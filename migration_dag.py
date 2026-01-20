@@ -297,60 +297,88 @@ def discover_tables_ssh(db_config: dict, mapr_setup: dict) -> dict:
     hive_port = config['hive_server_port']
     hive_auth = config['hive_auth']
     output_file = f"{temp_dir}/{src_db}_tables.json"
-
     script = f'''#!/bin/bash
-set -e
-JDBC="jdbc:hive2://{hive_host}:{hive_port}/{src_db};auth={hive_auth}"
+    set -e
 
-if [ "{pattern}" = "*" ]; then
-    TABLES=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 -e "SHOW TABLES IN {src_db};" 2>/dev/null | tail -n +2 | tr -d '"')
-else
-    LIKE=$(echo "{pattern}" | sed 's/\\*/%/g')
-    TABLES=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 -e "SHOW TABLES IN {src_db} LIKE '$LIKE';" 2>/dev/null | tail -n +2 | tr -d '"')
-fi
+    JDBC="jdbc:hive2://{hive_host}:{hive_port}/{src_db};auth={hive_auth}"
 
-echo "[" > {output_file}
-FIRST=true
-for TBL in $TABLES; do
-    [ -z "$TBL" ] && continue
-    
-    DESC=$(beeline -u "$JDBC" --silent=true -e "DESCRIBE FORMATTED {src_db}.$TBL;" 2>/dev/null)
-    LOC=$(echo "$DESC" | grep "Location:" | head -1 | sed 's/.*Location:[[:space:]]*//' | sed 's/[[:space:]]*|.*//' | tr -d ' \\t')
-    
-    INFMT=$(echo "$DESC" | grep "InputFormat:" | head -1)
-    if echo "$INFMT" | grep -qi parquet; then FMT="PARQUET"
-    elif echo "$INFMT" | grep -qi orc; then FMT="ORC"
-    elif echo "$INFMT" | grep -qi avro; then FMT="AVRO"
-    else FMT="PARQUET"; fi
-    
-    COLS=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 -e "DESCRIBE {src_db}.$TBL;" 2>/dev/null | tail -n +2 | grep -v "^#" | while IFS=',' read -r cn ct rest; do
-        cn=$(echo "$cn" | tr -d '" ')
-        ct=$(echo "$ct" | tr -d '" ')
-        [ -z "$cn" ] && continue
-        echo "{{\\"name\\":\\"$cn\\",\\"type\\":\\"$ct\\"}}"
-    done | paste -sd "," -)
-    
-    PARTS=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 -e "SHOW PARTITIONS {src_db}.$TBL;" 2>/dev/null | tail -n +2 | tr -d '"' || echo "")
-    IS_PART=false; PCNT=0; PJSON=""
-    if [ -n "$PARTS" ]; then
-        IS_PART=true
-        PCNT=$(echo "$PARTS" | grep -c . || echo 0)
-        PJSON=$(echo "$PARTS" | while read p; do [ -z "$p" ] && continue; echo "\\"$p\\""; done | paste -sd "," -)
+    if [ "{pattern}" = "*" ]; then
+        TABLES=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
+            -e "SHOW TABLES IN {src_db};" 2>/dev/null \
+            | tail -n +2 | tr -d '"')
+    else
+        LIKE=$(echo "{pattern}" | sed 's/\\*/%/g')
+        TABLES=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
+            -e "SHOW TABLES IN {src_db} LIKE '$LIKE';" 2>/dev/null \
+            | tail -n +2 | tr -d '"')
     fi
-    
-    PCOLS=$(echo "$DESC" | awk '/# Partition Information/,/^[[:space:]]*$/' | grep -v "^#" | grep -v col_name | awk -F'|' '{{gsub(/^ +| +$/,"",$2); if($2!="") print $2}}' | paste -sd "," -)
-    
-    S3LOC="{dest_bucket}/{dest_db}/$TBL"
-    
-    [ "$FIRST" = true ] && FIRST=false || echo "," >> {output_file}
-    cat >> {output_file} << EOF
-{{"source_database":"{src_db}","source_table":"$TBL","dest_database":"{dest_db}","dest_bucket":"{dest_bucket}","mapr_location":"$LOC","s3_location":"$S3LOC","file_format":"$FMT","schema":[$COLS],"partitions":[$PJSON],"partition_columns":"$PCOLS","partition_count":$PCNT,"is_partitioned":$IS_PART,"convert_to_iceberg":{str(convert_iceberg).lower()}}}
-EOF
-done
-echo "]" >> {output_file}
-cat {output_file}
-'''
 
+    echo "[" > {output_file}
+    FIRST=true
+
+    for TBL in $TABLES; do
+        [ -z "$TBL" ] && continue
+
+        DESC=$(beeline -u "$JDBC" --silent=true \
+            -e "DESCRIBE FORMATTED {src_db}.$TBL;" 2>/dev/null)
+
+        LOC=$(echo "$DESC" | awk -F'|' '/Location:/ {{gsub(/^ +| +$/,"",$3); print $3; exit}}')
+
+        INFMT=$(echo "$DESC" | grep "InputFormat:" | head -1)
+        if echo "$INFMT" | grep -qi parquet; then
+            FMT="PARQUET"
+        elif echo "$INFMT" | grep -qi orc; then
+            FMT="ORC"
+        elif echo "$INFMT" | grep -qi avro; then
+            FMT="AVRO"
+        else
+            FMT="PARQUET"
+        fi
+
+        PARTS=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
+            -e "SHOW PARTITIONS {src_db}.$TBL" 2>/dev/null \
+            | tail -n +2)
+
+        PART_COUNT=$(echo "$PARTS" | wc -l | tr -d ' ')
+
+        PCOLS=$(echo "$PARTS" \
+            | awk -F'/' '{{for(i=1;i<=NF;i++){{split($i,a,"="); print a[1]}}}}' \
+            | sort -u \
+            | tr '\\n' ',' | sed 's/,$//')
+
+        COLS=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
+            -e "DESCRIBE {src_db}.$TBL;" 2>/dev/null \
+            | tail -n +2 \
+            | grep -v "^#" \
+            | while IFS=',' read -r cn ct rest; do
+                cn=$(echo "$cn" | tr -d '" ')
+                ct=$(echo "$ct" | tr -d '" ')
+                [ -z "$cn" ] && continue
+                if [ -n "$PCOLS" ] && echo "$PCOLS" | tr ',' '\\n' | grep -qx "$cn"; then
+                    continue
+                fi
+                echo "{{\\"name\\":\\"$cn\\",\\"type\\":\\"$ct\\"}}"
+            done | paste -sd "," -)
+
+        IS_PART=false
+        PJSON=""
+        if [ "$PART_COUNT" -gt 0 ]; then
+            IS_PART=true
+            PJSON=$(echo "$PARTS" | while read p; do echo "\\"$p\\""; done | paste -sd "," -)
+        fi
+
+        S3LOC="{dest_bucket}/{dest_db}/$TBL"
+
+        [ "$FIRST" = true ] && FIRST=false || echo "," >> {output_file}
+
+        cat >> {output_file} << EOF
+    {{"source_database":"{src_db}","source_table":"$TBL","dest_database":"{dest_db}","dest_bucket":"{dest_bucket}","mapr_location":"$LOC","s3_location":"$S3LOC","file_format":"$FMT","schema":[$COLS],"partitions":[$PJSON],"partition_columns":"$PCOLS","partition_count":$PART_COUNT,"is_partitioned":$IS_PART,"convert_to_iceberg":{str(convert_iceberg).lower()}}}
+    EOF
+    done
+
+    echo "]" >> {output_file}
+    cat {output_file}
+    '''
     with ssh.get_conn() as client:
         _, stdout, stderr = client.exec_command(
             f"bash -s << 'EOFSCRIPT'\n{script}\nEOFSCRIPT",
