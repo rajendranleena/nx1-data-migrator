@@ -685,7 +685,6 @@ def migrate_to_iceberg(spark, sc, table_result: dict) -> dict:
         return {**table_result, 'iceberg_results': [], 'iceberg_skipped': True}
     
     config = get_config()
-    iceberg_
     
     dest_db = table_result['dest_database']
     tables = table_result['tables']
