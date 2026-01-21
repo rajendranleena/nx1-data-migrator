@@ -163,8 +163,8 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark, sc) -> st
 
 @task.pyspark(conn_id='spark_default')
 def parse_excel(excel_file_path: str, run_id: str, spark, sc) -> list:
-    """Read Excel config from S3 using pyspark.pandas.read_excel."""
-    import pyspark.pandas as ps
+    """Read Excel config from S3 using pandas.read_excel."""
+    import pandas as ps
     from io import BytesIO
 
     config = get_config()
