@@ -32,7 +32,6 @@ def get_config() -> dict:
         'hive_server_port': Variable.get('mapr_hive_server_port', default_var='10000'),
         'hive_auth': Variable.get('mapr_hive_auth', default_var='maprsasl'),
         'default_s3_bucket': Variable.get('migration_default_s3_bucket', default_var='s3a://data-lake'),
-        'aws_conn_id': Variable.get('migration_aws_conn_id', default_var='aws_default'),
         'distcp_mappers': Variable.get('migration_distcp_mappers', default_var='50'),
         'distcp_bandwidth': Variable.get('migration_distcp_bandwidth', default_var='100'),
         'spark_conn_id': Variable.get('migration_spark_conn_id', default_var='spark_default'),
@@ -166,11 +165,15 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark, sc) -> st
 def parse_excel(excel_file_path: str, run_id: str, spark, sc) -> list:
     """Read Excel config from S3 using pyspark.pandas.read_excel."""
     import pyspark.pandas as ps
-    
+    from io import BytesIO
+
     config = get_config()
-    
+    binary_df = spark.read.format("binaryFile").load(excel_file_path)
+    row = binary_df.select("content").first()
+    excel_bytes = bytes(row.content)
     # Read Excel directly from S3 using pyspark.pandas
-    df = ps.read_excel(excel_file_path)
+    #df = ps.read_excel(excel_file_path)
+    df = ps.read_excel(BytesIO(excel_bytes), engine='openpyxl')
     
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
@@ -913,7 +916,7 @@ with DAG(
     tags=['migration', 'mapr', 's3', 'hive', 'iceberg'],
     params={
         'excel_file_path': Param(
-            default='s3://config-bucket/migration.xlsx',
+            default='s3a://config-bucket/migration.xlsx',
             type='string',
             description='S3 path to Excel config file'
         )
