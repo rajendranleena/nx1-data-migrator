@@ -134,7 +134,7 @@ def init_tracking_tables(spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def create_migration_run(spark, sc, excel_file_path: str, dag_run_id: str) -> str:
+def create_migration_run(excel_file_path: str, dag_run_id: str, spark, sc) -> str:
     """Create migration run record in Iceberg tracking table."""
     from datetime import datetime
     import uuid
@@ -163,7 +163,7 @@ def create_migration_run(spark, sc, excel_file_path: str, dag_run_id: str) -> st
 
 
 @task.pyspark(conn_id='spark_default')
-def parse_excel(spark, sc, excel_file_path: str, run_id: str) -> list:
+def parse_excel(excel_file_path: str, run_id: str, spark, sc) -> list:
     """Read Excel config from S3 using pyspark.pandas.read_excel."""
     import pyspark.pandas as ps
     
@@ -280,7 +280,7 @@ echo "TEMP_DIR={temp_dir}"
 
 
 @task
-def discover_tables_ssh(db_config: dict, mapr_setup: dict) -> dict:
+def discover_tables_ssh(mapr_setup: dict, db_config: dict) -> dict:
     """Use beeline via SSH to discover tables and metadata."""
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
@@ -407,7 +407,7 @@ def discover_tables_ssh(db_config: dict, mapr_setup: dict) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def record_discovered_tables(spark, sc, discovery: dict) -> dict:
+def record_discovered_tables(discovery: dict, spark, sc) -> dict:
     """Record discovered tables in Iceberg tracking table."""
     
     config = get_config()
@@ -534,7 +534,7 @@ echo "DISTCP_EXIT_CODE=$?"
 
 
 @task.pyspark(conn_id='spark_default')
-def update_distcp_status(spark, sc, distcp_result: dict) -> dict:
+def update_distcp_status(distcp_result: dict, spark, sc) -> dict:
     """Update Iceberg tracking with DistCp results."""
     
     config = get_config()
@@ -564,7 +564,7 @@ def update_distcp_status(spark, sc, distcp_result: dict) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def create_hive_tables(spark, sc, distcp_result: dict) -> dict:
+def create_hive_tables(distcp_result: dict, spark, sc) -> dict:
     """Create external Hive tables via Spark. Handles incremental (repairs partitions)."""
     
     dest_db = distcp_result['dest_database']
@@ -675,7 +675,7 @@ def create_hive_tables(spark, sc, distcp_result: dict) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def update_table_create_status(spark, sc, table_result: dict) -> dict:
+def update_table_create_status(table_result: dict, spark, sc) -> dict:
     """Update Iceberg tracking with table creation results."""
     
     config = get_config()
@@ -706,7 +706,7 @@ def update_table_create_status(spark, sc, table_result: dict) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def migrate_to_iceberg(spark, sc, table_result: dict) -> dict:
+def migrate_to_iceberg(table_result: dict, spark, sc) -> dict:
     """Convert tables to Iceberg format via CTAS. Only if convert_to_iceberg=True."""
     
     if not table_result.get('convert_to_iceberg', False):
@@ -806,7 +806,7 @@ def migrate_to_iceberg(spark, sc, table_result: dict) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def update_iceberg_status(spark, sc, iceberg_result: dict) -> dict:
+def update_iceberg_status(iceberg_result: dict, spark, sc) -> dict:
     """Update Iceberg tracking with Iceberg migration results."""
     
     config = get_config()
@@ -844,7 +844,7 @@ def update_iceberg_status(spark, sc, iceberg_result: dict) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def finalize_run(spark, sc, run_id: str) -> dict:
+def finalize_run(run_id: str, spark, sc) -> dict:
     """Finalize migration run - update stats in Iceberg tracking."""
     
     config = get_config()
@@ -882,7 +882,7 @@ def finalize_run(spark, sc, run_id: str) -> dict:
 
 
 @task
-def cleanup_edge(run_id: str, mapr_setup: dict) -> dict:
+def cleanup_edge(mapr_setup: dict, run_id: str) -> dict:
     """Clean up temp files on edge node."""
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
@@ -945,7 +945,7 @@ with DAG(
     
     # Finalize
     t_final = finalize_run(run_id=t_run_id)
-    t_cleanup = cleanup_edge(run_id=t_run_id, mapr_setup=t_mapr)
+    t_cleanup = cleanup_edge(mapr_setup=t_mapr, run_id=t_run_id)
     
     # Dependencies
     t_init >> t_run_id >> t_excel >> t_mapr >> t_discover >> t_record
