@@ -71,9 +71,6 @@ def get_config() -> dict:
         # SSH Configuration (for MapR migration)
         'ssh_conn_id': Variable.get('mapr_ssh_conn_id', default_var='mapr_edge_ssh'),
         'edge_temp_path': Variable.get('mapr_edge_temp_path', default_var='/tmp/migration'),
-        'hive_server_host': Variable.get('mapr_hive_server_host', default_var='hiveserver2.mapr.local'),
-        'hive_server_port': Variable.get('mapr_hive_server_port', default_var='10000'),
-        'hive_auth': Variable.get('mapr_hive_auth', default_var='maprsasl'),
         
         # S3 Configuration
         'default_s3_bucket': Variable.get('migration_default_s3_bucket', default_var='s3a://data-lake'),
@@ -350,8 +347,10 @@ echo "TEMP_DIR={temp_dir}"
 
 @task
 @track_duration 
-def discover_tables_ssh(mapr_setup: dict, db_config: dict) -> dict:
-    """Use beeline via SSH to discover tables and metadata."""
+def discover_tables_via_spark_ssh(db_config: dict) -> dict:
+    """Use Spark SQL via SSH on edge node to discover tables and metadata."""
+    import json
+    
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
     
@@ -360,173 +359,204 @@ def discover_tables_ssh(mapr_setup: dict, db_config: dict) -> dict:
     pattern = db_config['table_pattern']
     dest_db = db_config['dest_database']
     dest_bucket = db_config['dest_bucket']
-    temp_dir = mapr_setup['temp_dir']
     
-    hive_host = config['hive_server_host']
-    hive_port = config['hive_server_port']
-    hive_auth = config['hive_auth']
-    output_file = f"{temp_dir}/{src_db}_tables.json"
-    
-    script = f'''#!/bin/bash
-    set -e
+    pyspark_script = f'''
+import json
+import sys
+from pyspark.sql import SparkSession
 
-    JDBC="jdbc:hive2://{hive_host}:{hive_port}/{src_db};auth={hive_auth}"
+spark = SparkSession.builder \\
+    .appName("table_discovery_{run_id}") \\
+    .enableHiveSupport() \\
+    .getOrCreate()
 
-    pattern="{pattern}"
-    src_db="{src_db}"
-    dest_db="{dest_db}"
-    dest_bucket="{dest_bucket}"
-    output_file="{output_file}"
+spark.sparkContext.setLogLevel("ERROR")
 
-    #===========================================================
+src_db = "{src_db}"
+pattern = "{pattern}"
+dest_db = "{dest_db}"
+dest_bucket = "{dest_bucket}"
 
-    if [ "$pattern" = "*" ]; then
-        TABLES=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
-            -e "SHOW TABLES IN ${src_db};" 2>/dev/null \
-            | tail -n +2 | tr -d '"')
-    else
-        LIKE=$(echo "$pattern" | sed 's/\\*/%/g')
-        TABLES=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
-            -e "SHOW TABLES IN ${src_db} LIKE '$LIKE';" 2>/dev/null \
-            | tail -n +2 | tr -d '"')
-    fi
+if pattern == '*':
+    tables_df = spark.sql(f"SHOW TABLES IN {{src_db}}")
+else:
+    like_pattern = pattern.replace('*', '%')
+    tables_df = spark.sql(f"SHOW TABLES IN {{src_db}} LIKE '{{like_pattern}}'")
 
-    echo "[" > "$output_file"
-    FIRST=true
+table_list = [row.tableName for row in tables_df.collect()]
 
-    for TBL in $TABLES; do
-        [ -z "$TBL" ] && continue
+metadata = []
 
-        DESC=$(beeline -u "$JDBC" --silent=true \
-            -e "DESCRIBE FORMATTED ${src_db}.${TBL};" 2>/dev/null)
+for tbl in table_list:
+    try:
+        desc_df = spark.sql(f"DESCRIBE FORMATTED {{src_db}}.{{tbl}}")
+        desc_rows = desc_df.collect()
+        
+        loc = None
+        table_type = "UNKNOWN"
+        input_format = None
+        
+        for row in desc_rows:
+            col_name = row.col_name.strip() if row.col_name else ""
+            data_type = row.data_type.strip() if row.data_type else ""
+            
+            if col_name == "Location:":
+                loc = data_type
+            elif col_name == "Table Type:":
+                table_type = data_type.replace("_TABLE", "")
+            elif col_name == "InputFormat:":
+                input_format = data_type
+        
+        mapr_total_size = 0
+        mapr_file_count = 0
+        if loc:
+            try:
+                from py4j.java_gateway import java_import
+                java_import(spark._jvm, "org.apache.hadoop.fs.*")
+                
+                fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+                    spark._jvm.java.net.URI(loc),
+                    spark._jsc.hadoopConfiguration()
+                )
+                path = spark._jvm.org.apache.hadoop.fs.Path(loc)
+                
+                if fs.exists(path):
+                    content_summary = fs.getContentSummary(path)
+                    mapr_total_size = int(content_summary.getLength())
+                    mapr_file_count = int(content_summary.getFileCount())
+            except:
+                pass
+        
+        file_format = "PARQUET"
+        if input_format:
+            if "parquet" in input_format.lower():
+                file_format = "PARQUET"
+            elif "orc" in input_format.lower():
+                file_format = "ORC"
+            elif "avro" in input_format.lower():
+                file_format = "AVRO"
+            elif "text" in input_format.lower():
+                file_format = "TEXTFILE"
+        
+        row_count = 0
+        try:
+            row_count = spark.sql(f"SELECT COUNT(*) as c FROM {{src_db}}.{{tbl}}").collect()[0].c
+        except:
+            pass
+        
+        partitions = []
+        partition_columns = ""
+        is_partitioned = False
+        try:
+            parts_df = spark.sql(f"SHOW PARTITIONS {{src_db}}.{{tbl}}")
+            partitions = [row.partition for row in parts_df.collect()]
+            is_partitioned = len(partitions) > 0
+            
+            if partitions:
+                first_part = partitions[0]
+                partition_columns = ",".join([p.split("=")[0] for p in first_part.split("/")])
+        except:
+            pass
+        
+        schema_df = spark.sql(f"DESCRIBE {{src_db}}.{{tbl}}")
+        schema = []
+        for row in schema_df.collect():
+            col_name = row.col_name.strip() if row.col_name else ""
+            data_type = row.data_type.strip() if row.data_type else ""
+            
+            if col_name.startswith("#") or col_name == "" or col_name == "col_name":
+                break
+            
+            schema.append({{"name": col_name, "type": data_type}})
+        
+        s3_location = f"{{dest_bucket}}/{{dest_db}}/{{tbl}}"
+        
+        metadata.append({{
+            "source_database": src_db,
+            "source_table": tbl,
+            "dest_database": dest_db,
+            "dest_bucket": dest_bucket,
+            "mapr_location": loc or "",
+            "s3_location": s3_location,
+            "file_format": file_format,
+            "schema": schema,
+            "partitions": partitions,
+            "partition_columns": partition_columns,
+            "partition_count": len(partitions),
+            "row_count": row_count,
+            "is_partitioned": is_partitioned,
+            "table_type": table_type,
+            "mapr_total_size_bytes": mapr_total_size,
+            "mapr_file_count": mapr_file_count
+        }})
+        
+    except Exception as e:
+        metadata.append({{
+            "source_database": src_db,
+            "source_table": tbl,
+            "dest_database": dest_db,
+            "dest_bucket": dest_bucket,
+            "mapr_location": "",
+            "s3_location": f"{{dest_bucket}}/{{dest_db}}/{{tbl}}",
+            "file_format": "PARQUET",
+            "schema": [],
+            "partitions": [],
+            "partition_columns": "",
+            "partition_count": 0,
+            "row_count": 0,
+            "is_partitioned": False,
+            "table_type": "UNKNOWN",
+            "mapr_total_size_bytes": 0,
+            "mapr_file_count": 0,
+            "error": str(e)[:500]
+        }})
 
-        LOC=$(echo "$DESC" | awk -F'|' '/^[[:space:]]*\\|[[:space:]]*Location:/ {{
-            gsub(/^ +| +$/, "", $3)
-            print $3
-            exit
-        }}')
+print("===JSON_START===", file=sys.stdout, flush=True)
+print(json.dumps(metadata), file=sys.stdout, flush=True)
+print("===JSON_END===", file=sys.stdout, flush=True)
 
-        if [ -n "$LOC" ]; then
-            MAPR_TOTAL_SIZE=$(hadoop fs -du -s "$LOC" 2>/dev/null | awk '{{print $1}}')
-            MAPR_FILE_COUNT=$(hadoop fs -ls -R "$LOC" 2>/dev/null | grep -v '^d' | wc -l)
-        else
-            MAPR_TOTAL_SIZE=0
-            MAPR_FILE_COUNT=0
-        fi
+spark.stop()
+'''
 
-        [ -z "$MAPR_TOTAL_SIZE" ] && MAPR_TOTAL_SIZE=0
-        [ -z "$MAPR_FILE_COUNT" ] && MAPR_FILE_COUNT=0
-
-        TABLE_TYPE=$(echo "$DESC" | awk -F'|' '/^[[:space:]]*\\|[[:space:]]*Table Type:/ {{
-            gsub(/^ +| +$/, "", $3)
-            sub(/_TABLE$/, "", $3)
-            print $3
-            exit
-        }}')
-
-        [ -z "$TABLE_TYPE" ] && TABLE_TYPE="UNKNOWN"
-
-        ROW_COUNT=$(beeline -u "$JDBC" \
-            --silent=true \
-            --outputformat=csv2 \
-            --showHeader=false \
-            -e "SELECT COUNT(*) FROM ${src_db}.${TBL};" 2>/dev/null \
-            | tail -n 1 \
-            | tr -d '"')
-
-        [ -z "$ROW_COUNT" ] && ROW_COUNT=0
-
-        INFMT=$(echo "$DESC" | grep "InputFormat:" | head -1)
-        if echo "$INFMT" | grep -qi parquet; then
-            FMT="PARQUET"
-        elif echo "$INFMT" | grep -qi orc; then
-            FMT="ORC"
-        elif echo "$INFMT" | grep -qi avro; then
-            FMT="AVRO"
-        elif echo "$INFMT" | grep -qi text; then
-            FMT="TEXTFILE"
-        else
-            FMT="PARQUET"
-        fi
-
-        PARTS=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
-            -e "SHOW PARTITIONS ${src_db}.${TBL};" 2>/dev/null \
-            | tail -n +2 \
-            | sed 's/^/"/;s/$/"/' \
-            | paste -sd "," -)
-
-        PART_COUNT=$(echo "$PARTS" | tr ',' '\\n' | wc -l)
-
-        PCOLS=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
-            -e "SHOW PARTITIONS ${src_db}.${TBL};" 2>/dev/null \
-            | tail -n +2 \
-            | awk -F'/' '{{for(i=1;i<=NF;i++){{split($i,a,"="); print a[1]}}}}' \
-            | sort -u \
-            | tr '\\n' ',' | sed 's/,$//')
-
-        COLS=$(beeline -u "$JDBC" \
-            --silent=true \
-            --outputformat=tsv2 \
-            -e "DESCRIBE ${src_db}.${TBL};" 2>/dev/null \
-            | awk -F'\\t' '
-                /^# Partition Information/ {{ exit }}
-                NF>=2 {{
-                    gsub(/^ +| +$/, "", $1)
-                    gsub(/^ +| +$/, "", $2)
-                    if ($1 != "col_name" && $1 != "")
-                        print "{{\\"name\\":\\""$1"\\",\\"type\\":\\""$2"\\"}}"
-                }}' \
-            | paste -sd "," -)
-
-        IS_PART=false
-        PJSON=""
-
-        if [ -n "$PARTS" ]; then
-            IS_PART=true
-            PJSON=$(echo "$PARTS" | while read p; do
-                [ -z "$p" ] && continue
-                echo "$p"
-            done | paste -sd "," -)
-        fi
-
-        PART_COUNT=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
-            -e "SHOW PARTITIONS ${src_db}.${TBL};" 2>/dev/null \
-            | tail -n +2 | wc -l | tr -d ' ')
-
-        S3LOC="${dest_bucket}/${dest_db}/${TBL}"
-
-        [ "$FIRST" = true ] && FIRST=false || echo "," >> "$output_file"
-
-        cat >> "$output_file" << EOF
-    {{"source_database":"$src_db","source_table":"$TBL","dest_database":"$dest_db","dest_bucket":"$dest_bucket","mapr_location":"$LOC","s3_location":"$S3LOC","file_format":"$FMT","schema":[$COLS],"partitions":[$PJSON],"partition_columns":"$PCOLS","partition_count":$PART_COUNT,"row_count":$ROW_COUNT,"is_partitioned":$IS_PART,"table_type":"$TABLE_TYPE","mapr_total_size_bytes":$MAPR_TOTAL_SIZE,"mapr_file_count":$MAPR_FILE_COUNT}}
-    EOF
-    done
-
-    echo "]" >> "$output_file"
-    cat "$output_file"
-    '''
     with ssh.get_conn() as client:
-        _, stdout, stderr = client.exec_command(
-            f"bash -s << 'EOFSCRIPT'\n{script}\nEOFSCRIPT",
-            timeout=SSH_COMMAND_TIMEOUT
-        )
+        temp_dir = f"/tmp/discovery_{run_id}"
+        client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
+        
+        script_path = f"{temp_dir}/discover_tables.py"
+        sftp = client.open_sftp()
+        with sftp.file(script_path, 'w') as f:
+            f.write(pyspark_script)
+        sftp.close()
+        
+        cmd = f"""
+cd {temp_dir}
+spark-submit {script_path} 2>/dev/null
+"""
+        
+        _, stdout, stderr = client.exec_command(cmd, timeout=3600)
         exit_code = stdout.channel.recv_exit_status()
         output = stdout.read().decode()
+        
+        client.exec_command(f"rm -rf {temp_dir}", timeout=60)
+        
         if exit_code != 0:
-            raise Exception(f"Discovery failed: {stderr.read().decode()}")
-    
-    try:
-        idx = output.rfind('[')
-        tables = json.loads(output[idx:output.rfind(']')+1]) if idx >= 0 else []
-    except json.JSONDecodeError as e:
-        raise Exception(f"JSON parse error: {e}")
+            raise Exception(f"Spark job failed: {stderr.read().decode()}\\n{output}")
+        
+        json_start = output.find("===JSON_START===")
+        json_end = output.find("===JSON_END===")
+        
+        if json_start == -1 or json_end == -1:
+            raise Exception(f"Could not find JSON markers in output: {output}")
+        
+        json_str = output[json_start + len("===JSON_START==="):json_end].strip()
+        metadata = json.loads(json_str)
     
     return {
         'run_id': run_id,
         'source_database': src_db,
         'dest_database': dest_db,
         'dest_bucket': dest_bucket,
-        'tables': tables
+        'tables': metadata
     }
 
 
@@ -1984,6 +2014,7 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
                     '{new_location or location or ""}',
                     current_timestamp(),
                     current_timestamp(),
+                    0.0,
                     'COMPLETED',
                     {hive_count},
                     {iceberg_count},
@@ -2572,7 +2603,7 @@ def finalize_iceberg_run(run_id: str, spark, sc) -> dict:
             SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as successful,
             SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed,
             SUM(CASE WHEN status = 'SKIPPED' THEN 1 ELSE 0 END) as skipped,
-            SUM(CASE WHEN counts_match = false THEN 1 ELSE 0 END) as count_mismatches
+            SUM(CASE WHEN row_count_match = false THEN 1 ELSE 0 END) as count_mismatches
         FROM {tracking_db}.iceberg_migration_table_status
         WHERE run_id = '{run_id}'
     """).collect()[0]
@@ -2646,7 +2677,7 @@ with DAG(
     t_mapr = mapr_token_setup(run_id=t_run_id)
     
     # Per-database processing (dynamic task mapping)
-    t_discover = discover_tables_ssh.partial(mapr_setup=t_mapr).expand(db_config=t_excel)
+    t_discover = discover_tables_via_spark_ssh.expand(db_config=t_excel)
     t_record = record_discovered_tables.expand(discovery=t_discover)
     t_distcp = run_distcp_ssh.partial(mapr_setup=t_mapr).expand(discovery=t_record)
     t_distcp_status = update_distcp_status.expand(distcp_result=t_distcp)
