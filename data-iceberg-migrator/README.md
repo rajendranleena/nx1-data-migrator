@@ -33,7 +33,7 @@ This implementation provides two independent but complementary migration DAGs:
 │                                                             │
 │ MapR-FS (Hive Tables)                                       │
 │ │                                                           │
-│ │ [SSH: Beeline Discovery]                                  │
+│ │ [PySpark: Metadata Discovery]                                  │
 │ ▼                                                           │
 │ Metadata Discovery                                          │
 │ │                                                           │
@@ -142,7 +142,7 @@ mapr_token_setup (SSH: MapR authentication)
 ┌───────────────────────────────────────────────┐
 │ Dynamic Task Mapping (per database config)    │
 │                                               │
-│ discover_tables_ssh (SSH: Beeline)            │
+│ discover_tables_via_spark_ssh (SSH: PySpark)  │
 │ ↓                                             │
 │ record_discovered_tables                      │
 │ ↓                                             │
@@ -229,13 +229,12 @@ cleanup_edge (SSH: Cleanup temp files)
 
 ---
 
-#### Step 4 - `discover_tables_ssh`
+#### Step 4 - `discover_tables_via_spark_ssh`
 
-**Type:** SSH (mapped per database)  
-**Purpose:** Discover table metadata from Hive using Beeline
+**Type:** SSH
+**Purpose:** Discover table metadata from Hive using PySpark
 
-- Executes on edge node via SSH for each database in Excel config
-- Uses Beeline to connect to HiveServer2 over JDBC
+- Executes on edge node via SSH on each database in Excel config
 - Discovers tables matching the pattern (supports `*` wildcards)
 - For each table, extracts:
   - **Schema** - Column names and data types
