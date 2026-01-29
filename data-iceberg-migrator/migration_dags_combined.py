@@ -2,7 +2,7 @@
 Combined Migration DAGs
 
 This file contains two independent DAGs:
-1. mapr_to_s3_migration: Migrates Hive tables from MapR-FS to S3
+1. mapr_to_s3_migration: Migrates data and Hive tables (metadata) from MapR-FS to S3
 2. iceberg_migration: Converts existing Hive tables in S3 to Apache Iceberg format
 
 Both DAGs can be run independently. The iceberg_migration DAG is typically run
@@ -32,12 +32,34 @@ Excel columns: database | table | inplace_migration | destination_iceberg_databa
 
 from datetime import datetime, timedelta
 import json
+from functools import wraps
 
 from airflow import DAG
 from airflow.decorators import task
 from airflow.models import Variable
 from airflow.models.param import Param
 from airflow.providers.ssh.hooks.ssh import SSHHook
+
+# =============================================================================
+# Duration tracking decorator using XCom
+# =============================================================================
+def track_duration(func):
+    """Decorator to automatically track task duration via result dict."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        from datetime import datetime as dt
+        start_time = dt.utcnow()
+        result = func(*args, **kwargs)
+        end_time = dt.utcnow()
+        duration = (end_time - start_time).total_seconds()
+        
+        # Add duration to result if it's a dict
+        if isinstance(result, dict):
+            result['_task_duration'] = duration
+        
+        return result
+    
+    return wrapper
 
 # =============================================================================
 # SHARED CONFIGURATION
@@ -69,6 +91,7 @@ def get_config() -> dict:
         # Tracking Configuration
         'tracking_database': Variable.get('migration_tracking_database', default_var='migration_tracking'),
         'tracking_location': Variable.get('migration_tracking_location', default_var='s3a://data-lake/migration_tracking'),
+        'report_output_location': Variable.get('migration_report_location', default_var='s3a://data-lake/migration_reports'),
         
         # MapR Authentication
         'mapr_user': Variable.get('mapr_user', default_var=''),
@@ -134,21 +157,63 @@ def init_tracking_tables(spark, sc) -> dict:
             schema_json STRING,
             partitions_json STRING,
             partition_columns STRING,
+            table_type STRING,                              
+            source_row_count BIGINT,                        
+            mapr_total_size_bytes BIGINT,                   
+            mapr_file_count BIGINT,                         
+            s3_total_size_bytes BIGINT,                    
+            s3_file_count BIGINT,                           
+            file_size_match BOOLEAN,                        
+            file_count_match BOOLEAN,       
             discovery_status STRING,
             discovery_completed_at TIMESTAMP,
+            discovery_duration_seconds DOUBLE,
             distcp_status STRING,
             distcp_started_at TIMESTAMP,
             distcp_completed_at TIMESTAMP,
+            distcp_duration_seconds DOUBLE,
             distcp_is_incremental BOOLEAN,
+            distcp_bytes_copied BIGINT,
+            distcp_files_copied BIGINT,
             table_create_status STRING,
             table_create_completed_at TIMESTAMP,
+            table_create_duration_seconds DOUBLE,
             table_already_existed BOOLEAN,
+            validation_status STRING,
+            validation_completed_at TIMESTAMP,
+            validation_duration_seconds DOUBLE,
+            dest_hive_row_count BIGINT,
+            source_partition_count INT,
+            dest_partition_count INT,
+            row_count_match BOOLEAN,
+            partition_count_match BOOLEAN,
+            schema_match BOOLEAN,
+            schema_differences STRING,
             overall_status STRING,
             error_message STRING,
             updated_at TIMESTAMP
         )
         USING iceberg
         LOCATION '{tracking_loc}/migration_table_status'
+    """)
+
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {tracking_db}.validation_results (
+            run_id STRING,
+            validation_run_timestamp TIMESTAMP,
+            total_tables_validated INT,
+            tables_passed_validation INT,
+            tables_failed_validation INT,
+            total_row_count_mismatches INT,
+            total_partition_count_mismatches INT,
+            total_schema_mismatches INT,
+            total_file_size_mismatches INT,
+            total_file_count_mismatches INT,
+            validation_summary_json STRING,
+            created_at TIMESTAMP
+        )
+        USING iceberg
+        LOCATION '{tracking_loc}/validation_results'
     """)
     
     return {'status': 'initialized', 'database': tracking_db}
@@ -284,6 +349,7 @@ echo "TEMP_DIR={temp_dir}"
 
 
 @task
+@track_duration 
 def discover_tables_ssh(mapr_setup: dict, db_config: dict) -> dict:
     """Use beeline via SSH to discover tables and metadata."""
     config = get_config()
@@ -302,87 +368,143 @@ def discover_tables_ssh(mapr_setup: dict, db_config: dict) -> dict:
     output_file = f"{temp_dir}/{src_db}_tables.json"
     
     script = f'''#!/bin/bash
-set -e
+    set -e
 
-JDBC="jdbc:hive2://{hive_host}:{hive_port}/{src_db};auth={hive_auth}"
+    JDBC="jdbc:hive2://{hive_host}:{hive_port}/{src_db};auth={hive_auth}"
 
-if [ "{pattern}" = "*" ]; then
-    TABLES=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
-        -e "SHOW TABLES IN {src_db};" 2>/dev/null \
-        | tail -n +2 | tr -d '"')
-else
-    LIKE=$(echo "{pattern}" | sed 's/\\*/%/g')
-    TABLES=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
-        -e "SHOW TABLES IN {src_db} LIKE '$LIKE';" 2>/dev/null \
-        | tail -n +2 | tr -d '"')
-fi
+    pattern="{pattern}"
+    src_db="{src_db}"
+    dest_db="{dest_db}"
+    dest_bucket="{dest_bucket}"
+    output_file="{output_file}"
 
-echo "[" > {output_file}
-FIRST=true
+    #===========================================================
 
-for TBL in $TABLES; do
-    [ -z "$TBL" ] && continue
-
-    DESC=$(beeline -u "$JDBC" --silent=true \
-        -e "DESCRIBE FORMATTED {src_db}.$TBL;" 2>/dev/null)
-
-    LOC=$(echo "$DESC" | awk -F'|' '/Location:/ {{gsub(/^ +| +$/,"",$3); print $3; exit}}')
-
-    INFMT=$(echo "$DESC" | grep "InputFormat:" | head -1)
-    if echo "$INFMT" | grep -qi parquet; then
-        FMT="PARQUET"
-    elif echo "$INFMT" | grep -qi orc; then
-        FMT="ORC"
-    elif echo "$INFMT" | grep -qi avro; then
-        FMT="AVRO"
+    if [ "$pattern" = "*" ]; then
+        TABLES=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
+            -e "SHOW TABLES IN ${src_db};" 2>/dev/null \
+            | tail -n +2 | tr -d '"')
     else
-        FMT="PARQUET"
+        LIKE=$(echo "$pattern" | sed 's/\\*/%/g')
+        TABLES=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
+            -e "SHOW TABLES IN ${src_db} LIKE '$LIKE';" 2>/dev/null \
+            | tail -n +2 | tr -d '"')
     fi
 
-    PARTS=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
-        -e "SHOW PARTITIONS {src_db}.$TBL" 2>/dev/null \
-        | tail -n +2)
+    echo "[" > "$output_file"
+    FIRST=true
 
-    PART_COUNT=$(echo "$PARTS" | wc -l | tr -d ' ')
+    for TBL in $TABLES; do
+        [ -z "$TBL" ] && continue
 
-    PCOLS=$(echo "$PARTS" \
-        | awk -F'/' '{{for(i=1;i<=NF;i++){{split($i,a,"="); print a[1]}}}}' \
-        | sort -u \
-        | tr '\\n' ',' | sed 's/,$//')
+        DESC=$(beeline -u "$JDBC" --silent=true \
+            -e "DESCRIBE FORMATTED ${src_db}.${TBL};" 2>/dev/null)
 
-    COLS=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
-        -e "DESCRIBE {src_db}.$TBL;" 2>/dev/null \
-        | tail -n +2 \
-        | grep -v "^#" \
-        | while IFS=',' read -r cn ct rest; do
-            cn=$(echo "$cn" | tr -d '" ')
-            ct=$(echo "$ct" | tr -d '" ')
-            [ -z "$cn" ] && continue
-            if [ -n "$PCOLS" ] && echo "$PCOLS" | tr ',' '\\n' | grep -qx "$cn"; then
-                continue
-            fi
-            echo "{{\\"name\\":\\"$cn\\",\\"type\\":\\"$ct\\"}}"
-        done | paste -sd "," -)
+        LOC=$(echo "$DESC" | awk -F'|' '/^[[:space:]]*\\|[[:space:]]*Location:/ {{
+            gsub(/^ +| +$/, "", $3)
+            print $3
+            exit
+        }}')
 
-    IS_PART=false
-    PJSON=""
-    if [ "$PART_COUNT" -gt 0 ]; then
-        IS_PART=true
-        PJSON=$(echo "$PARTS" | while read p; do echo "\\"$p\\""; done | paste -sd "," -)
-    fi
+        if [ -n "$LOC" ]; then
+            MAPR_TOTAL_SIZE=$(hadoop fs -du -s "$LOC" 2>/dev/null | awk '{{print $1}}')
+            MAPR_FILE_COUNT=$(hadoop fs -ls -R "$LOC" 2>/dev/null | grep -v '^d' | wc -l)
+        else
+            MAPR_TOTAL_SIZE=0
+            MAPR_FILE_COUNT=0
+        fi
 
-    S3LOC="{dest_bucket}/{dest_db}/$TBL"
+        [ -z "$MAPR_TOTAL_SIZE" ] && MAPR_TOTAL_SIZE=0
+        [ -z "$MAPR_FILE_COUNT" ] && MAPR_FILE_COUNT=0
 
-    [ "$FIRST" = true ] && FIRST=false || echo "," >> {output_file}
+        TABLE_TYPE=$(echo "$DESC" | awk -F'|' '/^[[:space:]]*\\|[[:space:]]*Table Type:/ {{
+            gsub(/^ +| +$/, "", $3)
+            sub(/_TABLE$/, "", $3)
+            print $3
+            exit
+        }}')
 
-    cat >> {output_file} << EOF
-{{"source_database":"{src_db}","source_table":"$TBL","dest_database":"{dest_db}","dest_bucket":"{dest_bucket}","mapr_location":"$LOC","s3_location":"$S3LOC","file_format":"$FMT","schema":[$COLS],"partitions":[$PJSON],"partition_columns":"$PCOLS","partition_count":$PART_COUNT,"is_partitioned":$IS_PART}}
-EOF
-done
+        [ -z "$TABLE_TYPE" ] && TABLE_TYPE="UNKNOWN"
 
-echo "]" >> {output_file}
-cat {output_file}
-'''
+        ROW_COUNT=$(beeline -u "$JDBC" \
+            --silent=true \
+            --outputformat=csv2 \
+            --showHeader=false \
+            -e "SELECT COUNT(*) FROM ${src_db}.${TBL};" 2>/dev/null \
+            | tail -n 1 \
+            | tr -d '"')
+
+        [ -z "$ROW_COUNT" ] && ROW_COUNT=0
+
+        INFMT=$(echo "$DESC" | grep "InputFormat:" | head -1)
+        if echo "$INFMT" | grep -qi parquet; then
+            FMT="PARQUET"
+        elif echo "$INFMT" | grep -qi orc; then
+            FMT="ORC"
+        elif echo "$INFMT" | grep -qi avro; then
+            FMT="AVRO"
+        elif echo "$INFMT" | grep -qi text; then
+            FMT="TEXTFILE"
+        else
+            FMT="PARQUET"
+        fi
+
+        PARTS=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
+            -e "SHOW PARTITIONS ${src_db}.${TBL};" 2>/dev/null \
+            | tail -n +2 \
+            | sed 's/^/"/;s/$/"/' \
+            | paste -sd "," -)
+
+        PART_COUNT=$(echo "$PARTS" | tr ',' '\\n' | wc -l)
+
+        PCOLS=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
+            -e "SHOW PARTITIONS ${src_db}.${TBL};" 2>/dev/null \
+            | tail -n +2 \
+            | awk -F'/' '{{for(i=1;i<=NF;i++){{split($i,a,"="); print a[1]}}}}' \
+            | sort -u \
+            | tr '\\n' ',' | sed 's/,$//')
+
+        COLS=$(beeline -u "$JDBC" \
+            --silent=true \
+            --outputformat=tsv2 \
+            -e "DESCRIBE ${src_db}.${TBL};" 2>/dev/null \
+            | awk -F'\\t' '
+                /^# Partition Information/ {{ exit }}
+                NF>=2 {{
+                    gsub(/^ +| +$/, "", $1)
+                    gsub(/^ +| +$/, "", $2)
+                    if ($1 != "col_name" && $1 != "")
+                        print "{{\\"name\\":\\""$1"\\",\\"type\\":\\""$2"\\"}}"
+                }}' \
+            | paste -sd "," -)
+
+        IS_PART=false
+        PJSON=""
+
+        if [ -n "$PARTS" ]; then
+            IS_PART=true
+            PJSON=$(echo "$PARTS" | while read p; do
+                [ -z "$p" ] && continue
+                echo "$p"
+            done | paste -sd "," -)
+        fi
+
+        PART_COUNT=$(beeline -u "$JDBC" --silent=true --outputformat=csv2 \
+            -e "SHOW PARTITIONS ${src_db}.${TBL};" 2>/dev/null \
+            | tail -n +2 | wc -l | tr -d ' ')
+
+        S3LOC="${dest_bucket}/${dest_db}/${TBL}"
+
+        [ "$FIRST" = true ] && FIRST=false || echo "," >> "$output_file"
+
+        cat >> "$output_file" << EOF
+    {{"source_database":"$src_db","source_table":"$TBL","dest_database":"$dest_db","dest_bucket":"$dest_bucket","mapr_location":"$LOC","s3_location":"$S3LOC","file_format":"$FMT","schema":[$COLS],"partitions":[$PJSON],"partition_columns":"$PCOLS","partition_count":$PART_COUNT,"row_count":$ROW_COUNT,"is_partitioned":$IS_PART,"table_type":"$TABLE_TYPE","mapr_total_size_bytes":$MAPR_TOTAL_SIZE,"mapr_file_count":$MAPR_FILE_COUNT}}
+    EOF
+    done
+
+    echo "]" >> "$output_file"
+    cat "$output_file"
+    '''
     with ssh.get_conn() as client:
         _, stdout, stderr = client.exec_command(
             f"bash -s << 'EOFSCRIPT'\n{script}\nEOFSCRIPT",
@@ -414,6 +536,8 @@ def record_discovered_tables(discovery: dict, spark, sc) -> dict:
     config = get_config()
     tracking_db = config['tracking_database']
     run_id = discovery['run_id']
+
+    discovery_duration = discovery.get('_task_duration', 0.0)
     
     for t in discovery['tables']:
         parts = t.get('partitions', [])
@@ -422,6 +546,10 @@ def record_discovered_tables(discovery: dict, spark, sc) -> dict:
         
         schema_json = json.dumps(t.get('schema', [])).replace("'", "''")
         parts_json = json.dumps(parts).replace("'", "''")
+        row_count = t.get('row_count', 0)
+        table_type = t.get('table_type', 'UNKNOWN')
+        mapr_size = t.get('mapr_total_size_bytes', 0)
+        mapr_files = t.get('mapr_file_count', 0)
         
         spark.sql(f"""
             MERGE INTO {tracking_db}.migration_table_status t
@@ -436,22 +564,31 @@ def record_discovered_tables(discovery: dict, spark, sc) -> dict:
             WHEN MATCHED THEN UPDATE SET
                 discovery_status = 'COMPLETED',
                 discovery_completed_at = current_timestamp(),
+                discovery_duration_seconds = {discovery_duration},
                 mapr_location = '{t['mapr_location']}',
                 file_format = '{t['file_format']}',
+                table_type = '{table_type}',                    
+                source_row_count = {row_count},                
+                mapr_total_size_bytes = {mapr_size},           
+                mapr_file_count = {mapr_files},     
                 updated_at = current_timestamp()
             WHEN NOT MATCHED THEN INSERT (
                 run_id, source_database, source_table, dest_database, dest_bucket,
                 dest_location, mapr_location, file_format,
                 partition_count, is_partitioned, schema_json, partitions_json,
-                partition_columns, discovery_status, discovery_completed_at,
-                overall_status, updated_at
+                partition_columns, table_type, source_row_count,         
+                mapr_total_size_bytes, mapr_file_count,                   
+                discovery_status, discovery_completed_at,
+                discovery_duration_seconds, overall_status, updated_at
             ) VALUES (
                 '{run_id}', '{t['source_database']}', '{t['source_table']}',
                 '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
                 '{t['mapr_location']}', '{t['file_format']}',
                 {t.get('partition_count', 0)}, {str(t.get('is_partitioned', False)).lower()},
                 '{schema_json}', '{parts_json}', '{t.get('partition_columns', '')}',
-                'COMPLETED', current_timestamp(), 'DISCOVERED', current_timestamp()
+                '{table_type}', {row_count},                               
+                {mapr_size}, {mapr_files},                               
+                'COMPLETED', current_timestamp(), {discovery_duration}, 'DISCOVERED', current_timestamp()
             )
         """)
     
@@ -459,6 +596,7 @@ def record_discovered_tables(discovery: dict, spark, sc) -> dict:
 
 
 @task
+@track_duration
 def run_distcp_ssh(discovery: dict, mapr_setup: dict) -> dict:
     """Run DistCp via SSH for all tables. Uses -update for incremental."""
     config = get_config()
@@ -494,9 +632,40 @@ set -e
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 echo "INCREMENTAL=$INCR"
-hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
-    -log {temp_dir}/distcp_{tbl}.log "{mapr_loc}" "{s3_loc}" 2>&1
-echo "DISTCP_EXIT_CODE=$?"
+DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+    -log {temp_dir}/distcp_{tbl}.log "{mapr_loc}" "{s3_loc}" 2>&1)
+DISTCP_EXIT=$?
+echo "DISTCP_EXIT_CODE=$DISTCP_EXIT"
+
+BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | awk '{{print $NF}}' | tr -d ',')
+FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Number of files copied" | awk '{{print $NF}}' | tr -d ',')
+S3_PATH="${{s3_loc#s3a://}}"
+S3_OBJECTS=$(s3Cli ls "$S3_PATH" 2>/dev/null | tail -n +3 | grep '^f')
+S3_FILE_COUNT=$(echo "$S3_OBJECTS" | grep -v '^$' | wc -l)
+S3_TOTAL_SIZE=$(echo "$S3_OBJECTS" | awk '{{
+    size = $2
+    unit = $3
+    
+    # Convert to bytes
+    if (unit == "B") bytes = size
+    else if (unit == "KB") bytes = size * 1024
+    else if (unit == "MB") bytes = size * 1024 * 1024
+    else if (unit == "GB") bytes = size * 1024 * 1024 * 1024
+    else if (unit == "TB") bytes = size * 1024 * 1024 * 1024 * 1024
+    else if (unit == "PB") bytes = size * 1024 * 1024 * 1024 * 1024 * 1024
+    else bytes = 0
+    
+    sum += bytes
+}} END {{print sum}}')
+
+[ -z "$S3_TOTAL_SIZE" ] && S3_TOTAL_SIZE=0
+[ -z "$S3_FILE_COUNT" ] && S3_FILE_COUNT=0
+
+echo "DISTCP_EXIT_CODE=$DISTCP_EXIT"
+echo "BYTES_COPIED=$BYTES_COPIED"
+echo "FILES_COPIED=$FILES_COPIED"
+echo "S3_TOTAL_SIZE=$S3_TOTAL_SIZE"
+echo "S3_FILE_COUNT=$S3_FILE_COUNT"
 '''
         try:
             with ssh.get_conn() as client:
@@ -504,6 +673,24 @@ echo "DISTCP_EXIT_CODE=$?"
                 exit_code = stdout.channel.recv_exit_status()
                 output = stdout.read().decode()
                 is_incr = "INCREMENTAL=true" in output
+
+                bytes_copied = 0
+                files_copied = 0
+                s3_size = 0
+                s3_files = 0
+
+                try:
+                    for line in output.split('\n'):
+                        if 'BYTES_COPIED=' in line:
+                            bytes_copied = int(line.split('=')[1].strip() or 0)
+                        if 'FILES_COPIED=' in line:
+                            files_copied = int(line.split('=')[1].strip() or 0)
+                        if 'S3_TOTAL_SIZE=' in line:
+                            s3_size = int(line.split('=')[1].strip() or 0)
+                        if 'S3_FILE_COUNT=' in line:
+                            s3_files = int(line.split('=')[1].strip() or 0)
+                except:
+                    pass
                 
                 if exit_code != 0:
                     raise Exception(stderr.read().decode())
@@ -513,6 +700,10 @@ echo "DISTCP_EXIT_CODE=$?"
                     'source_table': tbl,
                     'status': 'COMPLETED',
                     'is_incremental': is_incr,
+                    'bytes_copied': bytes_copied,
+                    'files_copied': files_copied,
+                    's3_total_size_bytes': s3_size,      
+                    's3_file_count': s3_files, 
                     'error': None
                 })
         except Exception as e:
@@ -521,6 +712,10 @@ echo "DISTCP_EXIT_CODE=$?"
                 'source_table': tbl,
                 'status': 'FAILED',
                 'is_incremental': False,
+                'bytes_copied': 0,
+                'files_copied': 0,
+                's3_total_size_bytes': 0,               
+                's3_file_count': 0,  
                 'error': str(e)[:2000]
             })
     
@@ -533,16 +728,28 @@ def update_distcp_status(distcp_result: dict, spark, sc) -> dict:
     config = get_config()
     tracking_db = config['tracking_database']
     run_id = distcp_result['run_id']
+
+    distcp_duration = distcp_result.get('_task_duration', 0.0)
     
     for r in distcp_result.get('distcp_results', []):
         overall = 'COPIED' if r['status'] == 'COMPLETED' else 'FAILED'
         error_msg = r.get('error', '').replace("'", "''") if r.get('error') else ''
+
+        s3_size = r.get('s3_total_size_bytes', 0)
+        s3_files = r.get('s3_file_count', 0)
         
         spark.sql(f"""
             UPDATE {tracking_db}.migration_table_status
             SET distcp_status = '{r['status']}',
                 distcp_completed_at = current_timestamp(),
+                distcp_duration_seconds = {distcp_duration},
                 distcp_is_incremental = {str(r['is_incremental']).lower()},
+                distcp_bytes_copied = {r.get('bytes_copied', 0)},
+                distcp_files_copied = {r.get('files_copied', 0)},
+                s3_total_size_bytes = {s3_size},                                   
+                s3_file_count = {s3_files},                                        
+                file_count_match = (mapr_file_count = {s3_files}),               
+                file_size_match = (ABS(mapr_total_size_bytes - {s3_size}) / GREATEST(mapr_total_size_bytes, 1) < 0.01),  
                 overall_status = '{overall}',
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
                 updated_at = current_timestamp()
@@ -555,6 +762,7 @@ def update_distcp_status(distcp_result: dict, spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
+@track_duration
 def create_hive_tables(distcp_result: dict, spark, sc) -> dict:
     """Create external Hive tables via Spark. Handles incremental (repairs partitions)."""
     dest_db = distcp_result['dest_database']
@@ -667,6 +875,8 @@ def update_table_create_status(table_result: dict, spark, sc) -> dict:
     tracking_db = config['tracking_database']
     run_id = table_result['run_id']
     dest_db = table_result['dest_database']
+
+    table_duration = table_result.get('_task_duration', 0.0)
     
     for r in table_result.get('table_results', []):
         overall = 'TABLE_CREATED' if r['status'] == 'COMPLETED' else ('FAILED' if r['status'] == 'FAILED' else 'SKIPPED')
@@ -676,6 +886,7 @@ def update_table_create_status(table_result: dict, spark, sc) -> dict:
             UPDATE {tracking_db}.migration_table_status
             SET table_create_status = '{r['status']}',
                 table_create_completed_at = current_timestamp(),
+                table_create_duration_seconds = {table_duration},
                 table_already_existed = {str(r.get('existed', False)).lower()},
                 overall_status = CASE WHEN overall_status != 'FAILED' THEN '{overall}' ELSE overall_status END,
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
@@ -686,6 +897,689 @@ def update_table_create_status(table_result: dict, spark, sc) -> dict:
         """)
     
     return table_result
+
+
+@task.pyspark(conn_id='spark_default')
+@track_duration
+def validate_destination_tables(source_validation: dict, spark, sc) -> dict:
+    """Validate destination Hive tables: row counts, partition counts, schema comparison."""
+    
+    config = get_config()
+    tracking_db = config['tracking_database']
+    
+    run_id = source_validation['run_id']
+    src_db = source_validation['source_database']
+    dest_db = source_validation['dest_database']
+    tables = source_validation['tables']
+    
+    validation_results = []
+    
+    for t in tables:
+        tbl = t['source_table']
+        dest_tbl = f"{dest_db}.{tbl}"
+        
+        try:
+            source_metrics = spark.sql(f"""
+                SELECT source_row_count, source_partition_count
+                FROM {tracking_db}.migration_table_status
+                WHERE run_id = '{run_id}'
+                  AND source_database = '{src_db}'
+                  AND source_table = '{tbl}'
+            """).collect()
+            
+            if not source_metrics:
+                validation_results.append({
+                    'source_table': tbl,
+                    'status': 'SKIPPED',
+                    'error': 'Source metrics not found in tracking table'
+                })
+                continue
+            
+            source_row_count = source_metrics[0]['source_row_count'] or 0
+            source_partition_count = t.get('partition_count', 0)
+            
+            # Get destination row count
+            dest_row_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_tbl}").collect()[0]['c']
+            
+            # Get destination partition count
+            dest_partition_count = 0
+            try:
+                dest_partitions_df = spark.sql(f"SHOW PARTITIONS {dest_tbl}")
+                dest_partition_count = dest_partitions_df.count()
+            except:
+                pass  
+            
+            # Schema comparison
+            src_schema = t.get('schema', [])
+            dest_schema_df = spark.sql(f"DESCRIBE {dest_tbl}")
+            dest_schema = [
+                {'name': row.col_name, 'type': row.data_type}
+                for row in dest_schema_df.collect()
+                if row.col_name and not row.col_name.startswith('#')
+            ]
+            
+            # Compare schemas
+            schema_match = True
+            schema_diffs = []
+            
+            src_cols = {c['name']: c['type'] for c in src_schema}
+            dest_cols = {c['name']: c['type'] for c in dest_schema}
+            
+            for col_name, col_type in src_cols.items():
+                if col_name not in dest_cols:
+                    schema_match = False
+                    schema_diffs.append(f"Missing column: {col_name}")
+                elif dest_cols[col_name] != col_type:
+                    schema_match = False
+                    schema_diffs.append(f"Type mismatch for {col_name}: {col_type} vs {dest_cols[col_name]}")
+            
+            for col_name in dest_cols:
+                if col_name not in src_cols:
+                    schema_match = False
+                    schema_diffs.append(f"Extra column in dest: {col_name}")
+            
+            # Validations
+            row_count_match = (source_row_count == dest_row_count)
+            partition_count_match = (source_partition_count == dest_partition_count)
+            
+            validation_results.append({
+                'source_table': tbl,
+                'status': 'COMPLETED',
+                'source_row_count': source_row_count,         
+                'dest_hive_row_count': dest_row_count,
+                'source_partition_count': source_partition_count,
+                'dest_partition_count': dest_partition_count,
+                'row_count_match': row_count_match,
+                'partition_count_match': partition_count_match,
+                'schema_match': schema_match,
+                'schema_differences': '; '.join(schema_diffs) if schema_diffs else '',
+                'error': None
+            })
+            
+        except Exception as e:
+            validation_results.append({
+                'source_table': tbl,
+                'status': 'FAILED',
+                'error': str(e)[:2000]
+            })
+    
+    return {**source_validation, 'validation_results': validation_results}
+
+
+@task.pyspark(conn_id='spark_default')
+def update_validation_status(validation_result: dict, spark, sc) -> dict:
+    """Update Iceberg tracking with validation results."""
+    
+    config = get_config()
+    tracking_db = config['tracking_database']
+    
+    run_id = validation_result['run_id']
+    dest_db = validation_result['dest_database']
+    
+    validation_duration = validation_result.get('_task_duration', 0.0)
+
+    total_validated = 0
+    passed_validation = 0
+    failed_validation = 0
+    row_mismatches = 0
+    partition_mismatches = 0
+    schema_mismatches = 0
+    
+    for v in validation_result.get('validation_results', []):
+        if v['status'] != 'COMPLETED':
+            continue
+
+        total_validated += 1
+        
+        error_msg = (v.get('error', '') or '').replace("'", "''")[:2000]
+        schema_diffs = (v.get('schema_differences', '') or '').replace("'", "''")[:2000]
+
+        if not v.get('row_count_match', False):
+            row_mismatches += 1
+        if not v.get('partition_count_match', True):
+            partition_mismatches += 1
+        if not v.get('schema_match', False):
+            schema_mismatches += 1
+
+        if (v.get('row_count_match', False) and 
+            v.get('partition_count_match', True) and 
+            v.get('schema_match', False)):
+            passed_validation += 1
+        else:
+            failed_validation += 1
+        
+        spark.sql(f"""
+            UPDATE {tracking_db}.migration_table_status
+            SET validation_status = '{v['status']}',
+                validation_completed_at = current_timestamp(),
+                validation_duration_seconds = {validation_duration},
+                source_row_count = {v.get('source_row_count', 0)},
+                dest_hive_row_count = {v.get('dest_hive_row_count', 0)},
+                source_partition_count = {v.get('source_partition_count', 0)},
+                dest_partition_count = {v.get('dest_partition_count', 0)},
+                row_count_match = {str(v.get('row_count_match', False)).lower()},
+                partition_count_match = {str(v.get('partition_count_match', False)).lower()},
+                schema_match = {str(v.get('schema_match', False)).lower()},
+                schema_differences = '{schema_diffs}',
+                overall_status = CASE 
+                    WHEN {str(v.get('row_count_match', False)).lower()} 
+                         AND {str(v.get('partition_count_match', False)).lower()} 
+                         AND {str(v.get('schema_match', False)).lower()} 
+                    THEN 'VALIDATED' 
+                    ELSE 'VALIDATION_FAILED' 
+                END,
+                error_message = CASE WHEN '{v['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
+                updated_at = current_timestamp()
+            WHERE run_id = '{run_id}'
+              AND dest_database = '{dest_db}'
+              AND source_table = '{v['source_table']}'
+        """)
+
+    if total_validated > 0:
+        file_metrics = spark.sql(f"""
+            SELECT 
+                SUM(CASE WHEN file_size_match = false THEN 1 ELSE 0 END) as size_mismatches,
+                SUM(CASE WHEN file_count_match = false THEN 1 ELSE 0 END) as count_mismatches
+            FROM {tracking_db}.migration_table_status
+            WHERE run_id = '{run_id}'
+        """).collect()[0]
+        
+        size_mismatches = file_metrics['size_mismatches'] or 0
+        count_mismatches = file_metrics['count_mismatches'] or 0
+        
+        validation_summary = {
+            'run_id': run_id,
+            'total_validated': total_validated,
+            'passed': passed_validation,
+            'failed': failed_validation,
+            'row_mismatches': row_mismatches,
+            'partition_mismatches': partition_mismatches,
+            'schema_mismatches': schema_mismatches,
+            'file_size_mismatches': size_mismatches,
+            'file_count_mismatches': count_mismatches
+        }
+        summary_json = json.dumps(validation_summary).replace("'", "''")
+        
+        spark.sql(f"""
+            INSERT INTO {tracking_db}.validation_results
+            VALUES (
+                '{run_id}',
+                current_timestamp(),
+                {total_validated},
+                {passed_validation},
+                {failed_validation},
+                {row_mismatches},
+                {partition_mismatches},
+                {schema_mismatches},
+                {size_mismatches},
+                {count_mismatches},
+                '{summary_json}',
+                current_timestamp()
+            )
+        """)
+    
+    return validation_result
+
+
+@task.pyspark(conn_id='spark_default')
+def generate_html_report(run_id: str, spark, sc) -> str:
+    """Generate comprehensive HTML migration report."""
+    from datetime import datetime
+    
+    config = get_config()
+    tracking_db = config['tracking_database']
+    report_location = config['report_output_location']
+    
+    # Get migration run info
+    run_info = spark.sql(f"""
+        SELECT * FROM {tracking_db}.migration_runs
+        WHERE run_id = '{run_id}'
+    """).collect()[0]
+    
+    # Get table status
+    table_status = spark.sql(f"""
+        SELECT * FROM {tracking_db}.migration_table_status
+        WHERE run_id = '{run_id}'
+        ORDER BY source_database, source_table
+    """).collect()
+    
+    # Calculate summary stats
+    total_tables = len(table_status)
+    successful_tables = sum(1 for t in table_status if t.overall_status in ['VALIDATED', 'TABLE_CREATED'])
+    failed_tables = sum(1 for t in table_status if 'FAILED' in t.overall_status)
+    total_data_gb = sum(t.distcp_bytes_copied or 0 for t in table_status) / (1024**3)
+    total_files = sum(t.distcp_files_copied or 0 for t in table_status)
+    total_rows = sum(t.source_row_count or 0 for t in table_status)
+    incremental_runs = sum(1 for t in table_status if t.distcp_is_incremental)
+    
+    # Generate HTML
+    html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MapR to S3 Migration Report - {run_id}</title>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        h1 {{
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }}
+        h2 {{
+            color: #34495e;
+            margin-top: 30px;
+            border-bottom: 2px solid #ecf0f1;
+            padding-bottom: 8px;
+        }}
+        .summary-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }}
+        .summary-card {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }}
+        .summary-card.success {{
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        }}
+        .summary-card.warning {{
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }}
+        .summary-card.info {{
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }}
+        .summary-card h3 {{
+            margin: 0 0 10px 0;
+            font-size: 14px;
+            opacity: 0.9;
+        }}
+        .summary-card .value {{
+            font-size: 32px;
+            font-weight: bold;
+            margin: 0;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 14px;
+        }}
+        th {{
+            background-color: #34495e;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            position: sticky;
+            top: 0;
+        }}
+        td {{
+            padding: 10px 12px;
+            border-bottom: 1px solid #ecf0f1;
+        }}
+        tr:hover {{
+            background-color: #f8f9fa;
+        }}
+        .status-badge {{
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            display: inline-block;
+        }}
+        .status-completed {{
+            background-color: #d4edda;
+            color: #155724;
+        }}
+        .status-failed {{
+            background-color: #f8d7da;
+            color: #721c24;
+        }}
+        .status-skipped {{
+            background-color: #fff3cd;
+            color: #856404;
+        }}
+        .metric {{
+            font-weight: bold;
+            color: #2980b9;
+        }}
+        .duration {{
+            color: #7f8c8d;
+            font-size: 12px;
+        }}
+        .validation-pass {{
+            color: #27ae60;
+            font-weight: bold;
+        }}
+        .validation-fail {{
+            color: #e74c3c;
+            font-weight: bold;
+        }}
+        .timestamp {{
+            color: #95a5a6;
+            font-size: 12px;
+        }}
+        .section-divider {{
+            margin: 40px 0;
+            border-top: 2px dashed #ecf0f1;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>MapR to S3 Migration Report</h1>
+        
+        <div class="timestamp">
+            Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
+            Run ID: <strong>{run_id}</strong><br>
+            DAG Run: <strong>{run_info.dag_run_id}</strong>
+        </div>
+        
+        <h2>Migration Summary</h2>
+        <div class="summary-grid">
+            <div class="summary-card">
+                <h3>TOTAL TABLES</h3>
+                <p class="value">{total_tables}</p>
+            </div>
+            <div class="summary-card success">
+                <h3>SUCCESSFUL</h3>
+                <p class="value">{successful_tables}</p>
+            </div>
+            <div class="summary-card warning">
+                <h3>FAILED</h3>
+                <p class="value">{failed_tables}</p>
+            </div>
+            <div class="summary-card info">
+                <h3>TOTAL DATA</h3>
+                <p class="value">{total_data_gb:.2f} GB</p>
+            </div>
+            <div class="summary-card info">
+                <h3>TOTAL FILES</h3>
+                <p class="value">{total_files:,}</p>
+            </div>
+            <div class="summary-card info">
+                <h3>TOTAL ROWS</h3>
+                <p class="value">{total_rows:,}</p>
+            </div>
+            <div class="summary-card">
+                <h3>INCREMENTAL RUNS</h3>
+                <p class="value">{incremental_runs}</p>
+            </div>
+        </div>
+        
+        <div class="section-divider"></div>
+
+        <h2>Validation Summary</h2>
+"""
+    validation_summary_data = spark.sql(f"""
+        SELECT * FROM {tracking_db}.validation_results
+        WHERE run_id = '{run_id}'
+        ORDER BY validation_run_timestamp DESC
+        LIMIT 1
+    """).collect()
+            
+    if validation_summary_data:
+        vs = validation_summary_data[0]
+        html += f"""
+        <div class="summary-grid">
+            <div class="summary-card info">
+                <h3>TABLES VALIDATED</h3>
+                <p class="value">{vs.total_tables_validated}</p>
+            </div>
+            <div class="summary-card success">
+                <h3>PASSED VALIDATION</h3>
+                <p class="value">{vs.tables_passed_validation}</p>
+            </div>
+            <div class="summary-card warning">
+                <h3>FAILED VALIDATION</h3>
+                <p class="value">{vs.tables_failed_validation}</p>
+            </div>
+            <div class="summary-card warning">
+                <h3>ROW COUNT MISMATCHES</h3>
+                <p class="value">{vs.total_row_count_mismatches}</p>
+            </div>
+            <div class="summary-card warning">
+                <h3>PARTITION MISMATCHES</h3>
+                <p class="value">{vs.total_partition_count_mismatches}</p>
+            </div>
+            <div class="summary-card warning">
+                <h3>SCHEMA MISMATCHES</h3>
+                <p class="value">{vs.total_schema_mismatches}</p>
+            </div>
+        </div>
+"""
+    else:
+        html += """
+        <p style="color: #95a5a6; font-style: italic;">No validation summary available for this run.</p>
+"""
+            
+    html += """
+        <div class="section-divider"></div>
+        
+        <h2>Table Migration Details</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Database</th>
+                    <th>Table</th>
+                    <th>Status</th>
+                    <th>Discovery</th>
+                    <th>DistCp</th>
+                    <th>Table Create</th>
+                    <th>Validation</th>
+                    <th>Total Duration</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+    
+    for t in table_status:
+        status_class = 'status-completed' if 'VALIDATED' in t.overall_status or 'TABLE_CREATED' in t.overall_status else 'status-failed'
+        
+        discovery_dur = f"{t.discovery_duration_seconds:.1f}s" if t.discovery_duration_seconds else "N/A"
+        distcp_dur = f"{t.distcp_duration_seconds:.1f}s" if t.distcp_duration_seconds else "N/A"
+        distcp_detail = f"<br><small>{t.distcp_bytes_copied/(1024**2):.1f} MB, {t.distcp_files_copied:,} files</small>" if t.distcp_bytes_copied else ""
+        if t.distcp_is_incremental:
+            distcp_dur += " <span style='background-color: #fff3cd; padding: 2px 6px; border-radius: 4px; font-size: 10px;'>INCREMENTAL</span>"
+        table_dur = f"{t.table_create_duration_seconds:.1f}s" if t.table_create_duration_seconds else "N/A"
+        val_dur = f"{t.validation_duration_seconds:.1f}s" if t.validation_duration_seconds else "N/A"
+        
+        total_dur = (t.discovery_duration_seconds or 0) + (t.distcp_duration_seconds or 0) + \
+                    (t.table_create_duration_seconds or 0) + (t.validation_duration_seconds or 0)
+        
+        html += f"""
+                <tr>
+                    <td>{t.source_database}</td>
+                    <td><strong>{t.source_table}</strong></td>
+                    <td><span class="status-badge {status_class}">{t.overall_status}</span></td>
+                    <td class="duration">{discovery_dur}</td>
+                    <td class="duration">{distcp_dur}{distcp_detail}</td>
+                    <td class="duration">{table_dur}</td>
+                    <td class="duration">{val_dur}</td>
+                    <td class="metric">{total_dur:.1f}s</td>
+                </tr>
+"""
+    
+    html += """
+            </tbody>
+        </table>
+        
+        <div class="section-divider"></div>
+        
+        <h2>Metadata Validation Results</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Database</th>
+                    <th>Table</th>
+                    <th>Source Rows</th>
+                    <th>Dest Hive Rows</th>
+                    <th>Row Count Match</th>
+                    <th>Source Partitions</th>
+                    <th>Dest Partitions</th>
+                    <th>Partition Match</th>
+                    <th>Schema Match</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+    
+    for t in table_status:
+        if not t.validation_status:
+            continue
+        
+        row_match_class = 'validation-pass' if t.row_count_match else 'validation-fail'
+        row_match_icon = '✓ PASS' if t.row_count_match else '✗ FAIL'
+        
+        part_match_class = 'validation-pass' if t.partition_count_match else 'validation-fail'
+        part_match_icon = '✓ PASS' if t.partition_count_match else '✗ FAIL'
+        
+        schema_match_class = 'validation-pass' if t.schema_match else 'validation-fail'
+        schema_match_icon = '✓ PASS' if t.schema_match else '✗ FAIL'
+        
+        html += f"""
+                <tr>
+                    <td>{t.source_database}</td>
+                    <td><strong>{t.source_table}</strong></td>
+                    <td class="metric">{t.source_row_count:,}</td>
+                    <td class="metric">{t.dest_hive_row_count:,}</td>
+                    <td class="{row_match_class}">{row_match_icon}</td>
+                    <td class="metric">{t.source_partition_count}</td>
+                    <td class="metric">{t.dest_partition_count}</td>
+                    <td class="{part_match_class}">{part_match_icon}</td>
+                    <td class="{schema_match_class}">{schema_match_icon}</td>
+                </tr>
+"""
+    html += """
+            </tbody>
+        </table>
+
+        <div class="section-divider"></div>
+        
+        <h2>Data Validation Results</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Database</th>
+                    <th>Table</th>
+                    <th>MapR Size (GB)</th>
+                    <th>S3 Size (GB)</th>
+                    <th>Size Match</th>
+                    <th>MapR Files</th>
+                    <th>S3 Files</th>
+                    <th>File Count Match</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+    
+    for t in table_status:
+        if not t.distcp_status:
+            continue
+        
+        mapr_size_gb = (t.mapr_total_size_bytes or 0) / (1024**3)
+        s3_size_gb = (t.s3_total_size_bytes or 0) / (1024**3)
+        
+        size_match_class = 'validation-pass' if t.file_size_match else 'validation-fail'
+        size_match_icon = '✓ PASS' if t.file_size_match else '✗ FAIL'
+        
+        count_match_class = 'validation-pass' if t.file_count_match else 'validation-fail'
+        count_match_icon = '✓ PASS' if t.file_count_match else '✗ FAIL'
+        
+        html += f"""
+                <tr>
+                    <td>{t.source_database}</td>
+                    <td><strong>{t.source_table}</strong></td>
+                    <td class="metric">{mapr_size_gb:.2f}</td>
+                    <td class="metric">{s3_size_gb:.2f}</td>
+                    <td class="{size_match_class}">{size_match_icon}</td>
+                    <td class="metric">{t.mapr_file_count:,}</td>
+                    <td class="metric">{t.s3_file_count:,}</td>
+                    <td class="{count_match_class}">{count_match_icon}</td>
+                </tr>
+""" 
+    
+    html += """
+            </tbody>
+        </table>
+        
+        <div class="section-divider"></div>
+        
+        <h2>Performance Metrics</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Database</th>
+                    <th>Table</th>
+                    <th>Data Volume</th>
+                    <th>DistCp Speed</th>
+                    <th>Rows/Second</th>
+                    <th>End-to-End Duration</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+    
+    for t in table_status:
+        data_gb = (t.distcp_bytes_copied or 0) / (1024**3)
+        distcp_speed = (t.distcp_bytes_copied or 0) / (1024**2) / (t.distcp_duration_seconds or 1)
+        
+        total_dur = (t.discovery_duration_seconds or 0) + (t.distcp_duration_seconds or 0) + \
+                    (t.table_create_duration_seconds or 0) + (t.validation_duration_seconds or 0)
+        
+        rows_per_sec = (t.source_row_count or 0) / (total_dur or 1)
+        
+        html += f"""
+                <tr>
+                    <td>{t.source_database}</td>
+                    <td><strong>{t.source_table}</strong></td>
+                    <td class="metric">{data_gb:.2f} GB</td>
+                    <td class="metric">{distcp_speed:.2f} MB/s</td>
+                    <td class="metric">{rows_per_sec:,.0f}</td>
+                    <td class="metric">{total_dur:.1f}s ({total_dur/60:.1f}m)</td>
+                </tr>
+"""
+    
+    html += """
+            </tbody>
+        </table>
+        
+        <div style="margin-top: 50px; padding-top: 20px; border-top: 1px solid #ecf0f1; color: #95a5a6; font-size: 12px;">
+            <p>This report was automatically generated by the MapR to S3 Migration DAG.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+    
+    # Write HTML to S3
+    report_path = f"{report_location}/{run_id}_report.html"
+    
+    # Use Spark to write HTML
+    from pyspark.sql import Row
+    report_df = spark.createDataFrame([Row(content=html)])
+    report_df.coalesce(1).write.mode('overwrite').text(report_path)
+    
+    return report_path
 
 
 @task.pyspark(conn_id='spark_default')
@@ -772,7 +1666,7 @@ def init_iceberg_tracking_tables(spark, sc) -> dict:
     """)
     
     spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS {tracking_db}.iceberg_migration_status (
+        CREATE TABLE IF NOT EXISTS {tracking_db}.iceberg_migration_table_status (
             run_id STRING,
             dag_run_id STRING,
             source_database STRING,
@@ -783,16 +1677,25 @@ def init_iceberg_tracking_tables(spark, sc) -> dict:
             table_location STRING,
             started_at TIMESTAMP,
             completed_at TIMESTAMP,
+            migration_duration_seconds DOUBLE,
             status STRING,
-            source_row_count BIGINT,
-            destination_row_count BIGINT,
-            counts_match BOOLEAN,
+            source_hive_row_count BIGINT,
+            destination_iceberg_row_count BIGINT,
+            row_count_match BOOLEAN,
+            source_hive_partition_count INT,
+            dest_iceberg_partition_count INT,
+            partition_count_match BOOLEAN,
+            schema_match BOOLEAN,
+            schema_differences STRING,
+            validation_status STRING,
+            validation_completed_at TIMESTAMP,
+            validation_duration_seconds DOUBLE,
             error_message STRING,
             updated_at TIMESTAMP,
             parent_migration_run_id STRING
         )
         USING iceberg
-        LOCATION '{tracking_loc}/iceberg_migration_status'
+        LOCATION '{tracking_loc}/iceberg_migration_table_status'
     """)
     
     return {'status': 'initialized', 'database': tracking_db}
@@ -950,6 +1853,7 @@ def update_parent_run_id(parent_lookup: dict, run_id: str, spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
+@track_duration
 def discover_hive_tables(db_config: dict, spark, sc) -> dict:
     """Discover Hive tables matching the pattern in the source database."""
     src_db = db_config['source_database']
@@ -992,6 +1896,7 @@ def discover_hive_tables(db_config: dict, spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
+@track_duration
 def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: str, spark, sc) -> dict:
     """Migrate discovered Hive tables to Iceberg format."""
     config = get_config()
@@ -1018,7 +1923,13 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
         
         try:
             hive_count = spark.sql(f"SELECT COUNT(*) as c FROM {src_db}.{tbl}").collect()[0]['c']
-            
+            src_hive_partition_count = 0
+            try:
+                src_partitions_df = spark.sql(f"SHOW PARTITIONS {src_db}.{tbl}")
+                src_hive_partition_count = src_partitions_df.count()
+            except:
+                pass 
+
             if inplace:
                 migration_type = "INPLACE"
                 dest_table = f"{src_db}.{tbl}"
@@ -1029,7 +1940,15 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
                 spark.sql(f"CALL spark_catalog.system.snapshot('{src_db}.{tbl}', '{dest_db}.{tbl}')")
             
             iceberg_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_table}").collect()[0]['c']
+            dest_iceberg_partition_count = 0
+            try:
+                dest_partitions_df = spark.sql(f"SHOW PARTITIONS {dest_table}")
+                dest_iceberg_partition_count = dest_partitions_df.count()
+            except:
+                pass
+
             counts_match = (hive_count == iceberg_count)
+            partition_match = (src_hive_partition_count == dest_iceberg_partition_count)
             
             desc_df = spark.sql(f"DESCRIBE FORMATTED {dest_table}")
             new_location = None
@@ -1046,11 +1965,14 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
                 'hive_count': hive_count,
                 'iceberg_count': iceberg_count,
                 'counts_match': counts_match,
+                'hive_partition_count': src_hive_partition_count,
+                'iceberg_partition_count': dest_iceberg_partition_count,
+                'partition_match': partition_match,
                 'error': None
             })
             
             spark.sql(f"""
-                INSERT INTO {tracking_db}.iceberg_migration_status
+                INSERT INTO {tracking_db}.iceberg_migration_table_status
                 VALUES (
                     '{run_id}',
                     '{dag_run_id}',
@@ -1066,6 +1988,14 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
                     {hive_count},
                     {iceberg_count},
                     {str(counts_match).lower()},
+                    {src_hive_partition_count},
+                    {dest_iceberg_partition_count},
+                    {str(partition_match).lower()},
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
                     NULL,
                     current_timestamp(),
                     {parent_run_id_sql}
@@ -1084,7 +2014,7 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
             })
             
             spark.sql(f"""
-                INSERT INTO {tracking_db}.iceberg_migration_status
+                INSERT INTO {tracking_db}.iceberg_migration_table_status
                 VALUES (
                     '{run_id}',
                     '{dag_run_id}',
@@ -1096,7 +2026,16 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
                     '{location or ""}',
                     current_timestamp(),
                     current_timestamp(),
+                    0.0,
                     'FAILED',
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
                     NULL,
                     NULL,
                     NULL,
@@ -1116,6 +2055,512 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
 
 
 @task.pyspark(conn_id='spark_default')
+def update_migration_durations(migration_result: dict, spark, sc) -> dict:
+    """Update tracking table with migration durations from XCom."""
+    
+    config = get_config()
+    tracking_db = config['tracking_database']
+    
+    run_id = migration_result['run_id']
+    
+    # Extract duration from XCom result
+    migration_duration = migration_result.get('_task_duration', 0.0)
+    
+    # Update all records for this run
+    spark.sql(f"""
+        UPDATE {tracking_db}.iceberg_migration_table_status
+        SET migration_duration_seconds = {migration_duration},
+            updated_at = current_timestamp()
+        WHERE run_id = '{run_id}'
+          AND migration_duration_seconds = 0.0
+    """)
+    
+    return migration_result
+
+
+@task.pyspark(conn_id='spark_default')
+@track_duration
+def validate_iceberg_tables(migration_result: dict, spark, sc) -> dict:
+    """Validate Iceberg tables: row counts, partition counts, schema comparison between source Hive and destination Iceberg."""
+    
+    config = get_config()
+    tracking_db = config['tracking_database']
+    
+    run_id = migration_result['run_id']
+    src_db = migration_result['source_database']
+    dest_db = migration_result['destination_database']
+    
+    validation_results = []
+    
+    for r in migration_result.get('results', []):
+        if r['status'] != 'COMPLETED':
+            continue
+        
+        # Extract table name from fully qualified name
+        src_tbl_full = r['source_table']
+        tbl = src_tbl_full.split('.')[-1]
+        dest_tbl = r['destination_table']
+        
+        try:
+            # Schema comparison between source Hive and destination Iceberg
+            src_hive_schema_df = spark.sql(f"DESCRIBE {src_db}.{tbl}")
+            src_hive_schema = [
+                {'name': row.col_name, 'type': row.data_type}
+                for row in src_hive_schema_df.collect()
+                if row.col_name and not row.col_name.startswith('#')
+            ]
+            
+            dest_iceberg_schema_df = spark.sql(f"DESCRIBE {dest_tbl}")
+            dest_iceberg_schema = [
+                {'name': row.col_name, 'type': row.data_type}
+                for row in dest_iceberg_schema_df.collect()
+                if row.col_name and not row.col_name.startswith('#')
+            ]
+            
+            # Compare schemas
+            schema_match = True
+            schema_diffs = []
+            
+            src_cols = {c['name']: c['type'] for c in src_hive_schema}
+            dest_cols = {c['name']: c['type'] for c in dest_iceberg_schema}
+            
+            for col_name, col_type in src_cols.items():
+                if col_name not in dest_cols:
+                    schema_match = False
+                    schema_diffs.append(f"Missing column in Iceberg: {col_name}")
+                elif dest_cols[col_name] != col_type:
+                    schema_match = False
+                    schema_diffs.append(f"Type mismatch for {col_name}: Hive {col_type} vs Iceberg {dest_cols[col_name]}")
+            
+            for col_name in dest_cols:
+                if col_name not in src_cols:
+                    schema_match = False
+                    schema_diffs.append(f"Extra column in Iceberg: {col_name}")
+            
+            validation_results.append({
+                'source_table': tbl,
+                'destination_table': dest_tbl,
+                'status': 'COMPLETED',
+                'source_hive_row_count': r.get('hive_count', 0),
+                'dest_iceberg_row_count': r.get('iceberg_count', 0),
+                'row_count_match': r.get('counts_match', False),
+                'source_hive_partition_count': r.get('hive_partition_count', 0),
+                'dest_iceberg_partition_count': r.get('iceberg_partition_count', 0),
+                'partition_count_match': r.get('partition_match', False),
+                'schema_match': schema_match,
+                'schema_differences': '; '.join(schema_diffs) if schema_diffs else '',
+                'error': None
+            })
+            
+        except Exception as e:
+            validation_results.append({
+                'source_table': tbl,
+                'destination_table': dest_tbl,
+                'status': 'FAILED',
+                'error': str(e)[:2000]
+            })
+    
+    return {**migration_result, 'validation_results': validation_results}
+
+
+@task.pyspark(conn_id='spark_default')
+def update_iceberg_validation_status(validation_result: dict, spark, sc) -> dict:
+    """Update Iceberg tracking with validation results."""
+    
+    config = get_config()
+    tracking_db = config['tracking_database']
+    
+    run_id = validation_result['run_id']
+    src_db = validation_result['source_database']
+    
+    # Extract duration from XCom result
+    validation_duration = validation_result.get('_task_duration', 0.0)
+    
+    for v in validation_result.get('validation_results', []):
+        if v['status'] != 'COMPLETED':
+            continue
+        
+        error_msg = (v.get('error', '') or '').replace("'", "''")[:2000]
+        schema_diffs = (v.get('schema_differences', '') or '').replace("'", "''")[:2000]
+        
+        overall_status = 'VALIDATED' if (
+            v.get('row_count_match', False) and 
+            v.get('partition_count_match', True) and 
+            v.get('schema_match', False)
+        ) else 'VALIDATION_FAILED'
+        
+        spark.sql(f"""
+            UPDATE {tracking_db}.iceberg_migration_table_status
+            SET validation_status = '{v['status']}',
+                validation_completed_at = current_timestamp(),
+                validation_duration_seconds = {validation_duration},
+                source_hive_row_count = {v.get('source_hive_row_count', 0)},
+                destination_iceberg_row_count = {v.get('dest_iceberg_row_count', 0)},
+                row_count_match = {str(v.get('row_count_match', False)).lower()},
+                source_hive_partition_count = {v.get('source_hive_partition_count', 0)},
+                dest_iceberg_partition_count = {v.get('dest_iceberg_partition_count', 0)},
+                partition_count_match = {str(v.get('partition_count_match', False)).lower()},
+                schema_match = {str(v.get('schema_match', False)).lower()},
+                schema_differences = '{schema_diffs}',
+                status = '{overall_status}',
+                error_message = CASE WHEN '{v['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
+                updated_at = current_timestamp()
+            WHERE run_id = '{run_id}'
+              AND source_database = '{src_db}'
+              AND source_table = '{v['source_table']}'
+        """)
+    
+    return validation_result
+
+
+@task.pyspark(conn_id='spark_default')
+def generate_iceberg_html_report(run_id: str, spark, sc) -> str:
+    """Generate comprehensive HTML Iceberg migration report."""
+    from datetime import datetime
+    
+    config = get_config()
+    tracking_db = config['tracking_database']
+    report_location = config['report_output_location']
+    
+    # Get migration status
+    migration_status = spark.sql(f"""
+        SELECT * FROM {tracking_db}.iceberg_migration_table_status
+        WHERE run_id = '{run_id}'
+        ORDER BY source_database, source_table
+    """).collect()
+    
+    # Calculate summary stats
+    total_tables = len(migration_status)
+    successful_tables = sum(1 for t in migration_status if t.status in ['VALIDATED', 'COMPLETED'])
+    failed_tables = sum(1 for t in migration_status if 'FAILED' in t.status)
+    total_rows = sum(t.source_hive_row_count or 0 for t in migration_status)
+    count_mismatches = sum(1 for t in migration_status if not t.row_count_match and t.row_count_match is not None)
+    
+    # Generate HTML
+    html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Iceberg Migration Report - {run_id}</title>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        h1 {{
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }}
+        h2 {{
+            color: #34495e;
+            margin-top: 30px;
+            border-bottom: 2px solid #ecf0f1;
+            padding-bottom: 8px;
+        }}
+        .summary-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }}
+        .summary-card {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }}
+        .summary-card.success {{
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        }}
+        .summary-card.warning {{
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }}
+        .summary-card.info {{
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }}
+        .summary-card h3 {{
+            margin: 0 0 10px 0;
+            font-size: 14px;
+            opacity: 0.9;
+        }}
+        .summary-card .value {{
+            font-size: 32px;
+            font-weight: bold;
+            margin: 0;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 14px;
+        }}
+        th {{
+            background-color: #34495e;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            position: sticky;
+            top: 0;
+        }}
+        td {{
+            padding: 10px 12px;
+            border-bottom: 1px solid #ecf0f1;
+        }}
+        tr:hover {{
+            background-color: #f8f9fa;
+        }}
+        .status-badge {{
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            display: inline-block;
+        }}
+        .status-completed {{
+            background-color: #d4edda;
+            color: #155724;
+        }}
+        .status-validated {{
+            background-color: #c3e6cb;
+            color: #155724;
+        }}
+        .status-failed {{
+            background-color: #f8d7da;
+            color: #721c24;
+        }}
+        .metric {{
+            font-weight: bold;
+            color: #2980b9;
+        }}
+        .duration {{
+            color: #7f8c8d;
+            font-size: 12px;
+        }}
+        .validation-pass {{
+            color: #27ae60;
+            font-weight: bold;
+        }}
+        .validation-fail {{
+            color: #e74c3c;
+            font-weight: bold;
+        }}
+        .timestamp {{
+            color: #95a5a6;
+            font-size: 12px;
+        }}
+        .section-divider {{
+            margin: 40px 0;
+            border-top: 2px dashed #ecf0f1;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Iceberg Migration Report</h1>
+        
+        <div class="timestamp">
+            Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
+            Run ID: <strong>{run_id}</strong>
+        </div>
+        
+        <h2>Migration Summary</h2>
+        <div class="summary-grid">
+            <div class="summary-card">
+                <h3>TOTAL TABLES</h3>
+                <p class="value">{total_tables}</p>
+            </div>
+            <div class="summary-card success">
+                <h3>SUCCESSFUL</h3>
+                <p class="value">{successful_tables}</p>
+            </div>
+            <div class="summary-card warning">
+                <h3>FAILED</h3>
+                <p class="value">{failed_tables}</p>
+            </div>
+            <div class="summary-card info">
+                <h3>TOTAL ROWS</h3>
+                <p class="value">{total_rows:,}</p>
+            </div>
+            <div class="summary-card warning">
+                <h3>COUNT MISMATCHES</h3>
+                <p class="value">{count_mismatches}</p>
+            </div>
+        </div>
+        
+        <div class="section-divider"></div>
+        
+        <h2>Table Migration Details</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Source Database</th>
+                    <th>Table</th>
+                    <th>Migration Type</th>
+                    <th>Destination</th>
+                    <th>Status</th>
+                    <th>Migration Duration</th>
+                    <th>Validation Duration</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+    
+    for t in migration_status:
+        if t.status == 'VALIDATED':
+            status_class = 'status-validated'
+        elif t.status == 'COMPLETED':
+            status_class = 'status-completed'
+        else:
+            status_class = 'status-failed'
+        
+        migration_dur = f"{t.migration_duration_seconds:.1f}s" if t.migration_duration_seconds else "N/A"
+        validation_dur = f"{t.validation_duration_seconds:.1f}s" if t.validation_duration_seconds else "N/A"
+        
+        html += f"""
+                <tr>
+                    <td>{t.source_database}</td>
+                    <td><strong>{t.source_table}</strong></td>
+                    <td>{t.migration_type}</td>
+                    <td>{t.destination_table}</td>
+                    <td><span class="status-badge {status_class}">{t.status}</span></td>
+                    <td class="duration">{migration_dur}</td>
+                    <td class="duration">{validation_dur}</td>
+                </tr>
+"""
+    
+    html += """
+            </tbody>
+        </table>
+        
+        <div class="section-divider"></div>
+        
+        <h2>Validation Results (Hive vs Iceberg)</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Database</th>
+                    <th>Table</th>
+                    <th>Source Hive Rows</th>
+                    <th>Dest Iceberg Rows</th>
+                    <th>Row Count Match</th>
+                    <th>Source Partitions</th>
+                    <th>Dest Partitions</th>
+                    <th>Partition Match</th>
+                    <th>Schema Match</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+    
+    for t in migration_status:
+        if t.validation_status != 'COMPLETED':
+            continue
+        
+        row_match_class = 'validation-pass' if t.row_count_match else 'validation-fail'
+        row_match_icon = '✓ PASS' if t.row_count_match else '✗ FAIL'
+        
+        part_match_class = 'validation-pass' if t.partition_count_match else 'validation-fail'
+        part_match_icon = '✓ PASS' if t.partition_count_match else '✗ FAIL'
+        
+        schema_match_class = 'validation-pass' if t.schema_match else 'validation-fail'
+        schema_match_icon = '✓ PASS' if t.schema_match else '✗ FAIL'
+        
+        html += f"""
+                <tr>
+                    <td>{t.source_database}</td>
+                    <td><strong>{t.source_table}</strong></td>
+                    <td class="metric">{t.source_hive_row_count:,}</td>
+                    <td class="metric">{t.destination_iceberg_row_count:,}</td>
+                    <td class="{row_match_class}">{row_match_icon}</td>
+                    <td class="metric">{t.source_hive_partition_count or 0}</td>
+                    <td class="metric">{t.dest_iceberg_partition_count or 0}</td>
+                    <td class="{part_match_class}">{part_match_icon}</td>
+                    <td class="{schema_match_class}">{schema_match_icon}</td>
+                </tr>
+"""
+    
+    html += """
+            </tbody>
+        </table>
+        
+        <div class="section-divider"></div>
+        
+        <h2>Performance Metrics</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Database</th>
+                    <th>Table</th>
+                    <th>Migration Duration</th>
+                    <th>Validation Duration</th>
+                    <th>Total Duration</th>
+                    <th>Rows Migrated</th>
+                    <th>Rows/Second</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+    
+    for t in migration_status:
+        if t.status not in ['COMPLETED', 'VALIDATED']:
+            continue
+        
+        migration_dur = t.migration_duration_seconds or 0
+        validation_dur = t.validation_duration_seconds or 0
+        total_dur = migration_dur + validation_dur
+        
+        rows_per_sec = (t.source_hive_row_count or 0) / (total_dur or 1)
+        
+        html += f"""
+                <tr>
+                    <td>{t.source_database}</td>
+                    <td><strong>{t.source_table}</strong></td>
+                    <td class="metric">{migration_dur:.1f}s</td>
+                    <td class="metric">{validation_dur:.1f}s</td>
+                    <td class="metric">{total_dur:.1f}s ({total_dur/60:.1f}m)</td>
+                    <td class="metric">{t.source_hive_row_count:,}</td>
+                    <td class="metric">{rows_per_sec:,.0f}</td>
+                </tr>
+"""
+    
+    html += """
+            </tbody>
+        </table>
+        
+        <div style="margin-top: 50px; padding-top: 20px; border-top: 1px solid #ecf0f1; color: #95a5a6; font-size: 12px;">
+            <p>This report was automatically generated by the Iceberg Migration DAG.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+    
+    # Write HTML to S3
+    report_path = f"{report_location}/{run_id}_iceberg_report.html"
+    
+    # Use Spark to write HTML
+    from pyspark.sql import Row
+    report_df = spark.createDataFrame([Row(content=html)])
+    report_df.coalesce(1).write.mode('overwrite').text(report_path)
+    
+    return report_path
+
+
+@task.pyspark(conn_id='spark_default')
 def finalize_iceberg_run(run_id: str, spark, sc) -> dict:
     """Finalize Iceberg migration run - aggregate statistics."""
     config = get_config()
@@ -1128,13 +2573,13 @@ def finalize_iceberg_run(run_id: str, spark, sc) -> dict:
             SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed,
             SUM(CASE WHEN status = 'SKIPPED' THEN 1 ELSE 0 END) as skipped,
             SUM(CASE WHEN counts_match = false THEN 1 ELSE 0 END) as count_mismatches
-        FROM {tracking_db}.iceberg_migration_status
+        FROM {tracking_db}.iceberg_migration_table_status
         WHERE run_id = '{run_id}'
     """).collect()[0]
 
     migration_type_result = spark.sql(f"""
         SELECT migration_type, COUNT(*) as cnt
-        FROM {tracking_db}.iceberg_migration_status
+        FROM {tracking_db}.iceberg_migration_table_status
         WHERE run_id = '{run_id}'
         GROUP BY migration_type
         ORDER BY cnt DESC
@@ -1207,6 +2652,13 @@ with DAG(
     t_distcp_status = update_distcp_status.expand(distcp_result=t_distcp)
     t_tables = create_hive_tables.expand(distcp_result=t_distcp_status)
     t_tbl_status = update_table_create_status.expand(table_result=t_tables)
+
+    # Validation tasks
+    t_dest_validation = validate_destination_tables.expand(source_validation=t_tbl_status)
+    t_val_status = update_validation_status.expand(validation_result=t_dest_validation)
+    
+    # Report generation 
+    t_report = generate_html_report(run_id=t_run_id)
     
     # Finalize
     t_final = finalize_run(run_id=t_run_id)
@@ -1215,7 +2667,8 @@ with DAG(
     # Dependencies
     t_init >> t_run_id >> t_excel >> t_mapr >> t_discover >> t_record
     t_record >> t_distcp >> t_distcp_status >> t_tables >> t_tbl_status
-    t_tbl_status >> t_final >> t_cleanup
+    t_tbl_status >> t_dest_validation >> t_val_status 
+    t_val_status >> t_report >> t_final >> t_cleanup
 
 
 # =============================================================================
@@ -1262,6 +2715,16 @@ with DAG(
     # Per-database processing
     t_ice_discover = discover_hive_tables.expand(db_config=t_ice_excel)
     t_ice_migrate = migrate_tables_to_iceberg.partial(dag_run_id="{{ run_id }}", parent_lookup=t_ice_parent_lookup).expand(discovery=t_ice_discover)
+
+    # Duration update
+    t_ice_durations = update_migration_durations.expand(migration_result=t_ice_migrate)
+    
+    # Validation 
+    t_ice_validate = validate_iceberg_tables.expand(migration_result=t_ice_durations)
+    t_ice_val_status = update_iceberg_validation_status.expand(validation_result=t_ice_validate)
+    
+    # Report generation 
+    t_ice_report = generate_iceberg_html_report(run_id=t_ice_run_id)
     
     # Finalize
     t_ice_final = finalize_iceberg_run(run_id=t_ice_run_id)
@@ -1269,4 +2732,5 @@ with DAG(
     # Dependencies
     t_ice_init >> t_ice_run_id >> t_ice_excel >> t_ice_parent_lookup >> t_ice_update_parent
     t_ice_excel >> t_ice_discover
-    [t_ice_discover, t_ice_parent_lookup] >> t_ice_migrate >> t_ice_final
+    [t_ice_discover, t_ice_parent_lookup] >> t_ice_migrate >> t_ice_durations
+    t_ice_durations >> t_ice_validate >> t_ice_val_status >> t_ice_report >> t_ice_final
