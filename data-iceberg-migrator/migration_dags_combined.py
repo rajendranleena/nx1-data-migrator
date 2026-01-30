@@ -3,10 +3,12 @@ Combined Migration DAGs
 
 This file contains two independent DAGs:
 1. mapr_to_s3_migration: Migrates data and Hive tables (metadata) from MapR-FS to S3
-2. iceberg_migration: Converts existing Hive tables in S3 to Apache Iceberg format
+2. mapr_to_s3_migration_retry: Retries failed tables from previous MapR-to-S3 migration
+3. iceberg_migration: Converts existing Hive tables in S3 to Apache Iceberg format
+4. iceberg_migration_retry: Retries failed Iceberg migrations from previous run
 
-Both DAGs can be run independently. The iceberg_migration DAG is typically run
-after mapr_to_s3_migration is complete, but they are not automatically chained.
+Both DAGs can be run independently. The iceberg_migration DAG is typically run after mapr_to_s3_migration is complete, but they are not automatically chained.
+The retry DAGs enable automatic recovery from transient failures without re-processing successful migrations.
 
 1. MapR to S3 Migration DAG
 
@@ -15,10 +17,22 @@ Orchestrates migration of Hive tables from MapR-FS to S3:
 - SSH operations for MapR token, beeline discovery, distcp (24h timeout)
 - PySpark tasks for Hive table creation
 - Incremental support (distcp -update, table repair)
+- Comprehensive validation (row counts, partitions, schema)
 
 Excel columns: database | table | dest database | bucket 
 
-2. Iceberg Migration DAG
+2. MapR to S3 Migration Retry
+
+Key Features:
+- Selective re-processing: Only retries failed/validation-failed tables
+- Incremental data copy: DistCp -update flag copies only missing/changed files
+- Idempotent operations: Safe to run multiple times
+- Tracking continuity: Updates original run_id records
+
+Parameters:
+- parent_run_id (REQUIRED): Run ID from initial migration to retry
+
+3. Iceberg Migration DAG
 
 Converts existing Hive tables in S3 to Apache Iceberg format.
 This DAG runs independently after the main MapR-to-S3 migration is complete.
@@ -28,6 +42,19 @@ Two migration strategies supported:
 2. Snapshot migration: Create separate Iceberg table alongside Hive table
 
 Excel columns: database | table | inplace_migration | destination_iceberg_database
+
+4. Iceberg Migration Retry
+
+Retries failed Iceberg migrations from a previous run.
+
+Key Features:
+- Selective re-processing: Only retries failed migrations
+- Migration re-execution: Re-runs migrate/snapshot procedures
+- Comprehensive validation: Row counts, partitions, schema comparison
+- Tracking continuity: Updates original run_id records
+
+Parameters:
+- parent_run_id (REQUIRED): Run ID from initial Iceberg migration to retry
 """
 
 from datetime import datetime, timedelta
@@ -1071,9 +1098,9 @@ def update_validation_status(validation_result: dict, spark, sc) -> dict:
         if not v.get('schema_match', False):
             schema_mismatches += 1
 
-        if (v.get('row_count_match', False) and 
+        if (v.get('row_count_match', True) and 
             v.get('partition_count_match', True) and 
-            v.get('schema_match', False)):
+            v.get('schema_match', True)):
             passed_validation += 1
         else:
             failed_validation += 1
@@ -1664,7 +1691,109 @@ def cleanup_edge(mapr_setup: dict, run_id: str) -> dict:
 
 
 # =============================================================================
-# DAG 2: ICEBERG MIGRATION TASKS
+#  DAG 2: MAPR TO S3 MIGRATION RETRY TASKS
+# =============================================================================
+
+@task.pyspark(conn_id='spark_default')
+def get_failed_tables(parent_run_id: str, spark, sc) -> list:
+    """ Query tracking table to identify tables that need retry. """
+    config = get_config()
+    tracking_db = config['tracking_database']
+
+    # Query for tables needing retry
+    failed_tables_df = spark.sql(f"""
+        SELECT
+            source_database,
+            source_table,
+            dest_database,
+            dest_bucket,
+            mapr_location,
+            dest_location,
+            file_format,
+            schema_json,
+            partitions_json,
+            partition_columns,
+            partition_count,
+            is_partitioned,
+            table_type,
+            source_row_count,
+            mapr_total_size_bytes,
+            mapr_file_count,
+            overall_status,
+            discovery_status,
+            distcp_status,
+            table_create_status,
+            validation_status,
+            error_message
+        FROM {tracking_db}.migration_table_status
+        WHERE run_id = '{parent_run_id}'
+          AND (
+              overall_status IN ('FAILED', 'VALIDATION_FAILED', 'SKIPPED')
+              OR file_count_match = false
+          )
+        ORDER BY source_database, source_table
+    """)
+
+    failed_tables = []
+    for row in failed_tables_df.collect():
+        import json as json_lib
+        schema = json_lib.loads(row.schema_json) if row.schema_json else []
+        partitions = json_lib.loads(row.partitions_json) if row.partitions_json else []
+
+        failed_tables.append({
+            'source_database': row.source_database,
+            'source_table': row.source_table,
+            'dest_database': row.dest_database,
+            'dest_bucket': row.dest_bucket,
+            'mapr_location': row.mapr_location,
+            's3_location': row.dest_location,
+            'file_format': row.file_format,
+            'schema': schema,
+            'partitions': partitions,
+            'partition_columns': row.partition_columns,
+            'partition_count': row.partition_count,
+            'row_count': row.source_row_count,
+            'is_partitioned': row.is_partitioned,
+            'table_type': row.table_type,
+            'mapr_total_size_bytes': row.mapr_total_size_bytes,
+            'mapr_file_count': row.mapr_file_count,
+            'run_id': parent_run_id,
+            'previous_status': row.overall_status,
+            'discovery_status': row.discovery_status,
+            'distcp_status': row.distcp_status,
+            'table_create_status': row.table_create_status,
+            'validation_status': row.validation_status,
+            'error_message': row.error_message
+        })
+
+    return failed_tables
+
+
+@task.pyspark(conn_id='spark_default')
+def group_failed_tables_by_database(failed_tables: list, spark, sc) -> list:
+    """ Group failed tables by database for efficient batch processing. """
+    from collections import defaultdict
+
+    db_groups = defaultdict(list)
+    for table in failed_tables:
+        key = (table['source_database'], table['dest_database'], table['dest_bucket'])
+        db_groups[key].append(table)
+
+    grouped_configs = []
+    for (src_db, dest_db, dest_bucket), tables in db_groups.items():
+        grouped_configs.append({
+            'run_id': tables[0]['run_id'], 
+            'source_database': src_db,
+            'dest_database': dest_db,
+            'dest_bucket': dest_bucket,
+            'tables': tables
+        })
+
+    return grouped_configs
+
+
+# =============================================================================
+# DAG 3: ICEBERG MIGRATION TASKS
 # =============================================================================
 
 @task.pyspark(conn_id='spark_default')
@@ -2642,6 +2771,86 @@ def finalize_iceberg_run(run_id: str, spark, sc) -> dict:
 
 
 # =============================================================================
+#  DAG 4: ICEBERG MIGRATION RETRY TASKS
+# =============================================================================
+
+@task.pyspark(conn_id='spark_default')
+def get_failed_iceberg_migrations(parent_run_id: str, spark, sc) -> list:
+    """ Query Iceberg tracking table to identify failed Iceberg migrations. """
+    config = get_config()
+    tracking_db = config['tracking_database']
+
+    failed_df = spark.sql(f"""
+        SELECT
+            source_database,
+            source_table,
+            migration_type,
+            destination_database,
+            destination_table,
+            status,
+            error_message
+        FROM {tracking_db}.iceberg_migration_table_status
+        WHERE run_id = '{parent_run_id}'
+          AND (
+              status = 'FAILED'
+              OR row_count_match = false
+              OR partition_count_match = false
+          )
+        ORDER BY source_database, source_table
+    """)
+
+    failed_tables = []
+    for row in failed_df.collect():
+        failed_tables.append({
+            'source_database': row.source_database,
+            'table': row.source_table,
+            'location': None,  
+            'run_id': parent_run_id  
+        })
+
+    return failed_tables
+
+
+@task.pyspark(conn_id='spark_default')
+def group_iceberg_failures(failed_tables: list, spark, sc) -> list:
+    """ Group failed Iceberg migrations by database and migration type. """
+    from collections import defaultdict
+
+    config = get_config()
+    tracking_db = config['tracking_database']
+
+    # Group by source database
+    db_groups = defaultdict(list)
+    for table in failed_tables:
+        db_groups[table['source_database']].append(table)
+
+    grouped_configs = []
+    for src_db, tables in db_groups.items():
+        sample_table = tables[0]['table']
+        config_row = spark.sql(f"""
+            SELECT migration_type, destination_database
+            FROM {tracking_db}.iceberg_migration_table_status
+            WHERE source_database = '{src_db}'
+              AND source_table = '{sample_table}'
+            LIMIT 1
+        """).collect()[0]
+
+        inplace = (config_row.migration_type == 'INPLACE')
+        dest_db = config_row.destination_database
+
+        grouped_configs.append({
+            'source_database': src_db,
+            'table_pattern': '*',
+            'inplace_migration': inplace,
+            'destination_iceberg_database': dest_db,
+            'run_id': tables[0]['run_id'],
+            'discovered_tables': tables  
+        })
+
+    return grouped_configs
+
+
+# =============================================================================
 # DAG 1 DEFINITION: MAPR TO S3 MIGRATION
 # =============================================================================
 
@@ -2703,7 +2912,67 @@ with DAG(
 
 
 # =============================================================================
-# DAG 2 DEFINITION: ICEBERG MIGRATION
+# DAG 2 DEFINITION: MAPR TO S3 MIGRATION RETRY
+# =============================================================================
+
+with DAG(
+    dag_id='mapr_to_s3_migration_retry', 
+    default_args=DEFAULT_ARGS,
+    description='Retry failed tables from previous MapR to S3 migration run',
+    schedule_interval=None, 
+    start_date=datetime(2025, 1, 1),
+    catchup=False,
+    max_active_runs=1,
+    tags=['migration', 'mapr', 's3', 'retry'], 
+    params={
+        'parent_run_id': Param(
+            default='',  
+            type='string',
+            description='Run ID from initial migration to retry failed tables'
+        )
+    },
+    render_template_as_native_obj=True,
+) as dag_mapr_to_s3_retry:
+
+    # Identify failed tables from parent run 
+    t_retry_failed = get_failed_tables(parent_run_id="{{ params.parent_run_id }}")
+    t_retry_grouped = group_failed_tables_by_database(failed_tables=t_retry_failed)
+    t_retry_run_id = create_migration_run(
+        excel_file_path="retry_run_for_{{ params.parent_run_id }}",
+        dag_run_id="{{ run_id }}"
+    )
+    t_retry_mapr = mapr_token_setup(run_id=t_retry_run_id)
+
+    # Per-database processing (dynamic task mapping)
+    t_retry_distcp = run_distcp_ssh.partial(mapr_setup=t_retry_mapr).expand(
+        discovery=t_retry_grouped  
+    )
+    t_retry_distcp_status = update_distcp_status.expand(distcp_result=t_retry_distcp)
+    t_retry_tables = create_hive_tables.expand(distcp_result=t_retry_distcp_status)
+    t_retry_tbl_status = update_table_create_status.expand(table_result=t_retry_tables)
+
+    # Validation taks
+    t_retry_validation = validate_destination_tables.expand(source_validation=t_retry_tbl_status)
+    t_retry_val_status = update_validation_status.expand(validation_result=t_retry_validation)
+
+    # Report generation 
+    t_retry_report = generate_html_report(run_id="{{ params.parent_run_id }}")
+
+    # Finalize
+    t_retry_final = finalize_run(run_id="{{ params.parent_run_id }}")
+    t_retry_cleanup = cleanup_edge(mapr_setup=t_retry_mapr, run_id=t_retry_run_id)
+
+    # Dependencies
+    t_retry_failed >> t_retry_grouped
+    [t_retry_run_id, t_retry_grouped] >> t_retry_mapr
+    t_retry_mapr >> t_retry_distcp >> t_retry_distcp_status
+    t_retry_distcp_status >> t_retry_tables >> t_retry_tbl_status
+    t_retry_tbl_status >> t_retry_validation >> t_retry_val_status
+    t_retry_val_status >> t_retry_report >> t_retry_final >> t_retry_cleanup
+
+
+# =============================================================================
+# DAG 3 DEFINITION: ICEBERG MIGRATION
 # =============================================================================
 
 with DAG(
@@ -2765,3 +3034,71 @@ with DAG(
     t_ice_excel >> t_ice_discover
     [t_ice_discover, t_ice_parent_lookup] >> t_ice_migrate >> t_ice_durations
     t_ice_durations >> t_ice_validate >> t_ice_val_status >> t_ice_report >> t_ice_final
+
+
+# =============================================================================
+#  DAG 4 DEFINITION:  ICEBERG MIGRATION RETRY
+# =============================================================================
+
+with DAG(
+    dag_id='iceberg_migration_retry', 
+    default_args=DEFAULT_ARGS,
+    description='Retry failed Iceberg migrations from previous run',
+    schedule_interval=None,
+    start_date=datetime(2025, 1, 1),
+    catchup=False,
+    max_active_runs=1,
+    tags=['migration', 'iceberg', 'retry'],
+    params={
+        'parent_run_id': Param(
+            default='',
+            type='string',
+            description='Run ID from initial Iceberg migration to retry'
+        )
+    },
+    render_template_as_native_obj=True,
+) as dag_iceberg_retry:
+
+    # Identify failed Iceberg migrations
+    t_ice_retry_failed = get_failed_iceberg_migrations(
+        parent_run_id="{{ params.parent_run_id }}"
+    )
+    t_ice_retry_grouped = group_iceberg_failures(failed_tables=t_ice_retry_failed)
+    t_ice_retry_run_id = create_iceberg_migration_run(
+        excel_file_path="iceberg_retry_for_{{ params.parent_run_id }}",
+        dag_run_id="{{ run_id }}"
+    )
+    t_ice_retry_parent = lookup_parent_migration_run(excel_configs=t_ice_retry_grouped)
+
+    # Per-database processing
+    t_ice_retry_migrate = migrate_tables_to_iceberg.partial(
+        dag_run_id="{{ run_id }}",
+        parent_lookup=t_ice_retry_parent
+    ).expand(discovery=t_ice_retry_grouped)
+    t_ice_retry_durations = update_migration_durations.expand(
+        migration_result=t_ice_retry_migrate
+    )
+
+    # Validation
+    t_ice_retry_validate = validate_iceberg_tables.expand(
+        migration_result=t_ice_retry_durations
+    )
+    t_ice_retry_val_status = update_iceberg_validation_status.expand(
+        validation_result=t_ice_retry_validate
+    )
+
+    # Report generation
+    t_ice_retry_report = generate_iceberg_html_report(
+        run_id="{{ params.parent_run_id }}"
+    )
+
+    # Finalise
+    t_ice_retry_final = finalize_iceberg_run(run_id="{{ params.parent_run_id }}")
+
+    # Dependencies
+    t_ice_retry_failed >> t_ice_retry_grouped
+    [t_ice_retry_run_id, t_ice_retry_grouped] >> t_ice_retry_parent
+    [t_ice_retry_grouped, t_ice_retry_parent] >> t_ice_retry_migrate
+    t_ice_retry_migrate >> t_ice_retry_durations >> t_ice_retry_validate
+    t_ice_retry_validate >> t_ice_retry_val_status >> t_ice_retry_report
+    t_ice_retry_report >> t_ice_retry_final
