@@ -241,6 +241,7 @@ with DAG(
         
         return '.'.join(parts)
 
+
     @task.pyspark(conn_id="spark_default")
     def write_policy_object_status(object_status: dict, spark, sc) -> dict:
         from datetime import datetime
