@@ -86,6 +86,18 @@ with DAG(
                 total_objects INT,
                 successful_objects INT,
                 failed_objects INT,
+                total_policies_parsed INT,
+                total_role_mappings_parsed INT,
+                groups_created INT,
+                groups_existing INT,
+                policies_created INT,
+                policies_updated INT,
+                policies_failed INT,
+                roles_created INT,
+                roles_existing INT,
+                mappings_created INT,
+                mappings_existing INT,
+                failed_operations INT,
                 error_message STRING,
                 created_at TIMESTAMP DEFAULT current_timestamp(),
                 updated_at TIMESTAMP DEFAULT current_timestamp()
@@ -93,6 +105,7 @@ with DAG(
             USING iceberg
             LOCATION '{loc}/ranger_policy_runs'
         """)
+
 
         spark.sql(f"""
             CREATE TABLE IF NOT EXISTS {db}.ranger_policy_object_status (
@@ -240,6 +253,7 @@ with DAG(
                 parts.append(column)
         
         return '.'.join(parts)
+
 
     @task.pyspark(conn_id="spark_default")
     def write_policy_object_status(object_status: dict, spark, sc) -> dict:
@@ -439,12 +453,24 @@ with DAG(
                 </p>
 
                 <div class="summary-cards">
-                    <div class="summary-card info">TOTAL OBJECTS: {total_objects}</div>
-                    <div class="summary-card success">SUCCESSFUL: {successful_objects}</div>
-                    <div class="summary-card failed">FAILED: {failed_objects}</div>
+                    <div class="summary-card info">Total Objects: {total_objects}</div>
+                    <div class="summary-card success">Successful: {successful_objects}</div>
+                    <div class="summary-card failed">Failed: {failed_objects}</div>
+                    <div class="summary-card info">Total Policies Parsed: {run_info.total_policies_parsed or 0}</div>
+                    <div class="summary-card info">Total Role Mappings Parsed: {run_info.total_role_mappings_parsed or 0}</div>
+                    <div class="summary-card success">Groups Created: {run_info.groups_created or 0}</div>
+                    <div class="summary-card info">Groups Existing: {run_info.groups_existing or 0}</div>
+                    <div class="summary-card success">Policies Created: {run_info.policies_created or 0}</div>
+                    <div class="summary-card info">Policies Updated: {run_info.policies_updated or 0}</div>
+                    <div class="summary-card failed">Policies Failed: {run_info.policies_failed or 0}</div>
+                    <div class="summary-card success">Roles Created: {run_info.roles_created or 0}</div>
+                    <div class="summary-card info">Roles Existing: {run_info.roles_existing or 0}</div>
+                    <div class="summary-card success">Mappings Created: {run_info.mappings_created or 0}</div>
+                    <div class="summary-card info">Mappings Existing: {run_info.mappings_existing or 0}</div>
+                    <div class="summary-card failed">Failed Operations: {run_info.failed_operations or 0}</div>
                 </div>
 
-                <h2>Object Counts by Type</h2>
+                <h2>Object Counts By Type</h2>
                 <ul>
         """
         for obj_type, count in type_counts.items():
@@ -506,29 +532,120 @@ with DAG(
         spark.createDataFrame([(html,)], ["content"]).coalesce(1).write.mode("overwrite").text(report_path)
 
         return report_path
-		
+
+
+    @task.pyspark(conn_id="spark_default")
+    def finalize_policy_run(run_id: str, dag_run_id: str, excel_file_path: str,
+                            parsed_data: Dict[str, Any], ranger_result: Dict[str, Any],
+                            keycloak_result: Dict[str, Any], spark, sc) -> dict:
+        """
+        Finalize the policy run: compute metrics from parsed data and task results,
+        update the ranger_policy_runs table, and return summary.
+        """
+        cfg = get_config()
+        db = cfg["tracking_database"]
+
+        # Compute run-level totals
+        total_objects = sum([
+            len(ranger_result['policies']['created']),
+            len(ranger_result['policies']['updated']),
+            len(ranger_result['policies']['failed']),
+            len(keycloak_result['created_roles']),
+            len(keycloak_result['existing_roles']),
+            len(keycloak_result['created_mappings']),
+            len(keycloak_result['existing_mappings']),
+            len(keycloak_result['failed'])
+        ])
+
+        successful_objects = (
+            len(ranger_result['policies']['created']) +
+            len(ranger_result['policies']['updated']) +
+            len(keycloak_result['created_roles']) +
+            len(keycloak_result['existing_roles']) +
+            len(keycloak_result['created_mappings']) +
+            len(keycloak_result['existing_mappings'])
+        )
+
+        failed_objects = (
+            len(ranger_result['policies']['failed']) +
+            len(keycloak_result['failed'])
+        )
+
+        overall_status = "COMPLETED" if failed_objects == 0 else "PARTIAL_FAILURE"
+
+        # Update the ranger_policy_runs table with all metrics
+        spark.sql(f"""
+            UPDATE {db}.ranger_policy_runs
+            SET
+                completed_at = current_timestamp(),
+                status = '{overall_status}',
+                total_objects = {total_objects},
+                successful_objects = {successful_objects},
+                failed_objects = {failed_objects},
+                total_policies_parsed = {len(parsed_data['policies'])},
+                total_role_mappings_parsed = {len(parsed_data['role_groups'])},
+                groups_created = {len(ranger_result['groups']['created'])},
+                groups_existing = {len(ranger_result['groups']['existing'])},
+                policies_created = {len(ranger_result['policies']['created'])},
+                policies_updated = {len(ranger_result['policies']['updated'])},
+                policies_failed = {len(ranger_result['policies']['failed'])},
+                roles_created = {len(keycloak_result['created_roles'])},
+                roles_existing = {len(keycloak_result['existing_roles'])},
+                mappings_created = {len(keycloak_result['created_mappings'])},
+                mappings_existing = {len(keycloak_result['existing_mappings'])},
+                failed_operations = {len(keycloak_result['failed'])},
+                updated_at = current_timestamp()
+            WHERE run_id = '{run_id}'
+        """)
+
+        return {
+            "run_id": run_id,
+            "status": overall_status,
+            "total_objects": total_objects,
+            "successful_objects": successful_objects,
+            "failed_objects": failed_objects,
+            "dag_run_id": dag_run_id,
+            "excel_file_path": excel_file_path,
+            "ranger_summary": ranger_result,
+            "keycloak_summary": keycloak_result
+        }
+
+
     # -----------------------------
     # DAG flow
     # -----------------------------
     excel_path = "{{ params.excel_file_path }}"
     dag_run_id = "{{ run_id }}"
 
+    # Initialize tables and run
     init_tables = init_policy_tracking_tables()
-    run_id = create_policy_run(excel_path, dag_run_id)
-    parsed_data = parse_excel_to_dicts(excel_path, run_id)
+    run_id_task = create_policy_run(excel_path, dag_run_id)
+    parsed_data = parse_excel_to_dicts(excel_path, run_id_task)
 
-    # Task outputs
-    ranger_statuses = create_ranger_groups_and_policies(parsed_data, run_id)
-    keycloak_statuses = create_keycloak_roles(parsed_data, run_id)
+    # Create policies / roles
+    ranger_result = create_ranger_groups_and_policies(parsed_data, run_id_task)
+    keycloak_result = create_keycloak_roles(parsed_data, run_id_task)
 
     # Write statuses (dynamic map)
-    write_ranger = write_policy_object_status.expand(object_status=ranger_statuses)
-    write_keycloak = write_policy_object_status.expand(object_status=keycloak_statuses)
+    write_ranger = write_policy_object_status.expand(object_status=ranger_result)
+    write_keycloak = write_policy_object_status.expand(object_status=keycloak_result)
+
+    # Finalize run (update metrics in runs table)
+    finalize = finalize_policy_run(
+        run_id=run_id_task,
+        dag_run_id=dag_run_id,
+        excel_file_path=excel_path,
+        parsed_data=parsed_data,
+        ranger_result=ranger_result,
+        keycloak_result=keycloak_result,
+    )
 
     # Generate report
-    report_path = generate_policy_report(run_id)
+    report_path = generate_policy_report(run_id_task)
 
     # Dependencies
-    init_tables >> run_id >> parsed_data
-    parsed_data >> [ranger_statuses, keycloak_statuses]
-    [write_ranger, write_keycloak] >> report_path
+    init_tables >> run_id_task >> parsed_data
+    parsed_data >> [ranger_result, keycloak_result]
+    [ranger_result, keycloak_result] >> [write_ranger, write_keycloak] >> finalize >> report_path
+
+
