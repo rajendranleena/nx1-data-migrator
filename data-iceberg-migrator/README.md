@@ -1,6 +1,6 @@
 # MapR to S3 Migration DAG
 
-An automated **Airflow TaskFlow-based migration pipeline** consisting of two independent DAGs for orchestrating large-scale Hive table migrations from MapR-FS to S3 and converting existing tables to Iceberg format.
+An automated **Airflow TaskFlow-based migration pipeline** consisting of four independent DAGs for orchestrating large-scale Hive table migrations from MapR-FS to S3 and converting existing tables to Iceberg format.
 
 ---
 
@@ -9,17 +9,20 @@ An automated **Airflow TaskFlow-based migration pipeline** consisting of two ind
 This implementation provides two independent but complementary migration DAGs:
 
 1. **`mapr_to_s3_migration`** - Migrates Hive tables from MapR-FS to Amazon S3
-2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
+2. **`mapr_to_s3_migration_retry`** - Retries failed tables from previous MapR-to-S3 migration
+3. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
+4. **`iceberg_migration_retry`** - Retries failed Iceberg migrations from previous run
 
 ---
 
-## Key Features of both DAGs
+## Key Features of all DAGs
 
 - **Parallel Processing** - Dynamic task mapping for concurrent migrations
 - **Comprehensive Tracking** - All operations tracked in Iceberg tables with detailed metrics
 - **Incremental Support** - Resume and update existing migrations
 - **Error Recovery** - Per-table error handling with detailed tracking
 - **Duration Tracking** - Automatic tracking of task execution times via XCom decorator
+- **Automatic Retry** - Dedicated retry DAGs for recovering from transient failures
 
 ---
 
@@ -33,7 +36,7 @@ This implementation provides two independent but complementary migration DAGs:
 │                                                             │
 │ MapR-FS (Hive Tables)                                       │
 │ │                                                           │
-│ │ [PySpark: Metadata Discovery]                                  │
+│ │ [PySpark: Metadata Discovery]                             │
 │ ▼                                                           │
 │ Metadata Discovery                                          │
 │ │                                                           │
@@ -50,10 +53,18 @@ This implementation provides two independent but complementary migration DAGs:
 │ Validated & Tracked                                         │
 └─────────────────────────────────────────────────────────────┘
 │
+│ (If failures occur)
+▼
+┌─────────────────────────────────────────────────────────────┐
+│ DAG 2: MapR to S3 Retry                                     │
+│                                                             │
+│ Query Failed Tables → Re-run DistCp → Re-validate           │
+└─────────────────────────────────────────────────────────────┘
+│
 │ (Independent, typically run after)
 ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ DAG 2: Iceberg Migration                                    │
+│ DAG 3: Iceberg Migration                                    │
 │                                                             │
 │ S3 (Hive Tables)                                            │
 │ │                                                           │
@@ -69,6 +80,14 @@ This implementation provides two independent but complementary migration DAGs:
 │ ▼                                                           │
 │ Validated & Tracked                                         │
 └─────────────────────────────────────────────────────────────┘
+│
+│ (If failures occur)
+▼
+┌─────────────────────────────────────────────────────────────┐
+│ DAG 4: Iceberg Migration Retry                              │
+│                                                             │
+│ Query Failed Migrations → Re-migrate → Re-validate          │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -80,17 +99,23 @@ Do you need to migrate from MapR-FS to S3?
 │
 ├─ YES → Run DAG 1 (mapr_to_s3_migration)
 │ │
-│ └─ Need Iceberg format?
+│ ├─ Failures? → Run DAG 2 (mapr_to_s3_migration_retry)
 │ │
-│ └─ YES → Then run DAG 2 (iceberg_migration)
-      │
-      └─ No Hive, Only Iceberg → Inline migration
-      │
-      └─ Both Hive and Iceberg → Snapshot migration
+│ └─ Need Iceberg format?
+│    │
+│    └─ YES → Run DAG 3 (iceberg_migration)
+│       │
+│       ├─ Failures? → Run DAG 4 (iceberg_migration_retry)
+│       │
+│       └─ No Hive, Only Iceberg → Inline migration
+│       │
+│       └─ Both Hive and Iceberg → Snapshot migration
 │
 └─ NO → Already in S3, need Iceberg?
-│
-└─ YES → Run DAG 2 (iceberg_migration) only
+   │
+   └─ YES → Run DAG 3 (iceberg_migration) only
+      │
+      └─ Failures? → Run DAG 4 (iceberg_migration_retry)
 ```
 
 ---
@@ -427,7 +452,100 @@ VALIDATED (All validations passed)
 
 ---
 
-## DAG 2: Iceberg Migration
+## DAG 2: MapR to S3 Migration Retry
+
+### Purpose
+
+Automatically retry failed tables from a previous MapR-to-S3 migration run with incremental data copy and idempotent operations.
+
+---
+
+### Key Features
+
+- **Selective Processing**: Only retries failed/validation-failed tables
+- **Incremental Data Copy**: DistCp `update` flag copies only missing/changed files
+- **Idempotent Operations**: Safe to run multiple times
+- **Tracking Continuity**: Updates original run_id records
+- **No Data Duplication**: Safe partition additions, table repairs
+
+---
+
+### When to Use
+
+**Common Scenarios:**
+
+1. **DistCp Failures**
+   - Network interruption during large table copy
+   - S3 throttling (503 errors)
+   - **What retry does**: Resumes copy with `update` flag, only copying missing files
+2. **Validation Failures**
+   - Row count mismatches (often due to concurrent writes)
+   - Partition count mismatches (MSCK repair failed)
+   - **What retry does**: Re-copies incrementally and re-validates
+3. **Table Creation Failures**
+   - Target Hive metastore unavailable
+   - Database didn’t exist
+   - **What retry does**: Retries table creation after issues resolved
+4. **Discovery Failures**
+   - HiveServer2 timeout
+   - Table metadata corrupted
+   - **What retry does**: Re-discovers table metadata
+5. **File Count Mismatches**
+   - DistCp reported success but file counts don’t match
+   - **What retry does**: Re-runs DistCp to copy missing files
+
+---
+
+### Idempotency Guarantees
+
+The retry DAG is **fully idempotent** - safe to run multiple times:
+
+| Operation                                   | Why It’s Safe                                |
+| ------------------------------------------- | -------------------------------------------- |
+| **DistCp -update**                          | Only copies new/changed files, no duplicates |
+| **CREATE TABLE IF NOT EXISTS**              | No-op if table exists                        |
+| **ALTER TABLE ADD IF NOT EXISTS PARTITION** | Safe partition additions                     |
+| **MSCK REPAIR TABLE**                       | Safe to re-run                               |
+| **Validation**                              | Read-only, always safe                       |
+| **Tracking Updates**                        | Uses MERGE (upsert), not INSERT              |
+
+---
+
+### Task Flow
+
+```
+get_failed_tables (Query tracking for failures)
+    ↓
+group_failed_tables_by_database (Batch for efficiency)
+    ↓
+mapr_token_setup (MapR authentication)
+    ↓
+┌─────────────────────────────────────────────┐
+│ Dynamic Task Mapping (per failed database)  │
+│                                             │
+│ run_distcp_ssh (Incremental copy)           │
+│ ↓                                           │
+│ update_distcp_status                        │
+│ ↓                                           │
+│ create_hive_tables (Create/repair)          │
+│ ↓                                           │
+│ update_table_create_status                  │
+│ ↓                                           │
+│ validate_destination_tables (Re-validate)   │
+│ ↓                                           │
+│ update_validation_status                    │
+└─────────────────────────────────────────────┘
+    ↓
+generate_html_report (Updated report)
+    ↓
+finalize_run (Update run stats)
+    ↓
+cleanup_edge
+```
+
+---
+
+## DAG 3: Iceberg Migration
 
 ### Purpose
 
@@ -740,6 +858,69 @@ VALIDATED
     │ (OR, if any validation fails)
     ↓
 VALIDATION_FAILED
+```
+
+---
+
+## DAG 4: Iceberg Migration Retry
+
+### Purpose
+
+Automatically retry failed Iceberg migrations from a previous run.
+
+---
+
+### Key Features
+
+- **Selective Processing**: Only retries failed migrations
+- **Migration Re-execution**: Re-runs migrate/snapshot procedures
+- **Comprehensive Validation**: Row counts, partitions, schema comparison
+- **Tracking Continuity**: Updates original run_id records
+
+---
+
+### When to Use
+
+**Common Scenarios:**
+
+1. **Migration Procedure Failures**
+   - Spark procedure errors (e.g., insufficient memory)
+   - Table locking issues
+   - **What retry does**: Re-attempts migration after issues resolved
+2. **Validation Failures**
+   - Row count mismatches
+   - Partition count mismatches
+   - **What retry does**: Re-validates after data stabilizes
+3. **Schema Comparison Failures**
+   - Schema evolution during migration
+   - **What retry does**: Re-runs schema comparison
+
+---
+
+### Task Flow
+
+```
+get_failed_iceberg_migrations (Query tracking for failures)
+    ↓
+group_iceberg_failures (Batch by database & type)
+    ↓
+lookup_parent_migration_run (Link to MapR-S3 migration)
+    ↓
+┌─────────────────────────────────────────────┐
+│ Dynamic Task Mapping (per failed database)  │
+│                                             │
+│ migrate_tables_to_iceberg (Re-run)          │
+│ ↓                                           │
+│ update_migration_durations                  │
+│ ↓                                           │
+│ validate_iceberg_tables (Re-validate)       │
+│ ↓                                           │
+│ update_iceberg_validation_status            │
+└─────────────────────────────────────────────┘
+    ↓
+generate_iceberg_html_report (Updated report)
+    ↓
+finalize_iceberg_run (Update run stats)
 ```
 
 ---
