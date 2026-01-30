@@ -578,12 +578,18 @@ with DAG(
         spark.createDataFrame([(html,)], ["content"]).coalesce(1).write.mode("overwrite").text(report_path)
 
         return report_path
-
+    
 
     @task.pyspark(conn_id="spark_default")
-    def finalize_policy_run(run_id: str, dag_run_id: str, excel_file_path: str,
-                            parsed_data: Dict[str, Any], ranger_result: Dict[str, Any],
-                            keycloak_result: Dict[str, Any], spark, sc) -> dict:
+    def finalize_policy_run(
+        policy_run_id: str,
+        policy_dag_run_id: str,
+        excel_file_path: str,
+        parsed_data: Dict[str, Any],
+        ranger_result: Dict[str, Any],
+        keycloak_result: Dict[str, Any],
+        spark=None,
+        sc=None)-> dict: 
         """
         Finalize the policy run: compute metrics from parsed data and task results,
         update the ranger_policy_runs table, and return summary.
@@ -641,16 +647,16 @@ with DAG(
                 mappings_existing = {len(keycloak_result['existing_mappings'])},
                 failed_operations = {len(keycloak_result['failed'])},
                 updated_at = current_timestamp()
-            WHERE run_id = '{run_id}'
+            WHERE run_id = '{policy_run_id}'
         """)
 
         return {
-            "run_id": run_id,
+            "run_id": policy_run_id,
             "status": overall_status,
             "total_objects": total_objects,
             "successful_objects": successful_objects,
             "failed_objects": failed_objects,
-            "dag_run_id": dag_run_id,
+            "dag_run_id": policy_dag_run_id,
             "excel_file_path": excel_file_path,
             "ranger_summary": ranger_result,
             "keycloak_summary": keycloak_result
@@ -678,8 +684,8 @@ with DAG(
 
     # Finalize run (update metrics in runs table)
     finalize = finalize_policy_run(
-        run_id=run_id_task,
-        dag_run_id=dag_run_id,
+        policy_run_id=run_id_task,
+        policy_dag_run_id=dag_run_id,
         excel_file_path=excel_path,
         parsed_data=parsed_data,
         ranger_result=ranger_result,
@@ -688,10 +694,12 @@ with DAG(
 
     # Generate report
     report_path = generate_policy_report(run_id_task)
-
     # Dependencies
     init_tables >> run_id_task >> parsed_data
     parsed_data >> [ranger_result, keycloak_result]
-    [ranger_result, keycloak_result] >> [write_ranger, write_keycloak] >> finalize >> report_path
+    [ranger_result, keycloak_result] >> write_ranger
+    [ranger_result, keycloak_result] >> write_keycloak
+
+    [write_ranger, write_keycloak] >> finalize >> report_path
 
 
