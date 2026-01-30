@@ -36,6 +36,34 @@ def get_config() -> dict:
         'report_output_location': Variable.get('policy_report_location', default_var='s3a://data-lake/policy_reports')
     }
 
+def parse_permission_string(permissions: str) -> List[str]:
+    """Parse permission string into list."""
+    if not permissions or str(permissions).lower() == 'nan':
+        return ['read']
+    return [p.strip().lower() for p in str(permissions).split(',') if p.strip()]
+
+
+def parse_csv_field(value: str) -> List[str]:
+    """Parse comma-separated field into list."""
+    if not value or str(value).lower() == 'nan':
+        return []
+    return [v.strip() for v in str(value).split(',') if v.strip()]
+
+
+def build_policy_name(catalog: str, database: str, table: str, column: str) -> str:
+    """
+    Build policy name following the convention:
+    iceberg.${database}.${table if not *}.${column if not *}
+    """
+    parts = [catalog, database]
+    
+    if table and table != '*':
+        parts.append(table)
+        if column and column != '*':
+            parts.append(column)
+    
+    return '.'.join(parts)
+
 default_args = {
     'owner': 'trino-admin',
     'depends_on_past': False,
@@ -130,20 +158,62 @@ with DAG(
     @task.pyspark(conn_id="spark_default")
     def create_policy_run(excel_file_path: str, dag_run_id: str, spark, sc) -> str:
         import uuid
-        run_id = f"run_{datetime.utcnow():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
+        run_id = f"run_{datetime.now(datetime.timezone.utc):%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
         db = get_config()["tracking_database"]
 
         spark.sql(f"""
-            INSERT INTO {db}.ranger_policy_runs
+            INSERT INTO {db}.ranger_policy_runs (
+                run_id,
+                dag_run_id,
+                excel_file_path,
+                started_at,
+                completed_at,
+                status,
+                total_objects,
+                successful_objects,
+                failed_objects,
+                total_policies_parsed,
+                total_role_mappings_parsed,
+                groups_created,
+                groups_existing,
+                policies_created,
+                policies_updated,
+                policies_failed,
+                roles_created,
+                roles_existing,
+                mappings_created,
+                mappings_existing,
+                failed_operations,
+                error_message
+            )
             VALUES (
-                '{run_id}', '{dag_run_id}', '{excel_file_path}',
-                current_timestamp(), NULL, 'RUNNING',
-                0, 0, 0, NULL,
-                current_timestamp(), current_timestamp()
+                '{run_id}',
+                '{dag_run_id}',
+                '{excel_file_path}',
+                current_timestamp(),
+                NULL,
+                'RUNNING',
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                NULL
             )
         """)
 
         return run_id
+
 
     @task.pyspark(conn_id='spark_default')
     def parse_excel_to_dicts(excel_file_path: str, run_id: str, spark, sc) -> Dict[str, Any]:
@@ -226,34 +296,6 @@ with DAG(
         logger.info(f"Parsed {len(policies)} policies and {len(role_groups)} role-group mappings")
         return {'policies': policies, 'role_groups': role_groups}
 
-    def parse_permission_string(permissions: str) -> List[str]:
-        """Parse permission string into list."""
-        if not permissions or str(permissions).lower() == 'nan':
-            return ['read']
-        return [p.strip().lower() for p in str(permissions).split(',') if p.strip()]
-
-
-    def parse_csv_field(value: str) -> List[str]:
-        """Parse comma-separated field into list."""
-        if not value or str(value).lower() == 'nan':
-            return []
-        return [v.strip() for v in str(value).split(',') if v.strip()]
-
-
-    def build_policy_name(catalog: str, database: str, table: str, column: str) -> str:
-        """
-        Build policy name following the convention:
-        iceberg.${database}.${table if not *}.${column if not *}
-        """
-        parts = [catalog, database]
-        
-        if table and table != '*':
-            parts.append(table)
-            if column and column != '*':
-                parts.append(column)
-        
-        return '.'.join(parts)
-
 
     @task.pyspark(conn_id="spark_default")
     def write_policy_object_status(object_status: dict, spark, sc) -> dict:
@@ -267,13 +309,17 @@ with DAG(
         obj_key = object_status.get("object_key", "")
         status = object_status.get("status", "RUNNING")
         error_msg = object_status.get("error_message", "")
-        started_at = object_status.get("started_at", datetime.utcnow())
+        started_at = object_status.get("started_at", datetime.now(datetime.timezone.utc))
         completed_at = object_status.get("completed_at", None)
-        attempt = object_status.get("attempt", 1)
-        created_at = datetime.utcnow()
+        created_at = datetime.now(datetime.timezone.utc)
 
+        # Format as SQL timestamp strings
+        started_at_sql = f"'{started_at.strftime('%Y-%m-%d %H:%M:%S')}'"
+        completed_at_sql = f"'{completed_at.strftime('%Y-%m-%d %H:%M:%S')}'" if completed_at else "NULL"
+        created_at_sql = f"'{created_at.strftime('%Y-%m-%d %H:%M:%S')}'"
+
+        attempt = object_status.get("attempt", 1)
         error_msg_sql = error_msg.replace("'", "''")
-        completed_at_sql = f"'{completed_at}'" if completed_at else "NULL"
 
         spark.sql(f"""
             MERGE INTO {db}.ranger_policy_object_status t
@@ -282,7 +328,7 @@ with DAG(
             WHEN MATCHED THEN UPDATE SET
                 status = '{status}',
                 error_message = '{error_msg_sql}',
-                completed_at = {completed_at_sql},
+                completed_at = {completed_at},
                 attempt = {attempt},
                 updated_at = current_timestamp()
             WHEN NOT MATCHED THEN INSERT (
@@ -291,8 +337,8 @@ with DAG(
                 attempt, created_at
             ) VALUES (
                 '{run_id}', '{obj_type}', '{obj_name}', '{obj_key}',
-                '{status}', '{error_msg_sql}', '{started_at}', {completed_at_sql},
-                {attempt}, '{created_at}'
+                '{status}', '{error_msg_sql}', '{started_at_sql}', {completed_at_sql},
+                {attempt}, '{created_at_sql}'
             )
         """)
 
@@ -332,8 +378,8 @@ with DAG(
                 "object_type": "group",
                 "object_name": g,
                 "status": "SUCCESS",
-                "started_at": datetime.utcnow(),
-                "completed_at": datetime.utcnow()
+                "started_at": datetime.now(datetime.timezone.utc),
+                "completed_at": datetime.now(datetime.timezone.utc)
             })
 
         # Sync policies
@@ -346,8 +392,8 @@ with DAG(
                     "object_name": p['name'],
                     "status": "FAILED" if obj_list == "failed" else "SUCCESS",
                     "error_message": p.get('error', ''),
-                    "started_at": datetime.utcnow(),
-                    "completed_at": datetime.utcnow()
+                    "started_at": datetime.now(datetime.timezone.utc),
+                    "completed_at": datetime.now(datetime.timezone.utc)
                 })
 
         return statuses
@@ -379,8 +425,8 @@ with DAG(
                         "object_name": name,
                         "status": "FAILED" if key=="failed" else "SUCCESS",
                         "error_message": entry.get('error','') if isinstance(entry, dict) else "",
-                        "started_at": datetime.utcnow(),
-                        "completed_at": datetime.utcnow()
+                        "started_at": datetime.now(datetime.timezone.utc),
+                        "completed_at": datetime.now(datetime.timezone.utc)
                     })
         return statuses
 
@@ -520,7 +566,7 @@ with DAG(
                 </table>
 
                 <p style="margin-top:20px; font-size:12px; color:#6c757d;">
-                    Report generated automatically by the Ranger Policy DAG on {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC.
+                    Report generated automatically by the Ranger Policy DAG on {datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC.
                 </p>
             </div>
         </body>
