@@ -2332,6 +2332,9 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
             """).collect()
             
             next_retry = (retry_info[0]['current_retry'] + 1) if retry_info else 1
+            retry_fields = f"true, '{retry_run_id}', {next_retry}, current_timestamp()"
+        else:
+            retry_fields = "false, NULL, 0, NULL"
         
         try:
             hive_count = spark.sql(f"SELECT COUNT(*) as c FROM {src_db}.{tbl}").collect()[0]['c']
@@ -2382,11 +2385,6 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
                 'partition_match': partition_match,
                 'error': None
             })
-
-            if is_retry:
-                retry_fields = f"true, '{retry_run_id}', {next_retry}, current_timestamp()"
-            else:
-                retry_fields = "false, NULL, 0, NULL"
             
             spark.sql(f"""
                 INSERT INTO {tracking_db}.iceberg_migration_table_status
@@ -3045,6 +3043,55 @@ def finalize_iceberg_run(run_id: str, spark, sc) -> dict:
 # =============================================================================
 
 @task.pyspark(conn_id='spark_default')
+def create_retry_iceberg_migration_run(parent_run_id: str, dag_run_id: str, spark, sc) -> str:
+    """Create retry Iceberg migration run record with parent linkage."""
+    from datetime import datetime
+    import uuid
+    
+    config = get_config()
+    tracking_db = config['tracking_database']
+    
+    retry_info = spark.sql(f"""
+        SELECT COALESCE(retry_count, 0) as current_retry
+        FROM {tracking_db}.iceberg_migration_runs
+        WHERE run_id = '{parent_run_id}'
+    """).collect()
+    
+    if retry_info:
+        retry_count = retry_info[0]['current_retry'] + 1
+    else:
+        retry_count = 1
+    
+    run_id = f"ice_retry_{retry_count}_{parent_run_id}_{uuid.uuid4().hex[:6]}"
+    
+    spark.sql(f"""
+        INSERT INTO {tracking_db}.iceberg_migration_runs
+        VALUES (
+            '{run_id}',
+            '{dag_run_id}',
+            'iceberg_retry_for_{parent_run_id}',
+            '{parent_run_id}',
+            'RETRY',
+            current_timestamp(),
+            NULL,
+            'RUNNING',
+            0, 0, 0,
+            '{json.dumps(config).replace("'", "''")}',
+            '{parent_run_id}',
+            true,
+            {retry_count}
+        )
+    """)
+    
+    spark.sql(f"""
+        UPDATE {tracking_db}.iceberg_migration_runs
+        SET retry_count = {retry_count}
+        WHERE run_id = '{parent_run_id}'
+    """)
+    
+    return run_id
+
+@task.pyspark(conn_id='spark_default')
 def get_failed_iceberg_migrations(parent_run_id: str, spark, sc) -> list:
     """ Query Iceberg tracking table to identify failed Iceberg migrations. """
     config = get_config()
@@ -3226,13 +3273,14 @@ with DAG(
     t_retry_val_status = update_validation_status.partial(retry_run_id=t_retry_run_id).expand(validation_result=t_retry_validation)
 
     # Report generation 
-    t_retry_report = generate_html_report(run_id="{{ params.parent_run_id }}")
+    t_retry_report = generate_html_report(run_id=t_retry_run_id)
 
     # Finalize
-    t_retry_final = finalize_run(run_id="{{ params.parent_run_id }}")
+    t_retry_final = finalize_run(run_id=t_retry_run_id)
     t_retry_cleanup = cleanup_edge(mapr_setup=t_retry_mapr, run_id=t_retry_run_id)
 
     # Dependencies
+    t_retry_failed >> t_retry_run_id
     t_retry_failed >> t_retry_grouped
     [t_retry_run_id, t_retry_grouped] >> t_retry_mapr
     t_retry_mapr >> t_retry_distcp >> t_retry_distcp_status
@@ -3334,8 +3382,8 @@ with DAG(
         parent_run_id="{{ params.parent_run_id }}"
     )
     t_ice_retry_grouped = group_iceberg_failures(failed_tables=t_ice_retry_failed)
-    t_ice_retry_run_id = create_iceberg_migration_run(
-        excel_file_path="iceberg_retry_for_{{ params.parent_run_id }}",
+    t_ice_retry_run_id = create_retry_iceberg_migration_run(
+        parent_run_id="{{ params.parent_run_id }}",
         dag_run_id="{{ run_id }}"
     )
     t_ice_retry_parent = lookup_parent_migration_run(excel_configs=t_ice_retry_grouped)
@@ -3357,14 +3405,13 @@ with DAG(
     t_ice_retry_val_status = update_iceberg_validation_status.partial(retry_run_id=t_ice_retry_run_id).expand(validation_result=t_ice_retry_validate)
 
     # Report generation
-    t_ice_retry_report = generate_iceberg_html_report(
-        run_id="{{ params.parent_run_id }}"
-    )
+    t_ice_retry_report = generate_iceberg_html_report(run_id=t_ice_retry_run_id)
 
     # Finalise
-    t_ice_retry_final = finalize_iceberg_run(run_id="{{ params.parent_run_id }}")
+    t_ice_retry_final = finalize_iceberg_run(run_id=t_ice_retry_run_id)
 
     # Dependencies
+    t_ice_retry_failed >> t_ice_retry_run_id
     t_ice_retry_failed >> t_ice_retry_grouped
     [t_ice_retry_run_id, t_ice_retry_grouped] >> t_ice_retry_parent
     [t_ice_retry_grouped, t_ice_retry_parent] >> t_ice_retry_migrate
