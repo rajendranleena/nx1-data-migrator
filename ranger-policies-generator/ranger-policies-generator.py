@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 def get_config() -> dict:
     return {
-        'ranger_url': Variable.get('ranger_url'),
+        'ranger_url': Variable.get('ranger_url', default_var='http://ranger:6080'),
         'ranger_username': Variable.get('ranger_username'),
         'ranger_password': Variable.get('ranger_password', deserialize_json=False),
         'service_name': Variable.get('nx1_repo_name', default_var='nx1-unifiedsql'),
@@ -33,7 +33,7 @@ def get_config() -> dict:
         'keycloak_client_id': Variable.get('keycloak_admin_client_id'),
         'keycloak_client_secret': Variable.get('keycloak_admin_client_secret', deserialize_json=False),
         'spark_conn_id': Variable.get('spark_conn_id', default_var='spark_default'),
-        'tracking_database': Variable.get('policy_tracking_database_lee', default_var='policy_tracking'),
+        'tracking_database': Variable.get('policy_tracking_database', default_var='policy_tracking'),
         'tracking_location': Variable.get('policy_tracking_location', default_var='s3a://data-lake/policy_tracking'),
         'report_output_location': Variable.get('policy_report_location', default_var='s3a://data-lake/policy_reports')
     }
@@ -81,10 +81,10 @@ default_args = {
 # DAG
 # -----------------------------
 with DAG(
-    dag_id='test_ranger_policy_automation',
+    dag_id='ranger_policy_automation',
     default_args=default_args,
     description='Automate Ranger & Keycloak policy creation from Excel configuration',
-    schedule=None,
+    schedule_interval=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=['ranger', 'keycloak', 'security', 'policy-automation'],
