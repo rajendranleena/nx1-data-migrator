@@ -121,6 +121,8 @@ def get_config() -> dict:
         'mapr_user': Variable.get('mapr_user', default_var=''),
         'mapr_password': Variable.get('mapr_password', default_var=''),
         'mapr_cluster': Variable.get('mapr_cluster', default_var=''),
+
+        's3_listing_tool': Variable.get('s3_listing_tool', default_var='hadoop'),
     }
 
 # SSH timeout: 24 hours
@@ -159,7 +161,10 @@ def init_tracking_tables(spark, sc) -> dict:
             total_tables INT,
             successful_tables INT,
             failed_tables INT,
-            config_json STRING
+            config_json STRING,
+            parent_run_id STRING,
+            is_retry BOOLEAN,
+            retry_count INT
         )
         USING iceberg
         LOCATION '{tracking_loc}/migration_runs'
@@ -185,8 +190,12 @@ def init_tracking_tables(spark, sc) -> dict:
             source_row_count BIGINT,                        
             mapr_total_size_bytes BIGINT,                   
             mapr_file_count BIGINT,                         
-            s3_total_size_bytes BIGINT,                    
-            s3_file_count BIGINT,                           
+            s3_total_size_bytes_before BIGINT, 
+            s3_file_count_before BIGINT,         
+            s3_total_size_bytes_after BIGINT,
+            s3_file_count_after BIGINT,
+            s3_bytes_transferred BIGINT,         
+            s3_files_transferred BIGINT,                             
             file_size_match BOOLEAN,                        
             file_count_match BOOLEAN,       
             discovery_status STRING,
@@ -215,7 +224,12 @@ def init_tracking_tables(spark, sc) -> dict:
             schema_differences STRING,
             overall_status STRING,
             error_message STRING,
-            updated_at TIMESTAMP
+            updated_at TIMESTAMP,
+            is_retry BOOLEAN,
+            retry_run_id STRING,
+            retry_count INT,
+            last_retry_at TIMESTAMP,
+            parent_run_id STRING
         )
         USING iceberg
         LOCATION '{tracking_loc}/migration_table_status'
@@ -264,7 +278,10 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark, sc) -> st
             NULL,
             'RUNNING',
             0, 0, 0,
-            '{json.dumps(config).replace("'", "''")}'
+            '{json.dumps(config).replace("'", "''")}',
+            NULL,
+            false,
+            0
         )
     """)
     
@@ -636,7 +653,8 @@ def record_discovered_tables(discovery: dict, spark, sc) -> dict:
                 partition_columns, table_type, source_row_count,         
                 mapr_total_size_bytes, mapr_file_count,                   
                 discovery_status, discovery_completed_at,
-                discovery_duration_seconds, overall_status, updated_at
+                discovery_duration_seconds, overall_status, updated_at,
+                is_retry, retry_count, parent_run_id
             ) VALUES (
                 '{run_id}', '{t['source_database']}', '{t['source_table']}',
                 '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
@@ -645,7 +663,8 @@ def record_discovered_tables(discovery: dict, spark, sc) -> dict:
                 '{schema_json}', '{parts_json}', '{t.get('partition_columns', '')}',
                 '{table_type}', {row_count},                               
                 {mapr_size}, {mapr_files},                               
-                'COMPLETED', current_timestamp(), {discovery_duration}, 'DISCOVERED', current_timestamp()
+                'COMPLETED', current_timestamp(), {discovery_duration}, 'DISCOVERED', current_timestamp(),
+                false, 0, NULL
             )
         """)
     
@@ -686,9 +705,39 @@ def run_distcp_ssh(discovery: dict, mapr_setup: dict) -> dict:
         
         cmd = f'''
 set -e
+
+calculate_s3_metrics_hadoop() {{
+    local location=$1
+    
+    if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
+        echo "S3_FILE_COUNT=0"
+        echo "S3_TOTAL_SIZE=0"
+        return
+    fi
+    
+    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
+    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
+    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
+    [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
+    
+    echo "S3_FILE_COUNT=$FILE_COUNT"
+    echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
+}}
+
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
 echo "INCREMENTAL=$INCR"
+
+echo "=== Calculating S3 metrics BEFORE distcp ==="
+S3_BEFORE=$(calculate_s3_metrics_hadoop "{s3_loc}")
+
+S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
+
+echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
+echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
+
+echo "=== Running distcp ==="
 DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}.log "{mapr_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
@@ -696,33 +745,30 @@ echo "DISTCP_EXIT_CODE=$DISTCP_EXIT"
 
 BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | awk '{{print $NF}}' | tr -d ',')
 FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Number of files copied" | awk '{{print $NF}}' | tr -d ',')
-S3_PATH="${{s3_loc#s3a://}}"
-S3_OBJECTS=$(s3Cli ls "$S3_PATH" 2>/dev/null | tail -n +3 | grep '^f')
-S3_FILE_COUNT=$(echo "$S3_OBJECTS" | grep -v '^$' | wc -l)
-S3_TOTAL_SIZE=$(echo "$S3_OBJECTS" | awk '{{
-    size = $2
-    unit = $3
-    
-    # Convert to bytes
-    if (unit == "B") bytes = size
-    else if (unit == "KB") bytes = size * 1024
-    else if (unit == "MB") bytes = size * 1024 * 1024
-    else if (unit == "GB") bytes = size * 1024 * 1024 * 1024
-    else if (unit == "TB") bytes = size * 1024 * 1024 * 1024 * 1024
-    else if (unit == "PB") bytes = size * 1024 * 1024 * 1024 * 1024 * 1024
-    else bytes = 0
-    
-    sum += bytes
-}} END {{print sum}}')
 
-[ -z "$S3_TOTAL_SIZE" ] && S3_TOTAL_SIZE=0
-[ -z "$S3_FILE_COUNT" ] && S3_FILE_COUNT=0
+[ -z "$BYTES_COPIED" ] && BYTES_COPIED=0
+[ -z "$FILES_COPIED" ] && FILES_COPIED=0
 
-echo "DISTCP_EXIT_CODE=$DISTCP_EXIT"
 echo "BYTES_COPIED=$BYTES_COPIED"
 echo "FILES_COPIED=$FILES_COPIED"
-echo "S3_TOTAL_SIZE=$S3_TOTAL_SIZE"
-echo "S3_FILE_COUNT=$S3_FILE_COUNT"
+
+echo "=== Calculating S3 metrics AFTER distcp ==="
+S3_AFTER=$(calculate_s3_metrics_hadoop "{s3_loc}")
+
+S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
+
+echo "S3_FILE_COUNT_AFTER=$S3_FILE_COUNT_AFTER"
+echo "S3_TOTAL_SIZE_AFTER=$S3_TOTAL_SIZE_AFTER"
+
+S3_FILES_TRANSFERRED=$((S3_FILE_COUNT_AFTER - S3_FILE_COUNT_BEFORE))
+S3_BYTES_TRANSFERRED=$((S3_TOTAL_SIZE_AFTER - S3_TOTAL_SIZE_BEFORE))
+
+echo "S3_FILES_TRANSFERRED=$S3_FILES_TRANSFERRED"
+echo "S3_BYTES_TRANSFERRED=$S3_BYTES_TRANSFERRED"
+
+[ "$DISTCP_EXIT" -ne 0 ] && exit $DISTCP_EXIT
+exit 0
 '''
         try:
             with ssh.get_conn() as client:
@@ -733,19 +779,31 @@ echo "S3_FILE_COUNT=$S3_FILE_COUNT"
 
                 bytes_copied = 0
                 files_copied = 0
-                s3_size = 0
-                s3_files = 0
+                s3_size_before = 0
+                s3_files_before = 0
+                s3_size_after = 0
+                s3_files_after = 0
+                s3_bytes_transferred = 0
+                s3_files_transferred = 0
 
                 try:
                     for line in output.split('\n'):
                         if 'BYTES_COPIED=' in line:
                             bytes_copied = int(line.split('=')[1].strip() or 0)
-                        if 'FILES_COPIED=' in line:
+                        elif 'FILES_COPIED=' in line:
                             files_copied = int(line.split('=')[1].strip() or 0)
-                        if 'S3_TOTAL_SIZE=' in line:
-                            s3_size = int(line.split('=')[1].strip() or 0)
-                        if 'S3_FILE_COUNT=' in line:
-                            s3_files = int(line.split('=')[1].strip() or 0)
+                        elif 'S3_TOTAL_SIZE_BEFORE=' in line:
+                            s3_size_before = int(line.split('=')[1].strip() or 0)
+                        elif 'S3_FILE_COUNT_BEFORE=' in line:
+                            s3_files_before = int(line.split('=')[1].strip() or 0)
+                        elif 'S3_TOTAL_SIZE_AFTER=' in line:
+                            s3_size_after = int(line.split('=')[1].strip() or 0)
+                        elif 'S3_FILE_COUNT_AFTER=' in line:
+                            s3_files_after = int(line.split('=')[1].strip() or 0)
+                        elif 'S3_BYTES_TRANSFERRED=' in line:
+                            s3_bytes_transferred = int(line.split('=')[1].strip() or 0)
+                        elif 'S3_FILES_TRANSFERRED=' in line:
+                            s3_files_transferred = int(line.split('=')[1].strip() or 0)
                 except:
                     pass
                 
@@ -759,8 +817,12 @@ echo "S3_FILE_COUNT=$S3_FILE_COUNT"
                     'is_incremental': is_incr,
                     'bytes_copied': bytes_copied,
                     'files_copied': files_copied,
-                    's3_total_size_bytes': s3_size,      
-                    's3_file_count': s3_files, 
+                    's3_total_size_bytes_before': s3_size_before,
+                    's3_file_count_before': s3_files_before,
+                    's3_total_size_bytes': s3_size_after,
+                    's3_file_count': s3_files_after,
+                    's3_bytes_transferred': s3_bytes_transferred,
+                    's3_files_transferred': s3_files_transferred,
                     'error': None
                 })
         except Exception as e:
@@ -771,8 +833,12 @@ echo "S3_FILE_COUNT=$S3_FILE_COUNT"
                 'is_incremental': False,
                 'bytes_copied': 0,
                 'files_copied': 0,
-                's3_total_size_bytes': 0,               
-                's3_file_count': 0,  
+                's3_total_size_bytes_before': 0,
+                's3_file_count_before': 0,
+                's3_total_size_bytes': 0,
+                's3_file_count': 0,
+                's3_bytes_transferred': 0,
+                's3_files_transferred': 0, 
                 'error': str(e)[:2000]
             })
     
@@ -780,7 +846,7 @@ echo "S3_FILE_COUNT=$S3_FILE_COUNT"
 
 
 @task.pyspark(conn_id='spark_default')
-def update_distcp_status(distcp_result: dict, spark, sc) -> dict:
+def update_distcp_status(distcp_result: dict, spark, sc, retry_run_id: str = None) -> dict:
     """Update Iceberg tracking with DistCp results."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -792,8 +858,35 @@ def update_distcp_status(distcp_result: dict, spark, sc) -> dict:
         overall = 'COPIED' if r['status'] == 'COMPLETED' else 'FAILED'
         error_msg = r.get('error', '').replace("'", "''") if r.get('error') else ''
 
-        s3_size = r.get('s3_total_size_bytes', 0)
-        s3_files = r.get('s3_file_count', 0)
+        s3_size_before = r.get('s3_total_size_bytes_before', 0)
+        s3_files_before = r.get('s3_file_count_before', 0)
+        s3_size_after = r.get('s3_total_size_bytes', 0)
+        s3_files_after = r.get('s3_file_count', 0)
+        s3_bytes_transfer = r.get('s3_bytes_transferred', 0)
+        s3_files_transfer = r.get('s3_files_transferred', 0)
+
+        is_retry = retry_run_id is not None
+        if is_retry:
+            retry_info = spark.sql(f"""
+                SELECT COALESCE(retry_count, 0) as current_retry
+                FROM {tracking_db}.migration_table_status
+                WHERE run_id = '{run_id}'
+                  AND source_database = '{r['source_database']}'
+                  AND source_table = '{r['source_table']}'
+            """).collect()
+            
+            next_retry = (retry_info[0]['current_retry'] + 1) if retry_info else 1
+
+        if is_retry:
+            retry_fields = f"""
+                is_retry = true,
+                retry_run_id = '{retry_run_id}',
+                retry_count = {next_retry},
+                last_retry_at = current_timestamp(),
+                parent_run_id = '{run_id}',
+            """
+        else:
+            retry_fields = ""
         
         spark.sql(f"""
             UPDATE {tracking_db}.migration_table_status
@@ -803,12 +896,17 @@ def update_distcp_status(distcp_result: dict, spark, sc) -> dict:
                 distcp_is_incremental = {str(r['is_incremental']).lower()},
                 distcp_bytes_copied = {r.get('bytes_copied', 0)},
                 distcp_files_copied = {r.get('files_copied', 0)},
-                s3_total_size_bytes = {s3_size},                                   
-                s3_file_count = {s3_files},                                        
-                file_count_match = (mapr_file_count = {s3_files}),               
-                file_size_match = (ABS(mapr_total_size_bytes - {s3_size}) / GREATEST(mapr_total_size_bytes, 1) < 0.01),  
+                s3_total_size_bytes_before = {s3_size_before},
+                s3_file_count_before = {s3_files_before},
+                s3_total_size_bytes_after = {s3_size_after},
+                s3_file_count_after = {s3_files_after},
+                s3_bytes_transferred = {s3_bytes_transfer},
+                s3_files_transferred = {s3_files_transfer},                                     
+                file_count_match = (mapr_file_count = {s3_files_after}),               
+                file_size_match = (ABS(mapr_total_size_bytes - {s3_size_after}) / GREATEST(mapr_total_size_bytes, 1) < 0.01),  
                 overall_status = '{overall}',
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
+                {retry_fields}
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
               AND source_database = '{r['source_database']}'
@@ -926,7 +1024,7 @@ def create_hive_tables(distcp_result: dict, spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def update_table_create_status(table_result: dict, spark, sc) -> dict:
+def update_table_create_status(table_result: dict, spark, sc, retry_run_id: str = None) -> dict:
     """Update Iceberg tracking with table creation results."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -934,10 +1032,20 @@ def update_table_create_status(table_result: dict, spark, sc) -> dict:
     dest_db = table_result['dest_database']
 
     table_duration = table_result.get('_task_duration', 0.0)
+
+    is_retry = retry_run_id is not None
     
     for r in table_result.get('table_results', []):
         overall = 'TABLE_CREATED' if r['status'] == 'COMPLETED' else ('FAILED' if r['status'] == 'FAILED' else 'SKIPPED')
         error_msg = (r.get('error', '') or '').replace("'", "''")[:2000]
+
+        if is_retry:
+            retry_fields = f"""
+                retry_run_id = '{retry_run_id}',
+                last_retry_at = current_timestamp(),
+            """
+        else:
+            retry_fields = ""
         
         spark.sql(f"""
             UPDATE {tracking_db}.migration_table_status
@@ -947,6 +1055,7 @@ def update_table_create_status(table_result: dict, spark, sc) -> dict:
                 table_already_existed = {str(r.get('existed', False)).lower()},
                 overall_status = CASE WHEN overall_status != 'FAILED' THEN '{overall}' ELSE overall_status END,
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
+                {retry_fields}
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
               AND dest_database = '{dest_db}'
@@ -1064,7 +1173,7 @@ def validate_destination_tables(source_validation: dict, spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def update_validation_status(validation_result: dict, spark, sc) -> dict:
+def update_validation_status(validation_result: dict, spark, sc, retry_run_id: str = None) -> dict:
     """Update Iceberg tracking with validation results."""
     
     config = get_config()
@@ -1081,6 +1190,7 @@ def update_validation_status(validation_result: dict, spark, sc) -> dict:
     row_mismatches = 0
     partition_mismatches = 0
     schema_mismatches = 0
+    is_retry = retry_run_id is not None
     
     for v in validation_result.get('validation_results', []):
         if v['status'] != 'COMPLETED':
@@ -1104,6 +1214,14 @@ def update_validation_status(validation_result: dict, spark, sc) -> dict:
             passed_validation += 1
         else:
             failed_validation += 1
+
+        if is_retry:
+            retry_fields = f"""
+                retry_run_id = '{retry_run_id}',
+                last_retry_at = current_timestamp(),
+            """
+        else:
+            retry_fields = ""
         
         spark.sql(f"""
             UPDATE {tracking_db}.migration_table_status
@@ -1126,6 +1244,7 @@ def update_validation_status(validation_result: dict, spark, sc) -> dict:
                     ELSE 'VALIDATION_FAILED' 
                 END,
                 error_message = CASE WHEN '{v['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
+                {retry_fields}
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
               AND dest_database = '{dest_db}'
@@ -1155,6 +1274,9 @@ def update_validation_status(validation_result: dict, spark, sc) -> dict:
             'file_size_mismatches': size_mismatches,
             'file_count_mismatches': count_mismatches
         }
+        if is_retry:
+            validation_summary['retry_run_id'] = retry_run_id
+
         summary_json = json.dumps(validation_summary).replace("'", "''")
         
         spark.sql(f"""
@@ -1208,6 +1330,17 @@ def generate_html_report(run_id: str, spark, sc) -> str:
     total_files = sum(t.distcp_files_copied or 0 for t in table_status)
     total_rows = sum(t.source_row_count or 0 for t in table_status)
     incremental_runs = sum(1 for t in table_status if t.distcp_is_incremental)
+    retry_count = sum(1 for t in table_status if t.is_retry)
+
+    retry_info_html = ""
+    if run_info.is_retry:
+        retry_info_html = f"""
+        <div class="summary-card warning">
+            <h3>RETRY RUN</h3>
+            <p class="value">#{run_info.retry_count}</p>
+            <small>Parent: {run_info.parent_run_id}</small>
+        </div>
+        """
     
     # Generate HTML
     html = f"""
@@ -1223,6 +1356,14 @@ def generate_html_report(run_id: str, spark, sc) -> str:
             margin: 0;
             padding: 20px;
             background-color: #f5f5f5;
+        }}
+        .retry-badge {{
+            background-color: #fff3cd;
+            color: #856404;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            margin-left: 5px;
         }}
         .container {{
             max-width: 1400px;
@@ -1349,6 +1490,15 @@ def generate_html_report(run_id: str, spark, sc) -> str:
             Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
             Run ID: <strong>{run_id}</strong><br>
             DAG Run: <strong>{run_info.dag_run_id}</strong>
+"""
+    
+    if run_info.is_retry and run_info.parent_run_id:
+        html += f"""<br>
+            <span class="retry-badge">RETRY RUN #{run_info.retry_count}</span><br>
+            Parent Run ID: <strong>{run_info.parent_run_id}</strong>
+"""
+    
+    html += """
         </div>
         
         <h2>Migration Summary</h2>
@@ -1381,6 +1531,25 @@ def generate_html_report(run_id: str, spark, sc) -> str:
                 <h3>INCREMENTAL RUNS</h3>
                 <p class="value">{incremental_runs}</p>
             </div>
+""".format(
+        total_tables=total_tables,
+        successful_tables=successful_tables,
+        failed_tables=failed_tables,
+        total_data_gb=total_data_gb,
+        total_files=total_files,
+        total_rows=total_rows,
+        incremental_runs=incremental_runs
+    )
+    
+    if retry_count > 0:
+        html += f"""
+            <div class="summary-card warning">
+                <h3>RETRIED TABLES</h3>
+                <p class="value">{retry_count}</p>
+            </div>
+"""
+    
+    html += """
         </div>
         
         <div class="section-divider"></div>
@@ -1457,6 +1626,9 @@ def generate_html_report(run_id: str, spark, sc) -> str:
         distcp_detail = f"<br><small>{t.distcp_bytes_copied/(1024**2):.1f} MB, {t.distcp_files_copied:,} files</small>" if t.distcp_bytes_copied else ""
         if t.distcp_is_incremental:
             distcp_dur += " <span style='background-color: #fff3cd; padding: 2px 6px; border-radius: 4px; font-size: 10px;'>INCREMENTAL</span>"
+        table_name = f"<strong>{t.source_table}</strong>"
+        if t.is_retry:
+            table_name += f" <span class='retry-badge'>RETRY #{t.retry_count}</span>"
         table_dur = f"{t.table_create_duration_seconds:.1f}s" if t.table_create_duration_seconds else "N/A"
         val_dur = f"{t.validation_duration_seconds:.1f}s" if t.validation_duration_seconds else "N/A"
         
@@ -1539,10 +1711,14 @@ def generate_html_report(run_id: str, spark, sc) -> str:
                     <th>Database</th>
                     <th>Table</th>
                     <th>MapR Size (GB)</th>
-                    <th>S3 Size (GB)</th>
+                    <th>S3 Size Before (GB)</th>
+                    <th>S3 Size After (GB)</th>
+                    <th>S3 Size - Transferred (GB)</th>
                     <th>Size Match</th>
                     <th>MapR Files</th>
-                    <th>S3 Files</th>
+                    <th>S3 Files Before</th>
+                    <th>S3 Files After</th>
+                    <th>S3 Files - Transferred</th>
                     <th>File Count Match</th>
                 </tr>
             </thead>
@@ -1554,7 +1730,9 @@ def generate_html_report(run_id: str, spark, sc) -> str:
             continue
         
         mapr_size_gb = (t.mapr_total_size_bytes or 0) / (1024**3)
-        s3_size_gb = (t.s3_total_size_bytes or 0) / (1024**3)
+        s3_size_before_gb = (t.s3_total_size_bytes_before or 0) / (1024**3)
+        s3_size_after_gb = (t.s3_total_size_bytes_after or 0) / (1024**3)
+        s3_transferred_gb = (t.s3_bytes_transferred or 0) / (1024**3)
         
         size_match_class = 'validation-pass' if t.file_size_match else 'validation-fail'
         size_match_icon = '✓ PASS' if t.file_size_match else '✗ FAIL'
@@ -1567,10 +1745,14 @@ def generate_html_report(run_id: str, spark, sc) -> str:
                     <td>{t.source_database}</td>
                     <td><strong>{t.source_table}</strong></td>
                     <td class="metric">{mapr_size_gb:.2f}</td>
-                    <td class="metric">{s3_size_gb:.2f}</td>
+                    <td class="metric">{s3_size_before_gb:.2f}</td>
+                    <td class="metric">{s3_size_after_gb:.2f}</td>
+                    <td class="metric">{s3_transferred_gb:.2f}</td>
                     <td class="{size_match_class}">{size_match_icon}</td>
                     <td class="metric">{t.mapr_file_count:,}</td>
-                    <td class="metric">{t.s3_file_count:,}</td>
+                    <td class="metric">{t.s3_file_count_before:,}</td>
+                    <td class="metric">{t.s3_file_count_after:,}</td>
+                    <td class="metric">{t.s3_files_transferred:,}</td>
                     <td class="{count_match_class}">{count_match_icon}</td>
                 </tr>
 """ 
@@ -1695,12 +1877,58 @@ def cleanup_edge(mapr_setup: dict, run_id: str) -> dict:
 # =============================================================================
 
 @task.pyspark(conn_id='spark_default')
+def create_retry_migration_run(parent_run_id: str, dag_run_id: str, spark, sc) -> str:
+    """Create retry migration run record with parent linkage."""
+    from datetime import datetime
+    import uuid
+    
+    config = get_config()
+    tracking_db = config['tracking_database']
+    
+    retry_info = spark.sql(f"""
+        SELECT COALESCE(retry_count, 0) as current_retry
+        FROM {tracking_db}.migration_runs
+        WHERE run_id = '{parent_run_id}'
+    """).collect()
+    
+    if retry_info:
+        retry_count = retry_info[0]['current_retry'] + 1
+    else:
+        retry_count = 1
+    
+    run_id = f"retry_{retry_count}_{parent_run_id}_{uuid.uuid4().hex[:6]}"
+    
+    spark.sql(f"""
+        INSERT INTO {tracking_db}.migration_runs
+        VALUES (
+            '{run_id}',
+            '{dag_run_id}',
+            'retry_for_{parent_run_id}',
+            current_timestamp(),
+            NULL,
+            'RUNNING',
+            0, 0, 0,
+            '{json.dumps(config).replace("'", "''")}',
+            '{parent_run_id}',
+            true,
+            {retry_count}
+        )
+    """)
+    
+    spark.sql(f"""
+        UPDATE {tracking_db}.migration_runs
+        SET retry_count = {retry_count}
+        WHERE run_id = '{parent_run_id}'
+    """)
+    
+    return run_id
+
+@task.pyspark(conn_id='spark_default')
 def get_failed_tables(parent_run_id: str, spark, sc) -> list:
     """ Query tracking table to identify tables that need retry. """
     config = get_config()
     tracking_db = config['tracking_database']
 
-    # Query for tables needing retry
     failed_tables_df = spark.sql(f"""
         SELECT
             source_database,
@@ -1724,7 +1952,8 @@ def get_failed_tables(parent_run_id: str, spark, sc) -> list:
             distcp_status,
             table_create_status,
             validation_status,
-            error_message
+            error_message,
+            COALESCE(retry_count, 0) as current_retry_count
         FROM {tracking_db}.migration_table_status
         WHERE run_id = '{parent_run_id}'
           AND (
@@ -1763,7 +1992,8 @@ def get_failed_tables(parent_run_id: str, spark, sc) -> list:
             'distcp_status': row.distcp_status,
             'table_create_status': row.table_create_status,
             'validation_status': row.validation_status,
-            'error_message': row.error_message
+            'error_message': row.error_message,
+            'current_retry_count': row.current_retry_count,
         })
 
     return failed_tables
@@ -1818,7 +2048,10 @@ def init_iceberg_tracking_tables(spark, sc) -> dict:
             total_tables INT,
             successful_tables INT,
             failed_tables INT,
-            config_json STRING
+            config_json STRING,
+            parent_run_id STRING,
+            is_retry BOOLEAN,
+            retry_count INT
         )
         USING iceberg
         LOCATION '{tracking_loc}/iceberg_migration_runs'
@@ -1851,7 +2084,11 @@ def init_iceberg_tracking_tables(spark, sc) -> dict:
             validation_duration_seconds DOUBLE,
             error_message STRING,
             updated_at TIMESTAMP,
-            parent_migration_run_id STRING
+            parent_migration_run_id STRING,
+            is_retry BOOLEAN,
+            retry_run_id STRING,
+            retry_count INT,
+            last_retry_at TIMESTAMP
         )
         USING iceberg
         LOCATION '{tracking_loc}/iceberg_migration_table_status'
@@ -1883,7 +2120,10 @@ def create_iceberg_migration_run(excel_file_path: str, dag_run_id: str, spark, s
             NULL,
             'RUNNING',
             0, 0, 0,
-            '{json.dumps(config).replace("'", "''")}'
+            '{json.dumps(config).replace("'", "''")}',
+            NULL,
+            false,
+            0
         )
     """)
     
@@ -2056,7 +2296,7 @@ def discover_hive_tables(db_config: dict, spark, sc) -> dict:
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
-def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: str, spark, sc) -> dict:
+def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: str, spark, sc, retry_run_id: str = None) -> dict:
     """Migrate discovered Hive tables to Iceberg format."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -2072,6 +2312,8 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
     
     results = []
+
+    is_retry = retry_run_id is not None
     
     for tbl_meta in discovery.get('discovered_tables', []):
         tbl = tbl_meta['table']
@@ -2079,6 +2321,17 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
         table_key = f"{src_db}.{tbl}"
         parent_run_id = table_parent_mapping.get(table_key)
         parent_run_id_sql = f"'{parent_run_id}'" if parent_run_id else 'NULL'
+
+        if is_retry:
+            retry_info = spark.sql(f"""
+                SELECT COALESCE(retry_count, 0) as current_retry
+                FROM {tracking_db}.iceberg_migration_table_status
+                WHERE run_id = '{run_id}'
+                  AND source_database = '{src_db}'
+                  AND source_table = '{tbl}'
+            """).collect()
+            
+            next_retry = (retry_info[0]['current_retry'] + 1) if retry_info else 1
         
         try:
             hive_count = spark.sql(f"SELECT COUNT(*) as c FROM {src_db}.{tbl}").collect()[0]['c']
@@ -2129,6 +2382,11 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
                 'partition_match': partition_match,
                 'error': None
             })
+
+            if is_retry:
+                retry_fields = f"true, '{retry_run_id}', {next_retry}, current_timestamp()"
+            else:
+                retry_fields = "false, NULL, 0, NULL"
             
             spark.sql(f"""
                 INSERT INTO {tracking_db}.iceberg_migration_table_status
@@ -2158,7 +2416,8 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
                     NULL,
                     NULL,
                     current_timestamp(),
-                    {parent_run_id_sql}
+                    {parent_run_id_sql},
+                    {retry_fields}
                 )
             """)
             
@@ -2201,7 +2460,8 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
                     NULL,
                     '{error_msg}',
                     current_timestamp(),
-                    {parent_run_id_sql}
+                    {parent_run_id_sql},
+                    {retry_fields}
                 )
             """)
     
@@ -2324,7 +2584,7 @@ def validate_iceberg_tables(migration_result: dict, spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def update_iceberg_validation_status(validation_result: dict, spark, sc) -> dict:
+def update_iceberg_validation_status(validation_result: dict, spark, sc, retry_run_id: str = None) -> dict:
     """Update Iceberg tracking with validation results."""
     
     config = get_config()
@@ -2335,6 +2595,7 @@ def update_iceberg_validation_status(validation_result: dict, spark, sc) -> dict
     
     # Extract duration from XCom result
     validation_duration = validation_result.get('_task_duration', 0.0)
+    is_retry = retry_run_id is not None
     
     for v in validation_result.get('validation_results', []):
         if v['status'] != 'COMPLETED':
@@ -2348,6 +2609,14 @@ def update_iceberg_validation_status(validation_result: dict, spark, sc) -> dict
             v.get('partition_count_match', True) and 
             v.get('schema_match', False)
         ) else 'VALIDATION_FAILED'
+
+        if is_retry:
+            retry_fields = f"""
+                retry_run_id = '{retry_run_id}',
+                last_retry_at = current_timestamp(),
+            """
+        else:
+            retry_fields = ""
         
         spark.sql(f"""
             UPDATE {tracking_db}.iceberg_migration_table_status
@@ -2364,6 +2633,7 @@ def update_iceberg_validation_status(validation_result: dict, spark, sc) -> dict
                 schema_differences = '{schema_diffs}',
                 status = '{overall_status}',
                 error_message = CASE WHEN '{v['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
+                {retry_fields}
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
               AND source_database = '{src_db}'
@@ -2937,8 +3207,8 @@ with DAG(
     # Identify failed tables from parent run 
     t_retry_failed = get_failed_tables(parent_run_id="{{ params.parent_run_id }}")
     t_retry_grouped = group_failed_tables_by_database(failed_tables=t_retry_failed)
-    t_retry_run_id = create_migration_run(
-        excel_file_path="retry_run_for_{{ params.parent_run_id }}",
+    t_retry_run_id = create_retry_migration_run(
+        parent_run_id="{{ params.parent_run_id }}",
         dag_run_id="{{ run_id }}"
     )
     t_retry_mapr = mapr_token_setup(run_id=t_retry_run_id)
@@ -2947,13 +3217,13 @@ with DAG(
     t_retry_distcp = run_distcp_ssh.partial(mapr_setup=t_retry_mapr).expand(
         discovery=t_retry_grouped  
     )
-    t_retry_distcp_status = update_distcp_status.expand(distcp_result=t_retry_distcp)
+    t_retry_distcp_status = update_distcp_status.partial(retry_run_id=t_retry_run_id).expand(distcp_result=t_retry_distcp)
     t_retry_tables = create_hive_tables.expand(distcp_result=t_retry_distcp_status)
-    t_retry_tbl_status = update_table_create_status.expand(table_result=t_retry_tables)
+    t_retry_tbl_status = update_table_create_status.partial(retry_run_id=t_retry_run_id).expand(table_result=t_retry_tables)
 
     # Validation taks
     t_retry_validation = validate_destination_tables.expand(source_validation=t_retry_tbl_status)
-    t_retry_val_status = update_validation_status.expand(validation_result=t_retry_validation)
+    t_retry_val_status = update_validation_status.partial(retry_run_id=t_retry_run_id).expand(validation_result=t_retry_validation)
 
     # Report generation 
     t_retry_report = generate_html_report(run_id="{{ params.parent_run_id }}")
@@ -3073,7 +3343,8 @@ with DAG(
     # Per-database processing
     t_ice_retry_migrate = migrate_tables_to_iceberg.partial(
         dag_run_id="{{ run_id }}",
-        parent_lookup=t_ice_retry_parent
+        parent_lookup=t_ice_retry_parent,
+        retry_run_id=t_ice_retry_run_id
     ).expand(discovery=t_ice_retry_grouped)
     t_ice_retry_durations = update_migration_durations.expand(
         migration_result=t_ice_retry_migrate
@@ -3083,9 +3354,7 @@ with DAG(
     t_ice_retry_validate = validate_iceberg_tables.expand(
         migration_result=t_ice_retry_durations
     )
-    t_ice_retry_val_status = update_iceberg_validation_status.expand(
-        validation_result=t_ice_retry_validate
-    )
+    t_ice_retry_val_status = update_iceberg_validation_status.partial(retry_run_id=t_ice_retry_run_id).expand(validation_result=t_ice_retry_validate)
 
     # Report generation
     t_ice_retry_report = generate_iceberg_html_report(
