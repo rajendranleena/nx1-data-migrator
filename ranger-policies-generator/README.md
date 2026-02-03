@@ -52,6 +52,8 @@ Based on the Excel data, policy names are generated as follows:
    - Policy name: `{url}`
    - Example: `s3a://ml-bucket/models/*`
 
+*Note: Policy names are prefixed with `iceberg` to match the catalog used for table-type policies in Ranger. The `iceberg` catalog supports both Iceberg and Hive tables.
+
 ## Permission Mappings
 
 | Excel Permission | Ranger Access Types |

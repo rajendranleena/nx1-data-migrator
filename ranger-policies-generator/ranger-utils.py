@@ -271,6 +271,9 @@ class RangerPolicyManager:
             Dictionary with 'status' ('created', 'updated', or 'failed') and policy details
         """
         try:
+            logger.debug(f"Processing table policy '{policy_name}' -  url={url}")
+            logger.debug(f"Role permissions: {role_permissions}")
+            
             existing_policy = self.get_existing_policy(policy_name)
             
             # Build policy items from role_permissions
@@ -363,14 +366,36 @@ class RangerPolicyManager:
         policy.resources = resources
         policy.policyItems = policy_items
         
-        created_policy = self.client.create_policy(policy)
-        logger.info(f"Created policy: {policy_name}")
+        logger.debug(f"Creating policy '{policy_name}' for service '{self.service_name}'")
+        logger.debug(f"Resources: {resources}")
+        logger.debug(f"Policy items: {[{'groups': item.groups, 'accesses': [a.type for a in item.accesses]} for item in policy_items]}")
         
-        return {
-            'status': 'created',
-            'policy_name': policy_name,
-            'policy_id': created_policy.id if hasattr(created_policy, 'id') else None
-        }
+        try:
+            logger.debug(f"Sending create_policy request to Ranger at {self.ranger_url} for service {self.service_name}")
+            created_policy = self.client.create_policy(policy)
+            # Check if response is None (indicates silent failure)
+            if created_policy is None:
+                logger.error(f"create_policy returned None for policy '{policy_name}' - this typically indicates SSL/network issues or Ranger server problems")
+                raise RuntimeError(f"Ranger API returned None when creating policy '{policy_name}'. The policy was not created in Ranger backend. Check Ranger server logs for more information")
+            
+            policy_id = created_policy.id if hasattr(created_policy, 'id') else None
+            
+            logger.debug(f"API Response type: {type(created_policy)}")
+            logger.debug(f"API Response attributes: {dir(created_policy)}")
+            logger.debug(f"API Response str: {str(created_policy)}")
+            logger.debug(f"API Response repr: {repr(created_policy)}")
+            
+            logger.info(f"Created policy: {policy_name} (ID: {policy_id})")
+            logger.debug(f"Policy creation response: {created_policy}")
+            
+            return {
+                'status': 'created',
+                'policy_name': policy_name,
+                'policy_id': policy_id
+            }
+        except Exception as e:
+            logger.error(f"Policy creation failed for '{policy_name}': {e}", exc_info=True)
+            raise
     
     def _update_policy(
         self,

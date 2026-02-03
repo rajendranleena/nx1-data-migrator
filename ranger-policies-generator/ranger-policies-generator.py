@@ -8,21 +8,23 @@ This DAG:
 3. Creates Ranger policies based on parsed data
 4. Creates Keycloak realm roles and assigns groups to them
 """
-from datetime import datetime, timedelta
+
+import sys
+from datetime import datetime, timedelta, timezone
 from airflow import DAG
 from airflow.decorators import task
 from airflow.models import Variable
 from typing import Dict, List, Any
 import logging
-import sys
 
 sys.path.append('/opt/airflow/utils/migrations') 
 
 logger = logging.getLogger(__name__)
 
+
 def get_config() -> dict:
     return {
-        'ranger_url': Variable.get('ranger_url'),
+        'ranger_url': Variable.get('ranger_url', default_var='http://ranger:6080'),
         'ranger_username': Variable.get('ranger_username'),
         'ranger_password': Variable.get('ranger_password', deserialize_json=False),
         'service_name': Variable.get('nx1_repo_name', default_var='nx1-unifiedsql'),
@@ -35,6 +37,7 @@ def get_config() -> dict:
         'tracking_location': Variable.get('policy_tracking_location', default_var='s3a://data-lake/policy_tracking'),
         'report_output_location': Variable.get('policy_report_location', default_var='s3a://data-lake/policy_reports')
     }
+
 
 def parse_permission_string(permissions: str) -> List[str]:
     """Parse permission string into list."""
@@ -64,6 +67,7 @@ def build_policy_name(catalog: str, database: str, table: str, column: str) -> s
     
     return '.'.join(parts)
 
+
 default_args = {
     'owner': 'trino-admin',
     'depends_on_past': False,
@@ -77,7 +81,7 @@ default_args = {
 # DAG
 # -----------------------------
 with DAG(
-    dag_id='ranger_policy_automation_v3',
+    dag_id='ranger_policy_automation',
     default_args=default_args,
     description='Automate Ranger & Keycloak policy creation from Excel configuration',
     schedule_interval=None,
@@ -127,13 +131,12 @@ with DAG(
                 mappings_existing INT,
                 failed_operations INT,
                 error_message STRING,
-                created_at TIMESTAMP DEFAULT current_timestamp(),
-                updated_at TIMESTAMP DEFAULT current_timestamp()
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
             )
             USING iceberg
             LOCATION '{loc}/ranger_policy_runs'
         """)
-
 
         spark.sql(f"""
             CREATE TABLE IF NOT EXISTS {db}.ranger_policy_object_status (
@@ -143,11 +146,11 @@ with DAG(
                 object_key STRING,
                 status STRING,
                 error_message STRING,
-                attempt INT DEFAULT 1,
+                attempt INT,
                 started_at TIMESTAMP,
                 completed_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT current_timestamp(),
-                updated_at TIMESTAMP DEFAULT current_timestamp()
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
             )
             USING iceberg
             LOCATION '{loc}/ranger_policy_object_status'
@@ -156,9 +159,9 @@ with DAG(
         return {"status": "initialized", "tracking_db": db}
 
     @task.pyspark(conn_id="spark_default")
-    def create_policy_run(excel_file_path: str, dag_run_id: str, spark, sc) -> str:
+    def create_policy_run(excel_file_path: str, dag_run_identifier: str, spark, sc) -> str:
         import uuid
-        run_id = f"run_{datetime.now(datetime.timezone.utc):%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
+        policy_run_id = f"run_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
         db = get_config()["tracking_database"]
 
         spark.sql(f"""
@@ -184,11 +187,13 @@ with DAG(
                 mappings_created,
                 mappings_existing,
                 failed_operations,
-                error_message
+                error_message,
+                created_at,
+                updated_at
             )
             VALUES (
-                '{run_id}',
-                '{dag_run_id}',
+                '{policy_run_id}',
+                '{dag_run_identifier}',
                 '{excel_file_path}',
                 current_timestamp(),
                 NULL,
@@ -208,17 +213,19 @@ with DAG(
                 0,
                 0,
                 0,
-                NULL
+                NULL,
+                current_timestamp(),
+                current_timestamp()
             )
         """)
 
-        return run_id
-
+        return policy_run_id
 
     @task.pyspark(conn_id='spark_default')
-    def parse_excel_to_dicts(excel_file_path: str, run_id: str, spark, sc) -> Dict[str, Any]:
+    def parse_excel_to_dicts(excel_file_path: str, spark, sc) -> Dict[str, Any]:
         import pandas as pd
         from io import BytesIO
+        
         # Read Excel from S3
         binary_df = spark.read.format("binaryFile").load(excel_file_path)
         row = binary_df.select("content").first()
@@ -240,6 +247,11 @@ with DAG(
 
             if not role or role.lower() == 'nan':
                 continue
+            
+            # Validate database field - wildcards not supported for databases
+            if databases == '*':
+                logger.warning(f"Row skipped: database cannot be '*' (role: {role}). Use specific database names.")
+                continue
 
             # Role-groups
             group_list = parse_csv_field(groups)
@@ -251,7 +263,7 @@ with DAG(
 
             perm_list = parse_permission_string(permissions)
 
-            if url and url.lower() != 'nan':
+            if url and url.lower() != 'nan' and url != '-' and url != '*':
                 policy_name = url
                 if policy_name not in policies:
                     policies[policy_name] = {'type': 'url', 'url': url, 'roles': []}
@@ -296,61 +308,76 @@ with DAG(
         logger.info(f"Parsed {len(policies)} policies and {len(role_groups)} role-group mappings")
         return {'policies': policies, 'role_groups': role_groups}
 
-
     @task.pyspark(conn_id="spark_default")
-    def write_policy_object_status(object_status: dict, spark, sc) -> dict:
-        from datetime import datetime
+    def write_policy_object_statuses(statuses: List[Dict], spark, sc) -> Dict:
+        """
+        Write all object statuses in a single batch operation.
+        This avoids the mapped task complexity and type mismatches.
+        """
+        from datetime import datetime as dt
+        
         cfg = get_config()
         db = cfg["tracking_database"]
+        
+        if not statuses:
+            return {"written": 0}
+        
+        written_count = 0
+        
+        for obj in statuses:
+            obj_run_id = obj["run_id"]
+            obj_type = obj["object_type"]
+            obj_name = obj["object_name"].replace("'", "''")  # Escape single quotes
+            obj_key = obj.get("object_key", "").replace("'", "''")
+            status = obj.get("status", "SUCCESS")
+            error_msg = obj.get("error_message", "").replace("'", "''")
+            attempt = obj.get("attempt", 1)
+            started_at = obj.get("started_at", dt.now(timezone.utc))
+            completed_at = obj.get("completed_at", dt.now(timezone.utc))
+            
+            # Format timestamps using to_timestamp() for proper casting
+            started_at_sql = f"to_timestamp('{started_at.strftime('%Y-%m-%d %H:%M:%S')}', 'yyyy-MM-dd HH:mm:ss')"
+            completed_at_sql = f"to_timestamp('{completed_at.strftime('%Y-%m-%d %H:%M:%S')}', 'yyyy-MM-dd HH:mm:ss')" if completed_at else "NULL"
+            
 
-        run_id = object_status["run_id"]
-        obj_type = object_status["object_type"]
-        obj_name = object_status["object_name"]
-        obj_key = object_status.get("object_key", "")
-        status = object_status.get("status", "RUNNING")
-        error_msg = object_status.get("error_message", "")
-        started_at = object_status.get("started_at", datetime.now(datetime.timezone.utc))
-        completed_at = object_status.get("completed_at", None)
-        created_at = datetime.now(datetime.timezone.utc)
-
-        # Format as SQL timestamp strings
-        started_at_sql = f"'{started_at.strftime('%Y-%m-%d %H:%M:%S')}'"
-        completed_at_sql = f"'{completed_at.strftime('%Y-%m-%d %H:%M:%S')}'" if completed_at else "NULL"
-        created_at_sql = f"'{created_at.strftime('%Y-%m-%d %H:%M:%S')}'"
-
-        attempt = object_status.get("attempt", 1)
-        error_msg_sql = error_msg.replace("'", "''")
-
-        spark.sql(f"""
-            MERGE INTO {db}.ranger_policy_object_status t
-            USING (SELECT '{run_id}' AS run_id, '{obj_type}' AS object_type, '{obj_name}' AS object_name) s
-            ON t.run_id = s.run_id AND t.object_type = s.object_type AND t.object_name = s.object_name
-            WHEN MATCHED THEN UPDATE SET
-                status = '{status}',
-                error_message = '{error_msg_sql}',
-                completed_at = {completed_at},
-                attempt = {attempt},
-                updated_at = current_timestamp()
-            WHEN NOT MATCHED THEN INSERT (
-                run_id, object_type, object_name, object_key,
-                status, error_message, started_at, completed_at,
-                attempt, created_at
-            ) VALUES (
-                '{run_id}', '{obj_type}', '{obj_name}', '{obj_key}',
-                '{status}', '{error_msg_sql}', '{started_at_sql}', {completed_at_sql},
-                {attempt}, '{created_at_sql}'
-            )
-        """)
-
-        return object_status
+            try:
+                spark.sql(f"""
+                    MERGE INTO {db}.ranger_policy_object_status t
+                    USING (SELECT '{obj_run_id}' AS run_id, '{obj_type}' AS object_type, '{obj_name}' AS object_name) s
+                    ON t.run_id = s.run_id AND t.object_type = s.object_type AND t.object_name = s.object_name
+                    WHEN MATCHED THEN UPDATE SET
+                        status = '{status}',
+                        error_message = '{error_msg}',
+                        completed_at = {completed_at_sql},
+                        attempt = {attempt},
+                        updated_at = current_timestamp()
+                    WHEN NOT MATCHED THEN INSERT (
+                        run_id, object_type, object_name, object_key,
+                        status, error_message, started_at, completed_at,
+                        attempt, created_at, updated_at
+                    ) VALUES (
+                        '{obj_run_id}', '{obj_type}', '{obj_name}', '{obj_key}',
+                        '{status}', '{error_msg}', {started_at_sql}, {completed_at_sql},
+                        {attempt}, current_timestamp(), current_timestamp()
+                    )
+                """)
+                written_count += 1
+            except Exception as e:
+                logger.error(f"Failed to write status for {obj_type}/{obj_name}: {e}")
+        
+        return {"written": written_count, "total": len(statuses)}
 
     # -----------------------------
-    # Ranger & Keycloak tasks returning list of statuses
+    # Ranger & Keycloak tasks
     # -----------------------------
     @task
-    def create_ranger_groups_and_policies(parsed_data: Dict[str, Any], run_id: str) -> List[Dict]:
+    def create_ranger_groups_and_policies(parsed_data: Dict[str, Any], tracking_run_id: str) -> Dict[str, Any]:
+        """
+        Create Ranger groups and policies.
+        Returns both summary (for finalize) and statuses (for tracking).
+        """
         from ranger_utils import RangerPolicyManager
-        from datetime import datetime
+        from datetime import datetime as dt
 
         cfg = get_config()
         manager = RangerPolicyManager(
@@ -364,44 +391,85 @@ with DAG(
         role_groups = parsed_data['role_groups']
 
         statuses = []
+        groups_created = []
+        groups_existing = []
 
-        # Ensure groups
+        # Ensure groups exist
         all_roles = set(role_groups.keys())
         for policy_data in policies.values():
             for r in policy_data.get('roles', []):
                 all_roles.add(r['role'])
 
         groups_result = manager.ensure_groups_exist(list(all_roles))
+        
         for g, created in groups_result.items():
+            if created:
+                groups_created.append(g)
+            else:
+                groups_existing.append(g)
             statuses.append({
-                "run_id": run_id,
+                "run_id": tracking_run_id,
                 "object_type": "group",
                 "object_name": g,
+                "object_key": "",
                 "status": "SUCCESS",
-                "started_at": datetime.now(datetime.timezone.utc),
-                "completed_at": datetime.now(datetime.timezone.utc)
+                "error_message": "",
+                "attempt": 1,
+                "started_at": dt.now(timezone.utc),
+                "completed_at": dt.now(timezone.utc)
             })
 
         # Sync policies
         policies_result = manager.sync_policies_from_dict(policies)
+        
+        policies_created = []
+        policies_updated = []
+        policies_failed = []
+        
         for obj_list in ['created', 'updated', 'failed']:
             for p in policies_result.get(obj_list, []):
+                if isinstance(p, dict):
+                    name = p.get('name', 'UNKNOWN')
+                    error = p.get('error', '')
+                else:
+                    name = str(p)
+                    error = ''
+                
+                if obj_list == 'created':
+                    policies_created.append(name)
+                elif obj_list == 'updated':
+                    policies_updated.append(name)
+                else:
+                    policies_failed.append({'name': name, 'error': error})
+                    
                 statuses.append({
-                    "run_id": run_id,
+                    "run_id": tracking_run_id,
                     "object_type": "policy",
-                    "object_name": p['name'],
+                    "object_name": name,
+                    "object_key": "",
                     "status": "FAILED" if obj_list == "failed" else "SUCCESS",
-                    "error_message": p.get('error', ''),
-                    "started_at": datetime.now(datetime.timezone.utc),
-                    "completed_at": datetime.now(datetime.timezone.utc)
+                    "error_message": error,
+                    "attempt": 1,
+                    "started_at": dt.now(timezone.utc),
+                    "completed_at": dt.now(timezone.utc)
                 })
 
-        return statuses
+        return {
+            "summary": {
+                "groups": {"created": groups_created, "existing": groups_existing},
+                "policies": {"created": policies_created, "updated": policies_updated, "failed": policies_failed}
+            },
+            "statuses": statuses
+        }
 
     @task
-    def create_keycloak_roles(parsed_data: Dict[str, Any], run_id: str) -> List[Dict]:
+    def create_keycloak_roles(parsed_data: Dict[str, Any], tracking_run_id: str) -> Dict[str, Any]:
+        """
+        Create Keycloak roles and group mappings.
+        Returns both summary (for finalize) and statuses (for tracking).
+        """
         from ranger_utils import KeycloakRoleManager
-        from datetime import datetime
+        from datetime import datetime as dt
 
         cfg = get_config()
         manager = KeycloakRoleManager(
@@ -415,29 +483,217 @@ with DAG(
         result = manager.sync_roles_and_groups(role_groups)
 
         statuses = []
-        for obj_type, obj_list in [("role", ['created_roles','existing_roles']), ("mapping", ['created_mappings','existing_mappings','failed'])]:
-            for key in obj_list:
-                for entry in result.get(key, []):
-                    name = entry if isinstance(entry, str) else f"{entry.get('role','')}->{entry.get('group','')}"
-                    statuses.append({
-                        "run_id": run_id,
-                        "object_type": obj_type if obj_type=="role" else "mapping",
-                        "object_name": name,
-                        "status": "FAILED" if key=="failed" else "SUCCESS",
-                        "error_message": entry.get('error','') if isinstance(entry, dict) else "",
-                        "started_at": datetime.now(datetime.timezone.utc),
-                        "completed_at": datetime.now(datetime.timezone.utc)
-                    })
-        return statuses
+        
+        # Process roles
+        for key in ['created_roles', 'existing_roles']:
+            for entry in result.get(key, []):
+                name = entry if isinstance(entry, str) else str(entry)
+                statuses.append({
+                    "run_id": tracking_run_id,
+                    "object_type": "role",
+                    "object_name": name,
+                    "object_key": "",
+                    "status": "SUCCESS",
+                    "error_message": "",
+                    "attempt": 1,
+                    "started_at": dt.now(timezone.utc),
+                    "completed_at": dt.now(timezone.utc)
+                })
+        
+        # Process mappings
+        for key in ['created_mappings', 'existing_mappings']:
+            for entry in result.get(key, []):
+                if isinstance(entry, dict):
+                    name = f"{entry.get('role', '')}->{entry.get('group', '')}"
+                else:
+                    name = str(entry)
+                statuses.append({
+                    "run_id": tracking_run_id,
+                    "object_type": "mapping",
+                    "object_name": name,
+                    "object_key": "",
+                    "status": "SUCCESS",
+                    "error_message": "",
+                    "attempt": 1,
+                    "started_at": dt.now(timezone.utc),
+                    "completed_at": dt.now(timezone.utc)
+                })
+        
+        # Process failures
+        for entry in result.get('failed', []):
+            if isinstance(entry, dict):
+                name = f"{entry.get('role', '')}->{entry.get('group', '')}"
+                error = entry.get('error', '')
+            else:
+                name = str(entry)
+                error = ''
+            statuses.append({
+                "run_id": tracking_run_id,
+                "object_type": "mapping",
+                "object_name": name,
+                "object_key": "",
+                "status": "FAILED",
+                "error_message": error,
+                "attempt": 1,
+                "started_at": dt.now(timezone.utc),
+                "completed_at": dt.now(timezone.utc)
+            })
+
+        return {
+            "summary": {
+                "created_roles": result.get('created_roles', []),
+                "existing_roles": result.get('existing_roles', []),
+                "created_mappings": result.get('created_mappings', []),
+                "existing_mappings": result.get('existing_mappings', []),
+                "failed": result.get('failed', [])
+            },
+            "statuses": statuses
+        }
+
+    @task
+    def debug_list_policies() -> Dict[str, Any]:
+        """
+        Debug task: Query Ranger backend to verify policies actually exist.
+        This runs during DAG execution and logs all policies for the service.
+        """
+        from ranger_utils import RangerPolicyManager
+        
+        cfg = get_config()
+        manager = RangerPolicyManager(
+            ranger_url=cfg["ranger_url"],
+            ranger_username=cfg["ranger_username"],
+            ranger_password=cfg["ranger_password"],
+            service_name=cfg["service_name"]
+        )
+        
+        try:
+            # Query all policies for the service
+            all_policies = manager.get_all_policies()
+            policy_names = [p.get('name', 'UNKNOWN') for p in all_policies]
+            
+            logger.info(f"DEBUG: Found {len(all_policies)} policies in Ranger service '{cfg['service_name']}'")
+            logger.info(f"DEBUG: Policy names: {policy_names}")
+            
+            return {
+                "status": "success",
+                "total_policies": len(all_policies),
+                "policy_names": policy_names,
+                "all_policies": all_policies
+            }
+        except Exception as e:
+            logger.error(f"DEBUG: Error querying Ranger policies: {e}", exc_info=True)
+            return {
+                "status": "error",
+                "error": str(e),
+                "total_policies": 0,
+                "policy_names": []
+            }
+    @task
+    def extract_statuses(ranger_result: Dict[str, Any], keycloak_result: Dict[str, Any]) -> List[Dict]:
+        """Combine statuses from both Ranger and Keycloak results."""
+        all_statuses = []
+        all_statuses.extend(ranger_result.get("statuses", []))
+        all_statuses.extend(keycloak_result.get("statuses", []))
+        return all_statuses
 
     @task.pyspark(conn_id="spark_default")
-    def generate_policy_report(run_id: str, spark, sc) -> str:
+    def finalize_policy_run(
+        tracking_run_id: str,
+        dag_run_identifier: str,
+        excel_file_path: str,
+        parsed_data: Dict[str, Any],
+        ranger_result: Dict[str, Any],
+        keycloak_result: Dict[str, Any],
+        spark=None,
+        sc=None
+    ) -> Dict:
+        """
+        Finalize the policy run: compute metrics from parsed data and task results,
+        update the ranger_policy_runs table, and return summary.
+        """
+        cfg = get_config()
+        db = cfg["tracking_database"]
+
+        # Extract summaries
+        ranger_summary = ranger_result.get("summary", {})
+        keycloak_summary = keycloak_result.get("summary", {})
+
+        # Compute run-level totals
+        groups_created = len(ranger_summary.get('groups', {}).get('created', []))
+        groups_existing = len(ranger_summary.get('groups', {}).get('existing', []))
+        policies_created = len(ranger_summary.get('policies', {}).get('created', []))
+        policies_updated = len(ranger_summary.get('policies', {}).get('updated', []))
+        policies_failed = len(ranger_summary.get('policies', {}).get('failed', []))
+        
+        roles_created = len(keycloak_summary.get('created_roles', []))
+        roles_existing = len(keycloak_summary.get('existing_roles', []))
+        mappings_created = len(keycloak_summary.get('created_mappings', []))
+        mappings_existing = len(keycloak_summary.get('existing_mappings', []))
+        keycloak_failed = len(keycloak_summary.get('failed', []))
+
+        total_objects = (
+            groups_created + groups_existing +
+            policies_created + policies_updated + policies_failed +
+            roles_created + roles_existing +
+            mappings_created + mappings_existing + keycloak_failed
+        )
+
+        successful_objects = (
+            groups_created + groups_existing +
+            policies_created + policies_updated +
+            roles_created + roles_existing +
+            mappings_created + mappings_existing
+        )
+
+        failed_objects = policies_failed + keycloak_failed
+
+        overall_status = "COMPLETED" if failed_objects == 0 else "PARTIAL_FAILURE"
+
+        # Update the ranger_policy_runs table with all metrics
+        spark.sql(f"""
+            UPDATE {db}.ranger_policy_runs
+            SET
+                completed_at = current_timestamp(),
+                status = '{overall_status}',
+                total_objects = {total_objects},
+                successful_objects = {successful_objects},
+                failed_objects = {failed_objects},
+                total_policies_parsed = {len(parsed_data.get('policies', {}))},
+                total_role_mappings_parsed = {len(parsed_data.get('role_groups', {}))},
+                groups_created = {groups_created},
+                groups_existing = {groups_existing},
+                policies_created = {policies_created},
+                policies_updated = {policies_updated},
+                policies_failed = {policies_failed},
+                roles_created = {roles_created},
+                roles_existing = {roles_existing},
+                mappings_created = {mappings_created},
+                mappings_existing = {mappings_existing},
+                failed_operations = {keycloak_failed},
+                updated_at = current_timestamp()
+            WHERE run_id = '{tracking_run_id}'
+        """)
+
+        return {
+            "run_id": tracking_run_id,
+            "status": overall_status,
+            "total_objects": total_objects,
+            "successful_objects": successful_objects,
+            "failed_objects": failed_objects,
+            "dag_run_id": dag_run_identifier,
+            "excel_file_path": excel_file_path,
+            "ranger_summary": ranger_summary,
+            "keycloak_summary": keycloak_summary
+        }
+
+    @task.pyspark(conn_id="spark_default")
+    def generate_policy_report(tracking_run_id: str, spark, sc) -> str:
         """
         Generate a multi-row formatted HTML report for Ranger & Keycloak policy run.
         Includes object counts, status badges, and error messages.
         Saves report to S3.
         """
-        from datetime import datetime
+        from datetime import datetime as dt
         from collections import Counter
 
         config = get_config()
@@ -447,13 +703,13 @@ with DAG(
         # Fetch run-level info
         run_info = spark.sql(f"""
             SELECT * FROM {tracking_db}.ranger_policy_runs
-            WHERE run_id = '{run_id}'
+            WHERE run_id = '{tracking_run_id}'
         """).collect()[0]
 
         # Fetch object-level info
         objects = spark.sql(f"""
             SELECT * FROM {tracking_db}.ranger_policy_object_status
-            WHERE run_id = '{run_id}'
+            WHERE run_id = '{tracking_run_id}'
             ORDER BY object_type, object_name
         """).collect()
 
@@ -462,76 +718,96 @@ with DAG(
         failed_objects = sum(1 for o in objects if o.status == "FAILED")
         type_counts = Counter(o.object_type for o in objects)
 
+        # Determine status class for run
+        run_status_class = 'status-success' if run_info.status == 'COMPLETED' else 'status-failed'
+
         # Build HTML
         html = f"""
         <!DOCTYPE html>
         <html lang="en">
         <head>
             <meta charset="UTF-8">
-            <title>Ranger Policy Run Report - {run_id}</title>
+            <title>Ranger Policy Run Report - {tracking_run_id}</title>
             <style>
                 body {{ font-family: Arial, sans-serif; background: #f5f5f5; padding: 20px; }}
-                .container {{ background: #fff; padding: 20px; border-radius: 8px; }}
+                .container {{ background: #fff; padding: 20px; border-radius: 8px; max-width: 1400px; margin: 0 auto; }}
                 h1 {{ color: #2c3e50; }}
-                .summary-card {{ display: inline-block; padding: 15px; margin: 5px; border-radius: 6px; color: #fff; }}
+                h2 {{ color: #34495e; margin-top: 30px; }}
+                .summary-cards {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0; }}
+                .summary-card {{ padding: 15px 20px; border-radius: 6px; color: #fff; min-width: 150px; text-align: center; }}
                 .success {{ background-color: #28a745; }}
                 .failed {{ background-color: #dc3545; }}
                 .info {{ background-color: #17a2b8; }}
                 table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
                 th {{ background-color: #343a40; color: white; }}
-                tr:hover {{ background-color: #f1f1f1; }}
-                .status-badge {{ padding: 4px 8px; border-radius: 12px; font-weight: bold; color: white; }}
+                tr:nth-child(even) {{ background-color: #f8f9fa; }}
+                tr:hover {{ background-color: #e9ecef; }}
+                .status-badge {{ padding: 4px 10px; border-radius: 12px; font-weight: bold; color: white; font-size: 12px; }}
                 .status-success {{ background-color: #28a745; }}
                 .status-failed {{ background-color: #dc3545; }}
                 .status-partial {{ background-color: #ffc107; color: #212529; }}
+                .error-cell {{ color: #dc3545; font-size: 12px; max-width: 300px; word-wrap: break-word; }}
+                .run-info {{ background: #f8f9fa; padding: 15px; border-radius: 6px; margin-bottom: 20px; }}
+                .run-info p {{ margin: 5px 0; }}
             </style>
         </head>
         <body>
             <div class="container">
                 <h1>Ranger Policy Run Report</h1>
-                <p>
-                    <strong>Run ID:</strong> {run_id}<br>
-                    <strong>DAG Run:</strong> {run_info.dag_run_id}<br>
-                    <strong>Excel Path:</strong> {run_info.excel_file_path}<br>
-                    <strong>Started At:</strong> {run_info.started_at}<br>
-                    <strong>Completed At:</strong> {run_info.completed_at}
-                </p>
+                
+                <div class="run-info">
+                    <p><strong>Run ID:</strong> {tracking_run_id}</p>
+                    <p><strong>DAG Run:</strong> {run_info.dag_run_id}</p>
+                    <p><strong>Excel Path:</strong> {run_info.excel_file_path}</p>
+                    <p><strong>Started At:</strong> {run_info.started_at}</p>
+                    <p><strong>Completed At:</strong> {run_info.completed_at}</p>
+                    <p><strong>Status:</strong> <span class="status-badge {run_status_class}">{run_info.status}</span></p>
+                </div>
 
+                <h2>Summary</h2>
                 <div class="summary-cards">
-                    <div class="summary-card info">Total Objects: {total_objects}</div>
-                    <div class="summary-card success">Successful: {successful_objects}</div>
-                    <div class="summary-card failed">Failed: {failed_objects}</div>
-                    <div class="summary-card info">Total Policies Parsed: {run_info.total_policies_parsed or 0}</div>
-                    <div class="summary-card info">Total Role Mappings Parsed: {run_info.total_role_mappings_parsed or 0}</div>
-                    <div class="summary-card success">Groups Created: {run_info.groups_created or 0}</div>
-                    <div class="summary-card info">Groups Existing: {run_info.groups_existing or 0}</div>
-                    <div class="summary-card success">Policies Created: {run_info.policies_created or 0}</div>
-                    <div class="summary-card info">Policies Updated: {run_info.policies_updated or 0}</div>
-                    <div class="summary-card failed">Policies Failed: {run_info.policies_failed or 0}</div>
-                    <div class="summary-card success">Roles Created: {run_info.roles_created or 0}</div>
-                    <div class="summary-card info">Roles Existing: {run_info.roles_existing or 0}</div>
-                    <div class="summary-card success">Mappings Created: {run_info.mappings_created or 0}</div>
-                    <div class="summary-card info">Mappings Existing: {run_info.mappings_existing or 0}</div>
-                    <div class="summary-card failed">Failed Operations: {run_info.failed_operations or 0}</div>
+                    <div class="summary-card info">Total Objects<br><strong>{total_objects}</strong></div>
+                    <div class="summary-card success">Successful<br><strong>{successful_objects}</strong></div>
+                    <div class="summary-card failed">Failed<br><strong>{failed_objects}</strong></div>
+                </div>
+                
+                <div class="summary-cards">
+                    <div class="summary-card info">Policies Parsed<br><strong>{run_info.total_policies_parsed or 0}</strong></div>
+                    <div class="summary-card info">Role Mappings Parsed<br><strong>{run_info.total_role_mappings_parsed or 0}</strong></div>
+                </div>
+                
+                <div class="summary-cards">
+                    <div class="summary-card success">Groups Created<br><strong>{run_info.groups_created or 0}</strong></div>
+                    <div class="summary-card info">Groups Existing<br><strong>{run_info.groups_existing or 0}</strong></div>
+                    <div class="summary-card success">Policies Created<br><strong>{run_info.policies_created or 0}</strong></div>
+                    <div class="summary-card info">Policies Updated<br><strong>{run_info.policies_updated or 0}</strong></div>
+                    <div class="summary-card failed">Policies Failed<br><strong>{run_info.policies_failed or 0}</strong></div>
+                </div>
+                
+                <div class="summary-cards">
+                    <div class="summary-card success">Roles Created<br><strong>{run_info.roles_created or 0}</strong></div>
+                    <div class="summary-card info">Roles Existing<br><strong>{run_info.roles_existing or 0}</strong></div>
+                    <div class="summary-card success">Mappings Created<br><strong>{run_info.mappings_created or 0}</strong></div>
+                    <div class="summary-card info">Mappings Existing<br><strong>{run_info.mappings_existing or 0}</strong></div>
+                    <div class="summary-card failed">Failed Operations<br><strong>{run_info.failed_operations or 0}</strong></div>
                 </div>
 
                 <h2>Object Counts By Type</h2>
                 <ul>
         """
         for obj_type, count in type_counts.items():
-            html += f"<li>{obj_type}: {count}</li>"
+            html += f"<li><strong>{obj_type}:</strong> {count}</li>"
 
         html += """
                 </ul>
 
-                <h2>Policy Object Details</h2>
+                <h2>Object Details</h2>
                 <table>
                     <thead>
                         <tr>
                             <th>Object Type</th>
                             <th>Object Name</th>
-                            <th>Object Key</th>
                             <th>Status</th>
                             <th>Error Message</th>
                             <th>Attempt</th>
@@ -548,13 +824,13 @@ with DAG(
                 else "status-failed" if o.status == "FAILED"
                 else "status-partial"
             )
+            error_display = o.error_message or ''
             html += f"""
                         <tr>
                             <td>{o.object_type}</td>
                             <td>{o.object_name}</td>
-                            <td>{o.object_key or ''}</td>
                             <td><span class="status-badge {status_class}">{o.status}</span></td>
-                            <td>{o.error_message or ''}</td>
+                            <td class="error-cell">{error_display}</td>
                             <td>{o.attempt}</td>
                             <td>{o.started_at}</td>
                             <td>{o.completed_at or ''}</td>
@@ -565,8 +841,8 @@ with DAG(
                     </tbody>
                 </table>
 
-                <p style="margin-top:20px; font-size:12px; color:#6c757d;">
-                    Report generated automatically by the Ranger Policy DAG on {datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC.
+                <p style="margin-top:30px; font-size:12px; color:#6c757d; text-align: center;">
+                    Report generated automatically by the Ranger Policy DAG on {dt.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC.
                 </p>
             </div>
         </body>
@@ -574,118 +850,36 @@ with DAG(
         """
 
         # Save HTML to S3
-        report_path = f"{report_location}/{run_id}_policy_report.html"
+        report_path = f"{report_location}/{tracking_run_id}_policy_report.html"
         spark.createDataFrame([(html,)], ["content"]).coalesce(1).write.mode("overwrite").text(report_path)
 
+        logger.info(f"Report generated at: {report_path}")
         return report_path
-    
-
-    @task.pyspark(conn_id="spark_default")
-    def finalize_policy_run(
-        policy_run_id: str,
-        policy_dag_run_id: str,
-        excel_file_path: str,
-        parsed_data: Dict[str, Any],
-        ranger_result: Dict[str, Any],
-        keycloak_result: Dict[str, Any],
-        spark=None,
-        sc=None)-> dict: 
-        """
-        Finalize the policy run: compute metrics from parsed data and task results,
-        update the ranger_policy_runs table, and return summary.
-        """
-        cfg = get_config()
-        db = cfg["tracking_database"]
-
-        # Compute run-level totals
-        total_objects = sum([
-            len(ranger_result['policies']['created']),
-            len(ranger_result['policies']['updated']),
-            len(ranger_result['policies']['failed']),
-            len(keycloak_result['created_roles']),
-            len(keycloak_result['existing_roles']),
-            len(keycloak_result['created_mappings']),
-            len(keycloak_result['existing_mappings']),
-            len(keycloak_result['failed'])
-        ])
-
-        successful_objects = (
-            len(ranger_result['policies']['created']) +
-            len(ranger_result['policies']['updated']) +
-            len(keycloak_result['created_roles']) +
-            len(keycloak_result['existing_roles']) +
-            len(keycloak_result['created_mappings']) +
-            len(keycloak_result['existing_mappings'])
-        )
-
-        failed_objects = (
-            len(ranger_result['policies']['failed']) +
-            len(keycloak_result['failed'])
-        )
-
-        overall_status = "COMPLETED" if failed_objects == 0 else "PARTIAL_FAILURE"
-
-        # Update the ranger_policy_runs table with all metrics
-        spark.sql(f"""
-            UPDATE {db}.ranger_policy_runs
-            SET
-                completed_at = current_timestamp(),
-                status = '{overall_status}',
-                total_objects = {total_objects},
-                successful_objects = {successful_objects},
-                failed_objects = {failed_objects},
-                total_policies_parsed = {len(parsed_data['policies'])},
-                total_role_mappings_parsed = {len(parsed_data['role_groups'])},
-                groups_created = {len(ranger_result['groups']['created'])},
-                groups_existing = {len(ranger_result['groups']['existing'])},
-                policies_created = {len(ranger_result['policies']['created'])},
-                policies_updated = {len(ranger_result['policies']['updated'])},
-                policies_failed = {len(ranger_result['policies']['failed'])},
-                roles_created = {len(keycloak_result['created_roles'])},
-                roles_existing = {len(keycloak_result['existing_roles'])},
-                mappings_created = {len(keycloak_result['created_mappings'])},
-                mappings_existing = {len(keycloak_result['existing_mappings'])},
-                failed_operations = {len(keycloak_result['failed'])},
-                updated_at = current_timestamp()
-            WHERE run_id = '{policy_run_id}'
-        """)
-
-        return {
-            "run_id": policy_run_id,
-            "status": overall_status,
-            "total_objects": total_objects,
-            "successful_objects": successful_objects,
-            "failed_objects": failed_objects,
-            "dag_run_id": policy_dag_run_id,
-            "excel_file_path": excel_file_path,
-            "ranger_summary": ranger_result,
-            "keycloak_summary": keycloak_result
-        }
-
 
     # -----------------------------
     # DAG flow
     # -----------------------------
     excel_path = "{{ params.excel_file_path }}"
-    dag_run_id = "{{ run_id }}"
+    dag_run_identifier = "{{ run_id }}"
 
-    # Initialize tables and run
+    # Initialize tables and create run record
     init_tables = init_policy_tracking_tables()
-    run_id_task = create_policy_run(excel_path, dag_run_id)
-    parsed_data = parse_excel_to_dicts(excel_path, run_id_task)
+    tracking_run_id = create_policy_run(excel_path, dag_run_identifier)
+    parsed_data = parse_excel_to_dicts(excel_path)
 
-    # Create policies / roles
-    ranger_result = create_ranger_groups_and_policies(parsed_data, run_id_task)
-    keycloak_result = create_keycloak_roles(parsed_data, run_id_task)
-
-    # Write statuses (dynamic map)
-    write_ranger = write_policy_object_status.expand(object_status=ranger_result)
-    write_keycloak = write_policy_object_status.expand(object_status=keycloak_result)
+    # Create policies and roles (returns combined summary + statuses)
+    ranger_result = create_ranger_groups_and_policies(parsed_data, tracking_run_id)
+    keycloak_result = create_keycloak_roles(parsed_data, tracking_run_id)
+    # Debug: verify policies exist in Ranger backend
+    debug_result = debug_list_policies()
+    # Extract and combine all statuses, then write in a single batch
+    all_statuses = extract_statuses(ranger_result, keycloak_result)
+    write_statuses = write_policy_object_statuses(all_statuses)
 
     # Finalize run (update metrics in runs table)
     finalize = finalize_policy_run(
-        policy_run_id=run_id_task,
-        policy_dag_run_id=dag_run_id,
+        tracking_run_id=tracking_run_id,
+        dag_run_identifier=dag_run_identifier,
         excel_file_path=excel_path,
         parsed_data=parsed_data,
         ranger_result=ranger_result,
@@ -693,13 +887,10 @@ with DAG(
     )
 
     # Generate report
-    report_path = generate_policy_report(run_id_task)
+    report_path = generate_policy_report(tracking_run_id)
+
     # Dependencies
-    init_tables >> run_id_task >> parsed_data
+    init_tables >> tracking_run_id >> parsed_data
     parsed_data >> [ranger_result, keycloak_result]
-    [ranger_result, keycloak_result] >> write_ranger
-    [ranger_result, keycloak_result] >> write_keycloak
-
-    [write_ranger, write_keycloak] >> finalize >> report_path
-
-
+    [ranger_result, keycloak_result] >> debug_result >> all_statuses >> write_statuses
+    write_statuses >> finalize >> report_path
