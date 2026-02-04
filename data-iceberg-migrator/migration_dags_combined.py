@@ -2,26 +2,28 @@
 Combined Migration DAGs
 
 This file contains two independent DAGs:
-1. mapr_to_s3_migration: Migrates data and Hive tables (metadata) from MapR-FS to S3
-2. mapr_to_s3_migration_retry: Retries failed tables from previous MapR-to-S3 migration
+1. mapr_to_s3_migration: Migrates data and Hive tables (metadata) from MapR or HDFS to S3
+2. mapr_to_s3_migration_retry: Retries failed tables from previous MapR/HDFS-to-S3 migration
 3. iceberg_migration: Converts existing Hive tables in S3 to Apache Iceberg format
 4. iceberg_migration_retry: Retries failed Iceberg migrations from previous run
 
 Both DAGs can be run independently. The iceberg_migration DAG is typically run after mapr_to_s3_migration is complete, but they are not automatically chained.
 The retry DAGs enable automatic recovery from transient failures without re-processing successful migrations.
 
-1. MapR to S3 Migration DAG
 
-Orchestrates migration of Hive tables from MapR-FS to S3:
+1. MapR/HDFS to S3 Migration DAG
+
+Orchestrates migration of Hive tables from MapR or HDFS to S3:
 - Excel config from S3 (only DAG parameter)
-- SSH operations for MapR token, beeline discovery, distcp (24h timeout)
+- SSH operations for MapR or Kerberos authentication, beeline discovery, distcp (24h timeout)
 - PySpark tasks for Hive table creation
 - Incremental support (distcp -update, table repair)
 - Comprehensive validation (row counts, partitions, schema)
 
-Excel columns: database | table | dest database | bucket 
+Excel columns: database | table | dest database | bucket
 
-2. MapR to S3 Migration Retry
+
+2. MapR/HDFS to S3 Migration Retry
 
 Key Features:
 - Selective re-processing: Only retries failed/validation-failed tables
@@ -96,8 +98,8 @@ def get_config() -> dict:
     """Shared configuration for both DAGs"""
     return {
         # SSH Configuration (for MapR migration)
-        'ssh_conn_id': Variable.get('mapr_ssh_conn_id', default_var='mapr_edge_ssh'),
-        'edge_temp_path': Variable.get('mapr_edge_temp_path', default_var='/tmp/migration'),
+        'ssh_conn_id': Variable.get('cluster_ssh_conn_id', default_var='cluster_edge_ssh'),
+        'edge_temp_path': Variable.get('cluster_edge_temp_path', default_var='/tmp/migration'),
         
         # S3 Configuration
         'default_s3_bucket': Variable.get('migration_default_s3_bucket', default_var='s3a://data-lake'),
@@ -117,10 +119,14 @@ def get_config() -> dict:
         'tracking_location': Variable.get('migration_tracking_location', default_var='s3a://data-lake/migration_tracking'),
         'report_output_location': Variable.get('migration_report_location', default_var='s3a://data-lake/migration_reports'),
         
-        # MapR Authentication
+
+        # Cluster Authentication (MapR or Kerberos)
+        'auth_method': Variable.get('auth_method', default_var='mapr'),  # 'mapr' or 'kinit'
         'mapr_user': Variable.get('mapr_user', default_var=''),
         'mapr_password': Variable.get('mapr_password', default_var=''),
-        'mapr_cluster': Variable.get('mapr_cluster', default_var=''),
+        'kinit_principal': Variable.get('kinit_principal', default_var=''),
+        'kinit_keytab': Variable.get('kinit_keytab', default_var=''),
+        'kinit_password': Variable.get('kinit_password', default_var=''),
 
         's3_listing_tool': Variable.get('s3_listing_tool', default_var='hadoop'),
     }
@@ -172,68 +178,68 @@ def init_tracking_tables(spark, sc) -> dict:
     
     # Table-level tracking Iceberg table
     spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS {tracking_db}.migration_table_status (
-            run_id STRING,
-            source_database STRING,
-            source_table STRING,
-            dest_database STRING,
-            dest_bucket STRING,
-            dest_location STRING,
-            mapr_location STRING,
-            file_format STRING,
-            partition_count INT,
-            is_partitioned BOOLEAN,
-            schema_json STRING,
-            partitions_json STRING,
-            partition_columns STRING,
-            table_type STRING,                              
-            source_row_count BIGINT,                        
-            mapr_total_size_bytes BIGINT,                   
-            mapr_file_count BIGINT,                         
-            s3_total_size_bytes_before BIGINT, 
-            s3_file_count_before BIGINT,         
-            s3_total_size_bytes_after BIGINT,
-            s3_file_count_after BIGINT,
-            s3_bytes_transferred BIGINT,         
-            s3_files_transferred BIGINT,                             
-            file_size_match BOOLEAN,                        
-            file_count_match BOOLEAN,       
-            discovery_status STRING,
-            discovery_completed_at TIMESTAMP,
-            discovery_duration_seconds DOUBLE,
-            distcp_status STRING,
-            distcp_started_at TIMESTAMP,
-            distcp_completed_at TIMESTAMP,
-            distcp_duration_seconds DOUBLE,
-            distcp_is_incremental BOOLEAN,
-            distcp_bytes_copied BIGINT,
-            distcp_files_copied BIGINT,
-            table_create_status STRING,
-            table_create_completed_at TIMESTAMP,
-            table_create_duration_seconds DOUBLE,
-            table_already_existed BOOLEAN,
-            validation_status STRING,
-            validation_completed_at TIMESTAMP,
-            validation_duration_seconds DOUBLE,
-            dest_hive_row_count BIGINT,
-            source_partition_count INT,
-            dest_partition_count INT,
-            row_count_match BOOLEAN,
-            partition_count_match BOOLEAN,
-            schema_match BOOLEAN,
-            schema_differences STRING,
-            overall_status STRING,
-            error_message STRING,
-            updated_at TIMESTAMP,
-            is_retry BOOLEAN,
-            retry_run_id STRING,
-            retry_count INT,
-            last_retry_at TIMESTAMP,
-            parent_run_id STRING
-        )
-        USING iceberg
-        LOCATION '{tracking_loc}/migration_table_status'
-    """)
+            CREATE TABLE IF NOT EXISTS {tracking_db}.migration_table_status (
+                run_id STRING,
+                source_database STRING,
+                source_table STRING,
+                dest_database STRING,
+                dest_bucket STRING,
+                dest_location STRING,
+                source_location STRING,
+                file_format STRING,
+                partition_count INT,
+                is_partitioned BOOLEAN,
+                schema_json STRING,
+                partitions_json STRING,
+                partition_columns STRING,
+                table_type STRING,                              
+                source_row_count BIGINT,                        
+                source_total_size_bytes BIGINT,                   
+                source_file_count BIGINT,                         
+                s3_total_size_bytes_before BIGINT, 
+                s3_file_count_before BIGINT,         
+                s3_total_size_bytes_after BIGINT,
+                s3_file_count_after BIGINT,
+                s3_bytes_transferred BIGINT,         
+                s3_files_transferred BIGINT,                             
+                file_size_match BOOLEAN,                        
+                file_count_match BOOLEAN,       
+                discovery_status STRING,
+                discovery_completed_at TIMESTAMP,
+                discovery_duration_seconds DOUBLE,
+                distcp_status STRING,
+                distcp_started_at TIMESTAMP,
+                distcp_completed_at TIMESTAMP,
+                distcp_duration_seconds DOUBLE,
+                distcp_is_incremental BOOLEAN,
+                distcp_bytes_copied BIGINT,
+                distcp_files_copied BIGINT,
+                table_create_status STRING,
+                table_create_completed_at TIMESTAMP,
+                table_create_duration_seconds DOUBLE,
+                table_already_existed BOOLEAN,
+                validation_status STRING,
+                validation_completed_at TIMESTAMP,
+                validation_duration_seconds DOUBLE,
+                dest_hive_row_count BIGINT,
+                source_partition_count INT,
+                dest_partition_count INT,
+                row_count_match BOOLEAN,
+                partition_count_match BOOLEAN,
+                schema_match BOOLEAN,
+                schema_differences STRING,
+                overall_status STRING,
+                error_message STRING,
+                updated_at TIMESTAMP,
+                is_retry BOOLEAN,
+                retry_run_id STRING,
+                retry_count INT,
+                last_retry_at TIMESTAMP,
+                parent_run_id STRING
+            )
+            USING iceberg
+            LOCATION '{tracking_loc}/migration_table_status'
+        """)
 
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {tracking_db}.validation_results (
@@ -333,40 +339,61 @@ def parse_excel(excel_file_path: str, run_id: str, spark, sc) -> list:
 
 
 @task
-def mapr_token_setup(run_id: str) -> dict:
-    """SSH to edge, generate MapR ticket using maprlogin, create temp dir."""
+def cluster_login_setup(run_id: str) -> dict:
+    """SSH to edge, perform cluster login (MapR or Kerberos), create temp dir."""
     config = get_config()
+    auth_method = config.get('auth_method', 'mapr')
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
-    temp_dir = f"{config['edge_temp_path']}/{run_id}"
-    
     mapr_user = config.get('mapr_user', '')
     mapr_password = config.get('mapr_password', '')
-    mapr_cluster = config.get('mapr_cluster', '')
-    
+    kinit_principal = config.get('kinit_principal', '')
+    kinit_keytab = config.get('kinit_keytab', '')
+    kinit_password = config.get('kinit_password', '')
+    temp_dir = f"{config['edge_temp_path']}/{run_id}"
+
+    # Compose the login script dynamically
     cmd = f"""
 set -e
 
-echo "=== MapR Authentication ==="
+echo "=== Cluster Authentication ({auth_method}) ==="
 
-if maprlogin print 2>/dev/null | grep -q "Valid"; then
-    echo "Using existing valid MapR ticket"
-else
-    echo "Generating new MapR ticket..."
-    
-    if [ -n "{mapr_user}" ] && [ -n "{mapr_password}" ]; then
-        echo "{mapr_password}" | maprlogin password -user {mapr_user}
-    elif klist -s 2>/dev/null; then
-        maprlogin kerberos
+if [ "{auth_method}" = "mapr" ]; then
+    if maprlogin print 2>/dev/null | grep -q "Valid"; then
+        echo "Using existing valid MapR ticket"
     else
-        echo "Attempting maprlogin with current user..."
-        maprlogin password || maprlogin kerberos || {{ echo "ERROR: MapR authentication failed"; exit 1; }}
+        echo "Generating new MapR ticket..."
+        if [ -n "{mapr_user}" ] && [ -n "{mapr_password}" ]; then
+            echo "{mapr_password}" | maprlogin password -user {mapr_user}
+        elif klist -s 2>/dev/null; then
+            maprlogin kerberos
+        else
+            echo "Attempting maprlogin with current user..."
+            maprlogin password || maprlogin kerberos || {{ echo "ERROR: MapR authentication failed"; exit 1; }}
+        fi
     fi
-fi
-
-echo "=== Verifying MapR Ticket ==="
-maprlogin print
-if ! maprlogin print 2>/dev/null | grep -q "Valid"; then
-    echo "ERROR: No valid MapR ticket"
+    echo "=== Verifying MapR Ticket ==="
+    maprlogin print
+    if ! maprlogin print 2>/dev/null | grep -q "Valid"; then
+        echo "ERROR: No valid MapR ticket"
+        exit 1
+    fi
+elif [ "{auth_method}" = "kinit" ]; then
+    echo "=== Performing kinit authentication ==="
+    if [ -n "{kinit_keytab}" ] && [ -n "{kinit_principal}" ]; then
+        kinit -kt "{kinit_keytab}" "{kinit_principal}"
+    elif [ -n "{kinit_principal}" ] && [ -n "{kinit_password}" ]; then
+        echo "{kinit_password}" | kinit "{kinit_principal}"
+    else
+        echo "ERROR: kinit requires principal and keytab or password"
+        exit 1
+    fi
+    echo "=== Verifying Kerberos Ticket ==="
+    if ! klist -s; then
+        echo "ERROR: No valid Kerberos ticket after kinit"
+        exit 1
+    fi
+else
+    echo "ERROR: Unknown auth_method: {auth_method}"
     exit 1
 fi
 
@@ -374,7 +401,7 @@ echo "=== Creating temp directory ==="
 mkdir -p {temp_dir}
 chmod 755 {temp_dir}
 
-echo "MAPR_SETUP_SUCCESS"
+echo "CLUSTER_LOGIN_SUCCESS"
 echo "TEMP_DIR={temp_dir}"
 """
     with ssh.get_conn() as client:
@@ -382,10 +409,10 @@ echo "TEMP_DIR={temp_dir}"
         exit_code = stdout.channel.recv_exit_status()
         output = stdout.read().decode()
         error = stderr.read().decode()
-        
-        if exit_code != 0 or "MAPR_SETUP_SUCCESS" not in output:
-            raise Exception(f"MapR setup failed: {error}\n{output}")
-    
+
+        if exit_code != 0 or "CLUSTER_LOGIN_SUCCESS" not in output:
+            raise Exception(f"Cluster login setup failed: {error}\n{output}")
+
     return {'temp_dir': temp_dir, 'run_id': run_id}
 
 
@@ -404,7 +431,7 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
     dest_db = db_config['dest_database']
     dest_bucket = db_config['dest_bucket']
     
-    pyspark_script = f'''
+    pyspark_script = '''
 import json
 import sys
 from pyspark.sql import SparkSession
@@ -422,10 +449,12 @@ dest_db = "{dest_db}"
 dest_bucket = "{dest_bucket}"
 
 if pattern == '*':
-    tables_df = spark.sql(f"SHOW TABLES IN {{src_db}}")
+    tables_df = spark.sql("SHOW TABLES IN {0}".format(src_db))
 else:
     like_pattern = pattern.replace('*', '%')
-    tables_df = spark.sql(f"SHOW TABLES IN {{src_db}} LIKE '{{like_pattern}}'")
+    tables_df = spark.sql(
+        "SHOW TABLES IN {0} LIKE '{1}'".format(src_db, like_pattern)
+    )
 
 table_list = [row.tableName for row in tables_df.collect()]
 
@@ -433,7 +462,9 @@ metadata = []
 
 for tbl in table_list:
     try:
-        desc_df = spark.sql(f"DESCRIBE FORMATTED {{src_db}}.{{tbl}}")
+        desc_df = spark.sql(
+            "DESCRIBE FORMATTED {0}.{1}".format(src_db, tbl)
+        )
         desc_rows = desc_df.collect()
         
         loc = None
@@ -441,18 +472,18 @@ for tbl in table_list:
         input_format = None
         
         for row in desc_rows:
-            col_name = row.col_name.strip() if row.col_name else ""
-            data_type = row.data_type.strip() if row.data_type else ""
+            col_name = (row.col_name or "").strip().rstrip(":").lower()
+            data_type = (row.data_type or "").strip()
             
-            if col_name == "Location:":
+            if col_name == "location":
                 loc = data_type
-            elif col_name == "Table Type:":
+            elif col_name in ("type", "table type"):
                 table_type = data_type.replace("_TABLE", "")
             elif col_name == "InputFormat:":
                 input_format = data_type
         
-        mapr_total_size = 0
-        mapr_file_count = 0
+        source_total_size = 0
+        source_file_count = 0
         if loc:
             try:
                 from py4j.java_gateway import java_import
@@ -466,8 +497,8 @@ for tbl in table_list:
                 
                 if fs.exists(path):
                     content_summary = fs.getContentSummary(path)
-                    mapr_total_size = int(content_summary.getLength())
-                    mapr_file_count = int(content_summary.getFileCount())
+                    source_total_size = int(content_summary.getLength())
+                    source_file_count = int(content_summary.getFileCount())
             except:
                 pass
         
@@ -484,7 +515,9 @@ for tbl in table_list:
         
         row_count = 0
         try:
-            row_count = spark.sql(f"SELECT COUNT(*) as c FROM {{src_db}}.{{tbl}}").collect()[0].c
+            row_count = spark.sql(
+                "SELECT COUNT(*) as c FROM {0}.{1}".format(src_db, tbl)
+            ).collect()[0].c
         except:
             pass
         
@@ -492,17 +525,23 @@ for tbl in table_list:
         partition_columns = ""
         is_partitioned = False
         try:
-            parts_df = spark.sql(f"SHOW PARTITIONS {{src_db}}.{{tbl}}")
+            parts_df = spark.sql(
+                "SHOW PARTITIONS {0}.{1}".format(src_db, tbl)
+            )
             partitions = [row.partition for row in parts_df.collect()]
             is_partitioned = len(partitions) > 0
             
             if partitions:
                 first_part = partitions[0]
-                partition_columns = ",".join([p.split("=")[0] for p in first_part.split("/")])
+                partition_columns = ",".join(
+                    [p.split("=")[0] for p in first_part.split("/")]
+                )
         except:
             pass
         
-        schema_df = spark.sql(f"DESCRIBE {{src_db}}.{{tbl}}")
+        schema_df = spark.sql(
+            "DESCRIBE {0}.{1}".format(src_db, tbl)
+        )
         schema = []
         for row in schema_df.collect():
             col_name = row.col_name.strip() if row.col_name else ""
@@ -511,16 +550,16 @@ for tbl in table_list:
             if col_name.startswith("#") or col_name == "" or col_name == "col_name":
                 break
             
-            schema.append({{"name": col_name, "type": data_type}})
+            schema.append({"name": col_name, "type": data_type})
         
-        s3_location = f"{{dest_bucket}}/{{dest_db}}/{{tbl}}"
+        s3_location = "{0}/{1}/{2}".format(dest_bucket, dest_db, tbl)
         
-        metadata.append({{
+        metadata.append({
             "source_database": src_db,
             "source_table": tbl,
             "dest_database": dest_db,
             "dest_bucket": dest_bucket,
-            "mapr_location": loc or "",
+            "source_location": loc or "",
             "s3_location": s3_location,
             "file_format": file_format,
             "schema": schema,
@@ -530,18 +569,18 @@ for tbl in table_list:
             "row_count": row_count,
             "is_partitioned": is_partitioned,
             "table_type": table_type,
-            "mapr_total_size_bytes": mapr_total_size,
-            "mapr_file_count": mapr_file_count
-        }})
+            "source_total_size_bytes": source_total_size,
+            "source_file_count": source_file_count
+        })
         
     except Exception as e:
-        metadata.append({{
+        metadata.append({
             "source_database": src_db,
             "source_table": tbl,
             "dest_database": dest_db,
             "dest_bucket": dest_bucket,
-            "mapr_location": "",
-            "s3_location": f"{{dest_bucket}}/{{dest_db}}/{{tbl}}",
+            "source_location": "",
+            "s3_location": "{0}/{1}/{2}".format(dest_bucket, dest_db, tbl),
             "file_format": "PARQUET",
             "schema": [],
             "partitions": [],
@@ -550,18 +589,27 @@ for tbl in table_list:
             "row_count": 0,
             "is_partitioned": False,
             "table_type": "UNKNOWN",
-            "mapr_total_size_bytes": 0,
-            "mapr_file_count": 0,
+            "source_total_size_bytes": 0,
+            "source_file_count": 0,
             "error": str(e)[:500]
-        }})
+        })
 
-print("===JSON_START===", file=sys.stdout, flush=True)
-print(json.dumps(metadata), file=sys.stdout, flush=True)
-print("===JSON_END===", file=sys.stdout, flush=True)
+print "===JSON_START==="
+sys.stdout.flush()
+print json.dumps(metadata)
+sys.stdout.flush()
+print "===JSON_END==="
+sys.stdout.flush()
 
 spark.stop()
-'''
-
+'''.format(
+        run_id=run_id,
+        src_db=src_db,
+        pattern=pattern,
+        dest_db=dest_db,
+        dest_bucket=dest_bucket
+    )
+        
     with ssh.get_conn() as client:
         temp_dir = f"/tmp/discovery_{run_id}"
         client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
@@ -572,9 +620,10 @@ spark.stop()
             f.write(pyspark_script)
         sftp.close()
         
+        # Use pyspark < script.py instead of spark-submit
         cmd = f"""
 cd {temp_dir}
-spark-submit {script_path} 2>/dev/null
+pyspark < {script_path} 2>/dev/null
 """
         
         _, stdout, stderr = client.exec_command(cmd, timeout=3600)
@@ -584,7 +633,7 @@ spark-submit {script_path} 2>/dev/null
         client.exec_command(f"rm -rf {temp_dir}", timeout=60)
         
         if exit_code != 0:
-            raise Exception(f"Spark job failed: {stderr.read().decode()}\\n{output}")
+            raise Exception(f"Spark job failed: {stderr.read().decode()}\n{output}")
         
         json_start = output.find("===JSON_START===")
         json_end = output.find("===JSON_END===")
@@ -592,7 +641,9 @@ spark-submit {script_path} 2>/dev/null
         if json_start == -1 or json_end == -1:
             raise Exception(f"Could not find JSON markers in output: {output}")
         
-        json_str = output[json_start + len("===JSON_START==="):json_end].strip()
+        json_str = output[
+            json_start + len("===JSON_START==="):json_end
+        ].strip()
         metadata = json.loads(json_str)
     
     return {
@@ -622,8 +673,8 @@ def record_discovered_tables(discovery: dict, spark, sc) -> dict:
         parts_json = json.dumps(parts).replace("'", "''")
         row_count = t.get('row_count', 0)
         table_type = t.get('table_type', 'UNKNOWN')
-        mapr_size = t.get('mapr_total_size_bytes', 0)
-        mapr_files = t.get('mapr_file_count', 0)
+        source_total_size = t.get('source_total_size_bytes', 0)
+        source_file_count = t.get('source_file_count', 0)
         
         spark.sql(f"""
             MERGE INTO {tracking_db}.migration_table_status t
@@ -639,30 +690,30 @@ def record_discovered_tables(discovery: dict, spark, sc) -> dict:
                 discovery_status = 'COMPLETED',
                 discovery_completed_at = current_timestamp(),
                 discovery_duration_seconds = {discovery_duration},
-                mapr_location = '{t['mapr_location']}',
+                source_location = '{t['source_location']}',
                 file_format = '{t['file_format']}',
                 table_type = '{table_type}',                    
                 source_row_count = {row_count},                
-                mapr_total_size_bytes = {mapr_size},           
-                mapr_file_count = {mapr_files},     
+                source_total_size_bytes = {source_total_size},           
+                source_file_count = {source_file_count},     
                 updated_at = current_timestamp()
             WHEN NOT MATCHED THEN INSERT (
                 run_id, source_database, source_table, dest_database, dest_bucket,
-                dest_location, mapr_location, file_format,
+                dest_location, source_location, file_format,
                 partition_count, is_partitioned, schema_json, partitions_json,
                 partition_columns, table_type, source_row_count,         
-                mapr_total_size_bytes, mapr_file_count,                   
+                source_total_size_bytes, source_file_count,                   
                 discovery_status, discovery_completed_at,
                 discovery_duration_seconds, overall_status, updated_at,
                 is_retry, retry_count, parent_run_id
             ) VALUES (
                 '{run_id}', '{t['source_database']}', '{t['source_table']}',
                 '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
-                '{t['mapr_location']}', '{t['file_format']}',
+                '{t['source_location']}', '{t['file_format']}',
                 {t.get('partition_count', 0)}, {str(t.get('is_partitioned', False)).lower()},
                 '{schema_json}', '{parts_json}', '{t.get('partition_columns', '')}',
                 '{table_type}', {row_count},                               
-                {mapr_size}, {mapr_files},                               
+                {source_total_size}, {source_file_count},                               
                 'COMPLETED', current_timestamp(), {discovery_duration}, 'DISCOVERED', current_timestamp(),
                 false, 0, NULL
             )
@@ -673,14 +724,14 @@ def record_discovered_tables(discovery: dict, spark, sc) -> dict:
 
 @task
 @track_duration
-def run_distcp_ssh(discovery: dict, mapr_setup: dict) -> dict:
+def run_distcp_ssh(discovery: dict, cluster_setup: dict) -> dict:
     """Run DistCp via SSH for all tables. Uses -update for incremental."""
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
     
     run_id = discovery['run_id']
     tables = discovery['tables']
-    temp_dir = mapr_setup['temp_dir']
+    temp_dir = cluster_setup['temp_dir']
     mappers = config['distcp_mappers']
     bandwidth = config['distcp_bandwidth']
     
@@ -700,9 +751,9 @@ def run_distcp_ssh(discovery: dict, mapr_setup: dict) -> dict:
     for t in tables:
         src_db = t['source_database']
         tbl = t['source_table']
-        mapr_loc = t['mapr_location']
+        source_loc = t['source_location']
         s3_loc = t['s3_location']
-        
+
         cmd = f'''
 set -e
 
@@ -739,7 +790,7 @@ echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
 
 echo "=== Running distcp ==="
 DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
-    -log {temp_dir}/distcp_{tbl}.log "{mapr_loc}" "{s3_loc}" 2>&1)
+    -log {temp_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 echo "DISTCP_EXIT_CODE=$DISTCP_EXIT"
 
@@ -902,8 +953,8 @@ def update_distcp_status(distcp_result: dict, spark, sc, retry_run_id: str = Non
                 s3_file_count_after = {s3_files_after},
                 s3_bytes_transferred = {s3_bytes_transfer},
                 s3_files_transferred = {s3_files_transfer},                                     
-                file_count_match = (mapr_file_count = {s3_files_after}),               
-                file_size_match = (ABS(mapr_total_size_bytes - {s3_size_after}) / GREATEST(mapr_total_size_bytes, 1) < 0.01),  
+                file_count_match = (source_file_count = {s3_files_after}),               
+                file_size_match = (ABS(source_total_size_bytes - {s3_size_after}) / GREATEST(source_total_size_bytes, 1) < 0.01),  
                 overall_status = '{overall}',
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
                 {retry_fields}
@@ -1729,7 +1780,7 @@ def generate_html_report(run_id: str, spark, sc) -> str:
         if not t.distcp_status:
             continue
         
-        mapr_size_gb = (t.mapr_total_size_bytes or 0) / (1024**3)
+        source_total_size_gb = (t.source_total_size_bytes or 0) / (1024**3)
         s3_size_before_gb = (t.s3_total_size_bytes_before or 0) / (1024**3)
         s3_size_after_gb = (t.s3_total_size_bytes_after or 0) / (1024**3)
         s3_transferred_gb = (t.s3_bytes_transferred or 0) / (1024**3)
@@ -1744,12 +1795,12 @@ def generate_html_report(run_id: str, spark, sc) -> str:
                 <tr>
                     <td>{t.source_database}</td>
                     <td><strong>{t.source_table}</strong></td>
-                    <td class="metric">{mapr_size_gb:.2f}</td>
+                    <td class="metric">{source_total_size_gb:.2f}</td>
                     <td class="metric">{s3_size_before_gb:.2f}</td>
                     <td class="metric">{s3_size_after_gb:.2f}</td>
                     <td class="metric">{s3_transferred_gb:.2f}</td>
                     <td class="{size_match_class}">{size_match_icon}</td>
-                    <td class="metric">{t.mapr_file_count:,}</td>
+                    <td class="metric">{t.source_file_count:,}</td>
                     <td class="metric">{t.s3_file_count_before:,}</td>
                     <td class="metric">{t.s3_file_count_after:,}</td>
                     <td class="metric">{t.s3_files_transferred:,}</td>
@@ -1856,11 +1907,11 @@ def finalize_run(run_id: str, spark, sc) -> dict:
 
 
 @task
-def cleanup_edge(mapr_setup: dict, run_id: str) -> dict:
+def cleanup_edge(cluster_setup: dict, run_id: str) -> dict:
     """Clean up temp files on edge node."""
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
-    temp_dir = mapr_setup.get('temp_dir', '')
+    temp_dir = cluster_setup.get('temp_dir', '')
     
     if temp_dir:
         try:
@@ -1935,7 +1986,7 @@ def get_failed_tables(parent_run_id: str, spark, sc) -> list:
             source_table,
             dest_database,
             dest_bucket,
-            mapr_location,
+            source_location,
             dest_location,
             file_format,
             schema_json,
@@ -1945,8 +1996,8 @@ def get_failed_tables(parent_run_id: str, spark, sc) -> list:
             is_partitioned,
             table_type,
             source_row_count,
-            mapr_total_size_bytes,
-            mapr_file_count,
+            source_total_size_bytes,
+            source_file_count,
             overall_status,
             discovery_status,
             distcp_status,
@@ -1974,7 +2025,7 @@ def get_failed_tables(parent_run_id: str, spark, sc) -> list:
             'source_table': row.source_table,
             'dest_database': row.dest_database,
             'dest_bucket': row.dest_bucket,
-            'mapr_location': row.mapr_location,
+            'source_location': row.source_location,
             's3_location': row.dest_location,
             'file_format': row.file_format,
             'schema': schema,
@@ -1984,8 +2035,8 @@ def get_failed_tables(parent_run_id: str, spark, sc) -> list:
             'row_count': row.source_row_count,
             'is_partitioned': row.is_partitioned,
             'table_type': row.table_type,
-            'mapr_total_size_bytes': row.mapr_total_size_bytes,
-            'mapr_file_count': row.mapr_file_count,
+            'source_total_size_bytes': row.source_total_size_bytes,
+            'source_file_count': row.source_file_count,
             'run_id': parent_run_id,
             'previous_status': row.overall_status,
             'discovery_status': row.discovery_status,
@@ -1995,9 +2046,7 @@ def get_failed_tables(parent_run_id: str, spark, sc) -> list:
             'error_message': row.error_message,
             'current_retry_count': row.current_retry_count,
         })
-
     return failed_tables
-
 
 @task.pyspark(conn_id='spark_default')
 def group_failed_tables_by_database(failed_tables: list, spark, sc) -> list:
@@ -2021,20 +2070,18 @@ def group_failed_tables_by_database(failed_tables: list, spark, sc) -> list:
 
     return grouped_configs
 
-
 # =============================================================================
 # DAG 3: ICEBERG MIGRATION TASKS
 # =============================================================================
-
 @task.pyspark(conn_id='spark_default')
 def init_iceberg_tracking_tables(spark, sc) -> dict:
-    """Create Iceberg migration tracking table if it doesn't exist."""
+    """Create Iceberg tracking tables for Iceberg migration if they don't exist."""
     config = get_config()
     tracking_db = config['tracking_database']
     tracking_loc = config['tracking_location']
-    
-    spark.sql(f"CREATE DATABASE IF NOT EXISTS {tracking_db} LOCATION '{tracking_loc}'")
-
+    spark.sql(f"""
+        CREATE DATABASE IF NOT EXISTS {tracking_db} LOCATION '{tracking_loc}'
+    """)
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {tracking_db}.iceberg_migration_runs (
             run_id STRING,
@@ -2056,7 +2103,6 @@ def init_iceberg_tracking_tables(spark, sc) -> dict:
         USING iceberg
         LOCATION '{tracking_loc}/iceberg_migration_runs'
     """)
-    
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {tracking_db}.iceberg_migration_table_status (
             run_id STRING,
@@ -2093,9 +2139,7 @@ def init_iceberg_tracking_tables(spark, sc) -> dict:
         USING iceberg
         LOCATION '{tracking_loc}/iceberg_migration_table_status'
     """)
-    
     return {'status': 'initialized', 'database': tracking_db}
-
 
 @task.pyspark(conn_id='spark_default')
 def create_iceberg_migration_run(excel_file_path: str, dag_run_id: str, spark, sc) -> str:
@@ -3200,12 +3244,12 @@ with DAG(
         excel_file_path="{{ params.excel_file_path }}",
         run_id=t_run_id
     )
-    t_mapr = mapr_token_setup(run_id=t_run_id)
+    t_cluster = cluster_login_setup(run_id=t_run_id)
     
     # Per-database processing (dynamic task mapping)
     t_discover = discover_tables_via_spark_ssh.expand(db_config=t_excel)
     t_record = record_discovered_tables.expand(discovery=t_discover)
-    t_distcp = run_distcp_ssh.partial(mapr_setup=t_mapr).expand(discovery=t_record)
+    t_distcp = run_distcp_ssh.partial(cluster_setup=t_cluster).expand(discovery=t_record)
     t_distcp_status = update_distcp_status.expand(distcp_result=t_distcp)
     t_tables = create_hive_tables.expand(distcp_result=t_distcp_status)
     t_tbl_status = update_table_create_status.expand(table_result=t_tables)
@@ -3219,10 +3263,10 @@ with DAG(
     
     # Finalize
     t_final = finalize_run(run_id=t_run_id)
-    t_cleanup = cleanup_edge(mapr_setup=t_mapr, run_id=t_run_id)
+    t_cleanup = cleanup_edge(cluster_setup=t_cluster, run_id=t_run_id)
     
     # Dependencies
-    t_init >> t_run_id >> t_excel >> t_mapr >> t_discover >> t_record
+    t_init >> t_run_id >> t_excel >> t_cluster >> t_discover >> t_record
     t_record >> t_distcp >> t_distcp_status >> t_tables >> t_tbl_status
     t_tbl_status >> t_dest_validation >> t_val_status 
     t_val_status >> t_report >> t_final >> t_cleanup
@@ -3258,10 +3302,10 @@ with DAG(
         parent_run_id="{{ params.parent_run_id }}",
         dag_run_id="{{ run_id }}"
     )
-    t_retry_mapr = mapr_token_setup(run_id=t_retry_run_id)
+    t_retry_cluster = cluster_login_setup(run_id=t_retry_run_id)
 
     # Per-database processing (dynamic task mapping)
-    t_retry_distcp = run_distcp_ssh.partial(mapr_setup=t_retry_mapr).expand(
+    t_retry_distcp = run_distcp_ssh.partial(cluster_setup=t_retry_cluster).expand(
         discovery=t_retry_grouped  
     )
     t_retry_distcp_status = update_distcp_status.partial(retry_run_id=t_retry_run_id).expand(distcp_result=t_retry_distcp)
@@ -3277,13 +3321,13 @@ with DAG(
 
     # Finalize
     t_retry_final = finalize_run(run_id=t_retry_run_id)
-    t_retry_cleanup = cleanup_edge(mapr_setup=t_retry_mapr, run_id=t_retry_run_id)
+    t_retry_cleanup = cleanup_edge(cluster_setup=t_retry_cluster, run_id=t_retry_run_id)
 
     # Dependencies
     t_retry_failed >> t_retry_run_id
     t_retry_failed >> t_retry_grouped
-    [t_retry_run_id, t_retry_grouped] >> t_retry_mapr
-    t_retry_mapr >> t_retry_distcp >> t_retry_distcp_status
+    [t_retry_run_id, t_retry_grouped] >> t_retry_cluster
+    t_retry_cluster >> t_retry_distcp >> t_retry_distcp_status
     t_retry_distcp_status >> t_retry_tables >> t_retry_tbl_status
     t_retry_tbl_status >> t_retry_validation >> t_retry_val_status
     t_retry_val_status >> t_retry_report >> t_retry_final >> t_retry_cleanup
