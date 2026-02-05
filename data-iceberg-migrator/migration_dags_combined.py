@@ -118,7 +118,10 @@ def get_config() -> dict:
         'tracking_database': Variable.get('migration_tracking_database', default_var='migration_tracking'),
         'tracking_location': Variable.get('migration_tracking_location', default_var='s3a://data-lake/migration_tracking'),
         'report_output_location': Variable.get('migration_report_location', default_var='s3a://data-lake/migration_reports'),
-        
+
+        # Ticket script configuration
+        'ticket_script_path': Variable.get('ticket_script_path', default_var='~/get_ticket.sh'),
+        'mapr_ticketfile_location': Variable.get('mapr_ticketfile_location', default_var='/tmp/maprticket_${USER}'),
 
         # Cluster Authentication (MapR or Kerberos)
         'auth_method': Variable.get('auth_method', default_var='mapr'),  # 'mapr' or 'kinit'
@@ -128,6 +131,7 @@ def get_config() -> dict:
         'kinit_keytab': Variable.get('kinit_keytab', default_var=''),
         'kinit_password': Variable.get('kinit_password', default_var=''),
 
+        # Listing tool
         's3_listing_tool': Variable.get('s3_listing_tool', default_var='hadoop'),
     }
 
@@ -342,23 +346,56 @@ def parse_excel(excel_file_path: str, run_id: str, spark, sc) -> list:
 def cluster_login_setup(run_id: str) -> dict:
     """SSH to edge, perform cluster login (MapR or Kerberos), create temp dir."""
     config = get_config()
-    auth_method = config.get('auth_method', 'mapr')
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
+    temp_dir = f"{config['edge_temp_path']}/{run_id}"
+
+    auth_script_parts = []
+
+    auth_script_parts.append("""
+echo "=== Sourcing User Profile ==="
+if [ -f ~/.profile ]; then
+    source ~/.profile
+    echo "Profile sourced: ~/.profile"
+else
+    echo "WARNING: Profile not found at ~/.profile"
+fi
+""")
+        
+    ticket_script = config['ticket_script_path']
+    auth_script_parts.append(f"""
+echo "=== Checking for Ticket Script ==="
+if [ -f "{ticket_script}" ]; then
+    echo "Ticket script found at {ticket_script}"
+    TICKET_EXISTS=true
+else
+    echo "Ticket script not found at {ticket_script}"
+    TICKET_EXISTS=false
+fi
+""")
+    
+    auth_method = config.get('auth_method', 'mapr')
     mapr_user = config.get('mapr_user', '')
     mapr_password = config.get('mapr_password', '')
+    mapr_ticketfile = config.get('mapr_ticketfile_location', '') 
     kinit_principal = config.get('kinit_principal', '')
     kinit_keytab = config.get('kinit_keytab', '')
     kinit_password = config.get('kinit_password', '')
-    temp_dir = f"{config['edge_temp_path']}/{run_id}"
 
-    # Compose the login script dynamically
-    cmd = f"""
+    auth_script_parts.append(f"""
+if [ "$TICKET_EXISTS" = "false" ]; then
+    echo "=== Creating Ticket Script at {ticket_script} ==="
+    cat > "{ticket_script}" << 'EOF_TICKET'
+#!/bin/bash
+# Auto-generated authentication script
 set -e
 
 echo "=== Cluster Authentication ({auth_method}) ==="
 
 if [ "{auth_method}" = "mapr" ]; then
-    if maprlogin print 2>/dev/null | grep -q "Valid"; then
+    MAPR_TICKETFILE_LOCATION="{mapr_ticketfile}" 
+    export MAPR_TICKETFILE_LOCATION 
+
+    if maprlogin print 2>/dev/null | grep -q "{mapr_user}"; then
         echo "Using existing valid MapR ticket"
     else
         echo "Generating new MapR ticket..."
@@ -371,14 +408,7 @@ if [ "{auth_method}" = "mapr" ]; then
             maprlogin password || maprlogin kerberos || {{ echo "ERROR: MapR authentication failed"; exit 1; }}
         fi
     fi
-    echo "=== Verifying MapR Ticket ==="
-    maprlogin print
-    if ! maprlogin print 2>/dev/null | grep -q "Valid"; then
-        echo "ERROR: No valid MapR ticket"
-        exit 1
-    fi
 elif [ "{auth_method}" = "kinit" ]; then
-    echo "=== Performing kinit authentication ==="
     if [ -n "{kinit_keytab}" ] && [ -n "{kinit_principal}" ]; then
         kinit -kt "{kinit_keytab}" "{kinit_principal}"
     elif [ -n "{kinit_principal}" ] && [ -n "{kinit_password}" ]; then
@@ -387,25 +417,65 @@ elif [ "{auth_method}" = "kinit" ]; then
         echo "ERROR: kinit requires principal and keytab or password"
         exit 1
     fi
-    echo "=== Verifying Kerberos Ticket ==="
-    if ! klist -s; then
-        echo "ERROR: No valid Kerberos ticket after kinit"
-        exit 1
-    fi
+elif [ "{auth_method}" = "none" ]; then
+    echo "No authentication required (auth_method=none)"
 else
     echo "ERROR: Unknown auth_method: {auth_method}"
     exit 1
 fi
 
+echo "Authentication successful"
+EOF_TICKET
+
+    chmod +x "{ticket_script}"
+    echo "Ticket script created and made executable"
+fi
+""")
+
+    auth_script_parts.append(f"""
+echo "=== Executing Ticket Script ==="
+if [ -f "{ticket_script}" ]; then
+    if [ -x "{ticket_script}" ]; then
+        "{ticket_script}"
+        TICKET_EXIT=$?
+        if [ $TICKET_EXIT -ne 0 ]; then
+            echo "ERROR: Ticket script failed with exit code $TICKET_EXIT"
+            exit 1
+        fi
+        echo "Ticket script executed successfully"
+        export MAPR_TICKETFILE_LOCATION="{mapr_ticketfile}"
+    else
+        echo "ERROR: Ticket script exists but is not executable: {ticket_script}"
+        echo "Run: chmod +x {ticket_script}"
+        exit 1
+    fi
+else
+    echo "ERROR: Ticket script not found at {ticket_script}"
+    exit 1
+fi
+""")
+    
+    auth_script_parts.append(f"""
+echo "=== Verifying Ticket ==="
+if maprlogin print 2>/dev/null | grep -q "Valid"; then
+    echo "Ticket verification successful"
+else
+    echo "ERROR: Ticket verification failed"
+    exit 1
+fi
+""") 
+        
+    auth_script_parts.append(f"""
 echo "=== Creating temp directory ==="
 mkdir -p {temp_dir}
 chmod 755 {temp_dir}
 
 echo "CLUSTER_LOGIN_SUCCESS"
 echo "TEMP_DIR={temp_dir}"
-"""
+""")
+    full_script = "set -e\n" + "\n".join(auth_script_parts)
     with ssh.get_conn() as client:
-        _, stdout, stderr = client.exec_command(cmd, timeout=300)
+        _, stdout, stderr = client.exec_command(full_script, timeout=300)
         exit_code = stdout.channel.recv_exit_status()
         output = stdout.read().decode()
         error = stderr.read().decode()
@@ -619,10 +689,12 @@ spark.stop()
         with sftp.file(script_path, 'w') as f:
             f.write(pyspark_script)
         sftp.close()
+
+        source_profile = "source ~/.profile 2>/dev/null || true\n"
         
         # Use pyspark < script.py instead of spark-submit
         cmd = f"""
-cd {temp_dir}
+{source_profile} cd {temp_dir}
 pyspark < {script_path} 2>/dev/null
 """
         
@@ -746,6 +818,8 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict) -> dict:
         s3_opts += f" -Dfs.s3a.access.key={s3_access_key}"
     if s3_secret_key:
         s3_opts += f" -Dfs.s3a.secret.key={s3_secret_key}"
+
+    source_profile = "source ~/.profile 2>/dev/null || true\n"
     
     results = []
     for t in tables:
@@ -754,7 +828,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict) -> dict:
         source_loc = t['source_location']
         s3_loc = t['s3_location']
 
-        cmd = f'''
+        cmd = f'''{source_profile}
 set -e
 
 calculate_s3_metrics_hadoop() {{
