@@ -1,6 +1,6 @@
 # MapR to S3 Migration DAG
 
-An automated **Airflow TaskFlow-based migration pipeline** consisting of four independent DAGs for orchestrating large-scale Hive table migrations from MapR-FS to S3 and converting existing tables to Iceberg format.
+An automated **Airflow TaskFlow-based migration pipeline** consisting of four independent DAGs for orchestrating large-scale Hive table migrations from MapR-FS/HDFS to S3 and converting existing tables to Iceberg format.
 
 ---
 
@@ -8,7 +8,7 @@ An automated **Airflow TaskFlow-based migration pipeline** consisting of four in
 
 This implementation provides two independent but complementary migration DAGs:
 
-1. **`mapr_to_s3_migration`** - Migrates Hive tables from MapR-FS to Amazon S3
+1. **`mapr_to_s3_migration`** - Migrates Hive tables from MapR-FS/HDFS to Amazon S3
 2. **`mapr_to_s3_migration_retry`** - Retries failed tables from previous MapR-to-S3 migration
 3. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
 4. **`iceberg_migration_retry`** - Retries failed Iceberg migrations from previous run
@@ -34,7 +34,7 @@ This implementation provides two independent but complementary migration DAGs:
 ┌─────────────────────────────────────────────────────────────┐
 │ DAG 1: MapR to S3                                           │
 │                                                             │
-│ MapR-FS (Hive Tables)                                       │
+│ MapR-FS/HDFS (Hive Tables)                                       │
 │ │                                                           │
 │ │ [PySpark: Metadata Discovery]                             │
 │ ▼                                                           │
@@ -95,7 +95,7 @@ This implementation provides two independent but complementary migration DAGs:
 ### Migration Strategy Decision Tree
 
 ```
-Do you need to migrate from MapR-FS to S3?
+Do you need to migrate from MapR-FS/HDFS to S3?
 │
 ├─ YES → Run DAG 1 (mapr_to_s3_migration)
 │ │
@@ -124,7 +124,7 @@ Do you need to migrate from MapR-FS to S3?
 
 ### Purpose
 
-Orchestrates the complete migration of Hive tables from MapR-FS to Amazon S3, including data transfer, metadata recreation, and validation.
+Orchestrates the complete migration of Hive tables from MapR-FS/HDFS to S3, including data transfer, metadata recreation, and validation.
 
 ---
 
@@ -162,7 +162,7 @@ create_migration_run
 ↓
 parse_excel
 ↓
-mapr_token_setup (SSH: MapR authentication)
+cluster_login_setup (SSH: cluster authentication)
 ↓
 ┌───────────────────────────────────────────────┐
 │ Dynamic Task Mapping (per database config)    │
@@ -238,19 +238,20 @@ cleanup_edge (SSH: Cleanup temp files)
 
 ---
 
-#### Step 3 - `mapr_token_setup`
+
+#### Step 3 - `cluster_login_setup`
 
 **Type:** SSH  
-**Purpose:** Authenticate to MapR cluster and prepare edge node environment
+**Purpose:** Authenticate to the source cluster (MapR or Kerberos) and prepare edge node environment
 
-- Connects to MapR edge node via SSH
-- Authenticates using one of three methods:
-  1. **Password authentication** - Uses `mapr_user` and `mapr_password` variables
-  2. **Kerberos** - Uses existing Kerberos ticket if available
-  3. **Existing MapR ticket** - Validates and uses existing valid ticket
-- Verifies MapR ticket validity with `maprlogin print`
+- Connects to the cluster edge node via SSH
+- Authenticates using one of the following methods, based on configuration:
+  1. **MapR password authentication** - Uses `mapr_user` and `mapr_password` variables
+  2. **Kerberos authentication** - Uses `kinit_principal` and `kinit_keytab` or `kinit_password`
+  3. **Existing MapR or Kerberos ticket** - Validates and uses existing valid ticket
+- Verifies ticket validity with `maprlogin print` or `klist`
 - Creates temporary working directory on edge node (`/tmp/migration/{run_id}`)
-- Ensures all subsequent SSH operations can access MapR filesystem
+- Ensures all subsequent SSH operations can access the source filesystem
 
 ---
 
@@ -263,7 +264,7 @@ cleanup_edge (SSH: Cleanup temp files)
 - Discovers tables matching the pattern (supports `*` wildcards)
 - For each table, extracts:
   - **Schema** - Column names and data types
-  - **Location** - MapR-FS HDFS path
+  - **Location** - Source filesystem path (MapR-FS or HDFS)
   - **Format** - Parquet, ORC, or Avro (detected from InputFormat)
   - **Partitions** - Partition spec and count (via `SHOW PARTITIONS`)
   - **Partition columns** - Extracted from table metadata
@@ -288,7 +289,7 @@ cleanup_edge (SSH: Cleanup temp files)
 #### Step 6 - `run_distcp_ssh`
 
 **Type:** SSH (mapped per database)  
-**Purpose:** Copy data from MapR-FS to S3 using Hadoop DistCp
+**Purpose:** Copy data from MapR-FS/HDFS to S3 using Hadoop DistCp
 
 - Executes DistCp via SSH for each table discovered in previous step
 - **Incremental detection:**
@@ -429,7 +430,7 @@ cleanup_edge (SSH: Cleanup temp files)
 **Type:** SSH  
 **Purpose:** Clean up temporary files on MapR edge node
 
-- Removes temporary directory created in `mapr_token_setup`
+- Removes temporary directory created in `cluster_login_setup`
 - Cleans up DistCp log files
 - Ensures edge node disk space is freed
 - Failures are ignored
@@ -518,7 +519,7 @@ get_failed_tables (Query tracking for failures)
     ↓
 group_failed_tables_by_database (Batch for efficiency)
     ↓
-mapr_token_setup (MapR authentication)
+cluster_login_setup (Source cluster authentication)
     ↓
 ┌─────────────────────────────────────────────┐
 │ Dynamic Task Mapping (per failed database)  │
