@@ -118,7 +118,7 @@ with DAG(
     dag_id='ranger_policy_automation',
     default_args=default_args,
     description='Automate Ranger & Keycloak policy creation from Excel configuration',
-    schedule_interval=None,
+    schedule=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=['ranger', 'keycloak', 'security', 'policy-automation'],
@@ -168,7 +168,7 @@ with DAG(
 
 
     @task.pyspark(conn_id='spark_default')
-    def parse_excel_to_dicts(excel_file_path: str, spark, sc) -> Dict[str, Any]:
+    def parse_excel_to_dicts(excel_file_path: str, spark) -> Dict[str, Any]:
         import pandas as pd
         from io import BytesIO
         
@@ -298,7 +298,7 @@ with DAG(
         return {'policies': policies, 'role_principals': role_principals, 'skipped_rows': skipped_rows}
 
     @task.pyspark(conn_id="spark_default")
-    def write_skipped_rows(tracking_run_id: str, skipped_rows: list, spark, sc) -> int:
+    def write_skipped_rows(tracking_run_id: str, skipped_rows: list, spark) -> int:
         """
         Write skipped Excel rows (validation errors) to the skipped rows tracking table.
         """
@@ -336,7 +336,7 @@ with DAG(
         return written_count
 
     @task.pyspark(conn_id="spark_default")
-    def init_policy_tracking_tables(spark, sc) -> Dict:
+    def init_policy_tracking_tables(spark) -> Dict:
 
         config = get_config()
         db = config["tracking_database"]
@@ -435,7 +435,7 @@ with DAG(
         return {"status": "initialized", "tracking_db": db}
 
     @task.pyspark(conn_id="spark_default")
-    def create_policy_run(excel_file_path: str, dag_run_identifier: str, spark, sc) -> str:
+    def create_policy_run(excel_file_path: str, dag_run_identifier: str, spark) -> str:
         import uuid
         policy_run_id = f"run_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
         db = get_config()["tracking_database"]
@@ -1121,7 +1121,7 @@ with DAG(
 
 
     @task.pyspark(conn_id="spark_default")
-    def generate_policy_report(tracking_run_id: str, skipped_rows: list, spark, sc) -> str:
+    def generate_policy_report(tracking_run_id: str, skipped_rows: list, spark) -> str:
         """
         Generate a multi-row formatted HTML report for Ranger & Keycloak policy run.
         Includes object counts, status badges, and error messages.
@@ -1392,7 +1392,7 @@ with DAG(
         return report_path
 
     @task.pyspark(conn_id="spark_default")
-    def write_policy_statuses(initial_policy_statuses: List[Dict], spark, sc) -> int:
+    def write_policy_statuses(initial_policy_statuses: List[Dict], spark) -> int:
         """
         Write initial policy statuses to the policy_status table (status = RUNNING or PENDING).
         """
@@ -1513,7 +1513,7 @@ with DAG(
         return status_list
 
     @task.pyspark(conn_id="spark_default")
-    def write_policy_object_statuses(statuses: List[Dict], spark, sc) -> Dict:
+    def write_policy_object_statuses(statuses: List[Dict], spark) -> Dict:
         """
         Write all object statuses in a single batch operation.
         This avoids the mapped task complexity and type mismatches.
