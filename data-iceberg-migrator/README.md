@@ -15,6 +15,56 @@ This implementation provides two independent but complementary migration DAGs:
 
 ---
 
+## Configuration Variables
+
+The DAGs rely on Airflow Variables for configuration. Set these before running:
+
+### Required Variables
+
+| Variable                      | Description                                     | Example                              |
+| ----------------------------- | ----------------------------------------------- | ------------------------------------ |
+| `cluster_ssh_conn_id`         | Airflow SSH connection ID for cluster edge node | `cluster_edge_ssh`                   |
+| `migration_default_s3_bucket` | Default S3 bucket for migrations                | `s3a://data-lake`                    |
+| `migration_tracking_database` | Database name for tracking tables               | `migration_tracking`                 |
+| `migration_tracking_location` | S3 location for tracking tables                 | `s3a://data-lake/migration_tracking` |
+| `migration_report_location`   | S3 location for HTML reports                    | `s3a://data-lake/migration_reports`  |
+| `migration_spark_conn_id`     | Airflow Spark connection ID                     | `spark_default`                      |
+
+### Authentication Variables
+
+| Variable                   | Description                                       | Required For           |
+| -------------------------- | ------------------------------------------------- | ---------------------- |
+| `auth_method`              | Authentication method: `mapr`, `kinit`, or `none` | MapR/Kerberos          |
+| `mapr_ticketfile_location` | MapR ticket file path                             | MapR auth              |
+| `kinit_principal`          | Kerberos principal                                | Kerberos auth          |
+| `kinit_keytab`             | Path to Kerberos keytab file                      | Kerberos keytab auth   |
+| `kinit_password`           | Kerberos password                                 | Kerberos password auth |
+
+### Optional Variables
+
+| Variable                     | Default          | Description                              |
+| ---------------------------- | ---------------- | ---------------------------------------- |
+| `cluster_edge_temp_path`     | `/tmp/migration` | Temporary directory on edge node         |
+| `s3_endpoint`                | _(empty)_        | Custom S3 endpoint URL                   |
+| `s3_access_key`              | _(empty)_        | S3 access key (if not using IAM)         |
+| `s3_secret_key`              | _(empty)_        | S3 secret key (if not using IAM)         |
+| `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                 |
+| `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)        |
+| `s3_listing_tool`            | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3` |
+
+---
+
+## DAG Parameter Details
+
+| DAG   | Parameter         | Required | Description                | Example                                      |
+| ----- | ----------------- | -------- | -------------------------- | -------------------------------------------- |
+| DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config    | `s3a://config-bucket/migration.xlsx`         |
+| DAG 2 | `parent_run_id`   | Yes      | Run ID from DAG 1 to retry | `run_20250210_143022_a1b2c3d4`               |
+| DAG 3 | `excel_file_path` | Yes      | S3 path to Iceberg config  | `s3a://config-bucket/iceberg_migration.xlsx` |
+| DAG 4 | `parent_run_id`   | Yes      | Run ID from DAG 3 to retry | `iceberg_run_20250210_150000_e5f6g7h8`       |
+
+---
+
 ## Key Features of all DAGs
 
 - **Parallel Processing** - Dynamic task mapping for concurrent migrations
@@ -34,7 +84,7 @@ This implementation provides two independent but complementary migration DAGs:
 ┌─────────────────────────────────────────────────────────────┐
 │ DAG 1: MapR to S3                                           │
 │                                                             │
-│ MapR-FS/HDFS (Hive Tables)                                       │
+│ MapR-FS/HDFS (Hive Tables)                                  │
 │ │                                                           │
 │ │ [PySpark: Metadata Discovery]                             │
 │ ▼                                                           │
@@ -140,6 +190,24 @@ Orchestrates the complete migration of Hive tables from MapR-FS/HDFS to S3, incl
 
 ---
 
+### Duration Tracking
+
+Tasks decorated with `@track_duration` automatically capture execution time:
+
+- **Mechanism**: Decorator wraps task function and measures start/end time
+- **Storage**: Adds `_task_duration` field to task result dictionary
+- **XCom**: Duration flows through task dependencies via XCom
+- **Tracking**: Saved to tracking tables in `*_duration_seconds` columns
+
+**Tracked tasks:**
+
+- `discover_tables_via_spark_ssh` → `discovery_duration_seconds`
+- `run_distcp_ssh` → `distcp_duration_seconds`
+- `create_hive_tables` → `table_create_duration_seconds`
+- `validate_destination_tables` → `validation_duration_seconds`
+
+---
+
 ### Excel Configuration Format
 
 **Required Columns:**
@@ -238,7 +306,6 @@ cleanup_edge (SSH: Cleanup temp files)
 
 ---
 
-
 #### Step 3 - `cluster_login_setup`
 
 **Type:** SSH  
@@ -246,9 +313,8 @@ cleanup_edge (SSH: Cleanup temp files)
 
 - Connects to the cluster edge node via SSH
 - Authenticates using one of the following methods, based on configuration:
-  1. **MapR password authentication** - Uses `mapr_user` and `mapr_password` variables
-  2. **Kerberos authentication** - Uses `kinit_principal` and `kinit_keytab` or `kinit_password`
-  3. **Existing MapR or Kerberos ticket** - Validates and uses existing valid ticket
+  1. **Kerberos authentication** - Uses `kinit_principal` and `kinit_keytab` or `kinit_password`
+  2. **Existing MapR or Kerberos ticket** - Validates and uses existing valid ticket
 - Verifies ticket validity with `maprlogin print` or `klist`
 - Creates temporary working directory on edge node (`/tmp/migration/{run_id}`)
 - Ensures all subsequent SSH operations can access the source filesystem
@@ -302,6 +368,14 @@ cleanup_edge (SSH: Cleanup temp files)
   - Dynamic strategy for load balancing
   - S3 credentials passed via `-D` properties
 - Captures success/failure status per table
+- **File metrics tracking:**
+  - Calculates S3 metrics BEFORE DistCp: file count and total size
+  - Calculates S3 metrics AFTER DistCp: file count and total size
+  - Computes transferred bytes and files (delta between before/after)
+  - Compares with source MapR/HDFS metrics:
+    - `file_size_match`: True if within 1% tolerance
+    - `file_count_match`: True if exact match
+  - These metrics help detect incomplete copies even when DistCp reports success
 - Logs written to `{temp_dir}/distcp_{table}.log`
 - **Timeout:** 24 hours per table (configurable via `SSH_COMMAND_TIMEOUT`)
 
@@ -401,10 +475,13 @@ cleanup_edge (SSH: Cleanup temp files)
 **Purpose:** Generate comprehensive HTML migration report
 
 - Queries tracking tables
-- Generates HTML report with sections:
-  - Table migration details
-  - Validation results
-  - Performance metric
+- **Generates HTML report with comprehensive sections:**
+  1. **Migration Summary** - Total/successful/failed tables, data volume, file counts, incremental runs
+  2. **Validation Summary** - Tables validated, passed/failed counts, mismatch breakdowns
+  3. **Table Migration Details** - Per-table status, durations for discovery/DistCp/creation/validation
+  4. **Metadata Validation Results** - Row count comparison, partition comparison, schema comparison
+  5. **Data Validation Results** - File size comparison (MapR vs S3), file count comparison
+  6. **Performance Metrics** - Data volume, DistCp speed (MB/s), rows/second, end-to-end duration
 
 ---
 
@@ -467,6 +544,12 @@ Automatically retry failed tables from a previous MapR-to-S3 migration run with 
 - **Incremental Data Copy**: DistCp `update` flag copies only missing/changed files
 - **Idempotent Operations**: Safe to run multiple times
 - **Tracking Continuity**: Updates original run_id records
+- **Retry Metadata Tracking**:
+  - `is_retry`: Boolean flag indicating retry run
+  - `retry_run_id`: Links to the retry run that processed this table
+  - `retry_count`: Increments with each retry attempt (1, 2, 3, ...)
+  - `last_retry_at`: Timestamp of most recent retry
+  - `parent_run_id`: Links back to original failed run
 - **No Data Duplication**: Safe partition additions, table repairs
 
 ---
@@ -562,6 +645,22 @@ Converts existing Hive tables in S3 to Apache Iceberg format using Spark procedu
 - **Parent Run Tracking** - Links back to original MapR-to-S3 migration
 - **Comprehensive Validation** - Row counts, partition counts, schema comparison
 - **HTML Reporting** - Detailed migration and validation reports
+
+---
+
+### Duration Tracking
+
+Tasks decorated with `@track_duration` automatically capture execution time:
+
+- **Mechanism**: Decorator wraps task function and measures start/end time
+- **Storage**: Adds `_task_duration` field to task result dictionary
+- **XCom**: Duration flows through task dependencies via XCom
+- **Tracking**: Saved to tracking tables in `*_duration_seconds` columns
+
+**Tracked tasks:**
+
+- `migrate_tables_to_iceberg` → `migration_duration_seconds`
+- `validate_iceberg_tables` → `validation_duration_seconds`
 
 ---
 
@@ -818,10 +917,11 @@ finalize_iceberg_run
 **Purpose:** Generate comprehensive HTML migration report
 
 - Queries tracking tables
-- Generates HTML report with sections:
-  - Table migration details
-  - Validation results
-  - Performance metric
+- **Generates HTML report with comprehensive sections:**
+  1. **Migration Summary** - Total/successful/failed tables, row counts, incremental runs
+  2. **Table Migration Details** - Per-table status, durations for migration/validation
+  3. **Validation Results (Hive vs Iceberg)** - Row count comparison, partition comparison, schema comparison
+  4. **Performance Metrics** - Rows migrated, Migration speed (MB/s), rows/second, end-to-end duration
 
 ---
 
@@ -923,6 +1023,23 @@ generate_iceberg_html_report (Updated report)
     ↓
 finalize_iceberg_run (Update run stats)
 ```
+
+---
+
+## Tracking Tables
+
+### MapR-to-S3 Migration Tracking
+
+1. **migration_tracking.migration_runs**: Run-level metadata for MapR-to-S3 migrations.
+2. **migration_tracking.migration_table_status**: Table-level tracking for MapR-to-S3 migrations.
+3. **migration_tracking.validation_results**: Aggregated validation summary per run.
+
+---
+
+### Iceberg Migration Tracking
+
+1. **migration_tracking.iceberg_migration_runs**: Run-level metadata for Iceberg migrations.
+2. **migration_tracking.iceberg_migration_table_status**: Table-level tracking for Iceberg migrations.
 
 ---
 

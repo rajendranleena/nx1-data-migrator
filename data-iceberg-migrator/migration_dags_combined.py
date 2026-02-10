@@ -119,14 +119,9 @@ def get_config() -> dict:
         'tracking_location': Variable.get('migration_tracking_location', default_var='s3a://data-lake/migration_tracking'),
         'report_output_location': Variable.get('migration_report_location', default_var='s3a://data-lake/migration_reports'),
 
-        # Ticket script configuration
-        'ticket_script_path': Variable.get('ticket_script_path', default_var='~/get_ticket.sh'),
-        'mapr_ticketfile_location': Variable.get('mapr_ticketfile_location', default_var='/tmp/maprticket_${USER}'),
-
         # Cluster Authentication (MapR or Kerberos)
         'auth_method': Variable.get('auth_method', default_var='mapr'),  # 'mapr' or 'kinit'
-        'mapr_user': Variable.get('mapr_user', default_var=''),
-        'mapr_password': Variable.get('mapr_password', default_var=''),
+        'mapr_ticketfile_location': Variable.get('mapr_ticketfile_location', default_var='/tmp/maprticket_${USER}'),
         'kinit_principal': Variable.get('kinit_principal', default_var=''),
         'kinit_keytab': Variable.get('kinit_keytab', default_var=''),
         'kinit_password': Variable.get('kinit_password', default_var=''),
@@ -360,54 +355,28 @@ else
     echo "WARNING: Profile not found at ~/.profile"
 fi
 """)
-        
-    ticket_script = config['ticket_script_path']
-    auth_script_parts.append(f"""
-echo "=== Checking for Ticket Script ==="
-if [ -f "{ticket_script}" ]; then
-    echo "Ticket script found at {ticket_script}"
-    TICKET_EXISTS=true
-else
-    echo "Ticket script not found at {ticket_script}"
-    TICKET_EXISTS=false
-fi
-""")
     
     auth_method = config.get('auth_method', 'mapr')
-    mapr_user = config.get('mapr_user', '')
-    mapr_password = config.get('mapr_password', '')
     mapr_ticketfile = config.get('mapr_ticketfile_location', '') 
     kinit_principal = config.get('kinit_principal', '')
     kinit_keytab = config.get('kinit_keytab', '')
     kinit_password = config.get('kinit_password', '')
 
     auth_script_parts.append(f"""
-if [ "$TICKET_EXISTS" = "false" ]; then
-    echo "=== Creating Ticket Script at {ticket_script} ==="
-    cat > "{ticket_script}" << 'EOF_TICKET'
-#!/bin/bash
-# Auto-generated authentication script
-set -e
-
 echo "=== Cluster Authentication ({auth_method}) ==="
 
 if [ "{auth_method}" = "mapr" ]; then
-    MAPR_TICKETFILE_LOCATION="{mapr_ticketfile}" 
-    export MAPR_TICKETFILE_LOCATION 
+    MAPR_TICKETFILE_LOCATION="{mapr_ticketfile}"
+    export MAPR_TICKETFILE_LOCATION
 
-    if maprlogin print 2>/dev/null | grep -q "{mapr_user}"; then
+    if maprlogin print 2>/dev/null | grep -q "mapr_user"; then
         echo "Using existing valid MapR ticket"
     else
-        echo "Generating new MapR ticket..."
-        if [ -n "{mapr_user}" ] && [ -n "{mapr_password}" ]; then
-            echo "{mapr_password}" | maprlogin password -user {mapr_user}
-        elif klist -s 2>/dev/null; then
-            maprlogin kerberos
-        else
-            echo "Attempting maprlogin with current user..."
-            maprlogin password || maprlogin kerberos || {{ echo "ERROR: MapR authentication failed"; exit 1; }}
-        fi
+        echo "ERROR: No valid MapR ticket found"
+        echo "Please ensure a valid MapR ticket exists before running this DAG"
+        exit 1
     fi
+    
 elif [ "{auth_method}" = "kinit" ]; then
     if [ -n "{kinit_keytab}" ] && [ -n "{kinit_principal}" ]; then
         kinit -kt "{kinit_keytab}" "{kinit_principal}"
@@ -417,53 +386,17 @@ elif [ "{auth_method}" = "kinit" ]; then
         echo "ERROR: kinit requires principal and keytab or password"
         exit 1
     fi
+    
 elif [ "{auth_method}" = "none" ]; then
     echo "No authentication required (auth_method=none)"
+    
 else
     echo "ERROR: Unknown auth_method: {auth_method}"
     exit 1
 fi
 
 echo "Authentication successful"
-EOF_TICKET
-
-    chmod +x "{ticket_script}"
-    echo "Ticket script created and made executable"
-fi
 """)
-
-    auth_script_parts.append(f"""
-echo "=== Executing Ticket Script ==="
-if [ -f "{ticket_script}" ]; then
-    if [ -x "{ticket_script}" ]; then
-        "{ticket_script}"
-        TICKET_EXIT=$?
-        if [ $TICKET_EXIT -ne 0 ]; then
-            echo "ERROR: Ticket script failed with exit code $TICKET_EXIT"
-            exit 1
-        fi
-        echo "Ticket script executed successfully"
-        export MAPR_TICKETFILE_LOCATION="{mapr_ticketfile}"
-    else
-        echo "ERROR: Ticket script exists but is not executable: {ticket_script}"
-        echo "Run: chmod +x {ticket_script}"
-        exit 1
-    fi
-else
-    echo "ERROR: Ticket script not found at {ticket_script}"
-    exit 1
-fi
-""")
-    
-    auth_script_parts.append(f"""
-echo "=== Verifying Ticket ==="
-if maprlogin print 2>/dev/null | grep -q "Valid"; then
-    echo "Ticket verification successful"
-else
-    echo "ERROR: Ticket verification failed"
-    exit 1
-fi
-""") 
         
     auth_script_parts.append(f"""
 echo "=== Creating temp directory ==="
@@ -519,11 +452,11 @@ dest_db = "{dest_db}"
 dest_bucket = "{dest_bucket}"
 
 if pattern == '*':
-    tables_df = spark.sql("SHOW TABLES IN {0}".format(src_db))
+    tables_df = spark.sql("SHOW TABLES IN {{0}}".format(src_db))
 else:
     like_pattern = pattern.replace('*', '%')
     tables_df = spark.sql(
-        "SHOW TABLES IN {0} LIKE '{1}'".format(src_db, like_pattern)
+        "SHOW TABLES IN {{0}} LIKE '{{1}}'".format(src_db, like_pattern)
     )
 
 table_list = [row.tableName for row in tables_df.collect()]
@@ -533,7 +466,7 @@ metadata = []
 for tbl in table_list:
     try:
         desc_df = spark.sql(
-            "DESCRIBE FORMATTED {0}.{1}".format(src_db, tbl)
+            "DESCRIBE FORMATTED {{0}}.{{1}}".format(src_db, tbl)
         )
         desc_rows = desc_df.collect()
         
@@ -586,7 +519,7 @@ for tbl in table_list:
         row_count = 0
         try:
             row_count = spark.sql(
-                "SELECT COUNT(*) as c FROM {0}.{1}".format(src_db, tbl)
+                "SELECT COUNT(*) as c FROM {{0}}.{{1}}".format(src_db, tbl)
             ).collect()[0].c
         except:
             pass
@@ -596,7 +529,7 @@ for tbl in table_list:
         is_partitioned = False
         try:
             parts_df = spark.sql(
-                "SHOW PARTITIONS {0}.{1}".format(src_db, tbl)
+                "SHOW PARTITIONS {{0}}.{{1}}".format(src_db, tbl)
             )
             partitions = [row.partition for row in parts_df.collect()]
             is_partitioned = len(partitions) > 0
@@ -610,7 +543,7 @@ for tbl in table_list:
             pass
         
         schema_df = spark.sql(
-            "DESCRIBE {0}.{1}".format(src_db, tbl)
+            "DESCRIBE {{0}}.{{1}}".format(src_db, tbl)
         )
         schema = []
         for row in schema_df.collect():
@@ -620,11 +553,11 @@ for tbl in table_list:
             if col_name.startswith("#") or col_name == "" or col_name == "col_name":
                 break
             
-            schema.append({"name": col_name, "type": data_type})
+            schema.append({{"name": col_name, "type": data_type}})
         
-        s3_location = "{0}/{1}/{2}".format(dest_bucket, dest_db, tbl)
+        s3_location = "{{0}}/{{1}}/{{2}}".format(dest_bucket, dest_db, tbl)
         
-        metadata.append({
+        metadata.append({{
             "source_database": src_db,
             "source_table": tbl,
             "dest_database": dest_db,
@@ -641,16 +574,16 @@ for tbl in table_list:
             "table_type": table_type,
             "source_total_size_bytes": source_total_size,
             "source_file_count": source_file_count
-        })
+        }})
         
     except Exception as e:
-        metadata.append({
+        metadata.append({{
             "source_database": src_db,
             "source_table": tbl,
             "dest_database": dest_db,
             "dest_bucket": dest_bucket,
             "source_location": "",
-            "s3_location": "{0}/{1}/{2}".format(dest_bucket, dest_db, tbl),
+            "s3_location": dest_bucket + "/" + dest_db + "/" + tbl,
             "file_format": "PARQUET",
             "schema": [],
             "partitions": [],
@@ -662,7 +595,7 @@ for tbl in table_list:
             "source_total_size_bytes": 0,
             "source_file_count": 0,
             "error": str(e)[:500]
-        })
+        }})
 
 print "===JSON_START==="
 sys.stdout.flush()
