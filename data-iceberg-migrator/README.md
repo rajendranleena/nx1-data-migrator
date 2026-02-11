@@ -42,15 +42,17 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 
 ### Optional Variables
 
-| Variable                     | Default          | Description                              |
-| ---------------------------- | ---------------- | ---------------------------------------- |
-| `cluster_edge_temp_path`     | `/tmp/migration` | Temporary directory on edge node         |
-| `s3_endpoint`                | _(empty)_        | Custom S3 endpoint URL                   |
-| `s3_access_key`              | _(empty)_        | S3 access key (if not using IAM)         |
-| `s3_secret_key`              | _(empty)_        | S3 secret key (if not using IAM)         |
-| `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                 |
-| `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)        |
-| `s3_listing_tool`            | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3` |
+| Variable                     | Default          | Description                                  |
+| ---------------------------- | ---------------- | -------------------------------------------- |
+| `cluster_edge_temp_path`     | `/tmp/migration` | Temporary directory on edge node             |
+| `s3_endpoint`                | _(empty)_        | Custom S3 endpoint URL                       |
+| `s3_access_key`              | _(empty)_        | S3 access key (if not using IAM)             |
+| `s3_secret_key`              | _(empty)_        | S3 secret key (if not using IAM)             |
+| `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                     |
+| `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)            |
+| `s3_listing_tool`            | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`     |
+| `migration_smtp_conn_id`     | `smtp_default`   | Airflow SMTP connection ID for email reports |
+| `migration_email_recipients` | _(empty)_        | Comma-separated email addresses for reports  |
 
 ---
 
@@ -255,6 +257,8 @@ cluster_login_setup (SSH: cluster authentication)
 └───────────────────────────────────────────────┘
 ↓
 generate_html_report
+↓
+send_migration_report_email (PySpark: Email report)
 ↓
 finalize_run
 ↓
@@ -472,9 +476,9 @@ cleanup_edge (SSH: Cleanup temp files)
 #### Step 12 - `generate_html_report`
 
 **Type:** PySpark
-**Purpose:** Generate comprehensive HTML migration report
+**Purpose:** Generate comprehensive HTML migration report and prepare for email delivery
 
-- Queries tracking tables
+- Queries tracking tables for run info and table status
 - **Generates HTML report with comprehensive sections:**
   1. **Migration Summary** - Total/successful/failed tables, data volume, file counts, incremental runs
   2. **Validation Summary** - Tables validated, passed/failed counts, mismatch breakdowns
@@ -482,10 +486,34 @@ cleanup_edge (SSH: Cleanup temp files)
   4. **Metadata Validation Results** - Row count comparison, partition comparison, schema comparison
   5. **Data Validation Results** - File size comparison (MapR vs S3), file count comparison
   6. **Performance Metrics** - Data volume, DistCp speed (MB/s), rows/second, end-to-end duration
+- Writes HTML report to S3 at `{report_location}/{run_id}_report.html`
+- **Returns both:**
+  - `report_path` - S3 location for audit/archival
+  - `html_content` - Full HTML string for direct email delivery
 
 ---
 
-#### Step 13 - `finalize_run`
+#### Step 13 - `send_migration_report_email`
+
+**Type:** PySpark  
+**Purpose:** Send HTML migration report via email using SMTP
+
+- Receives HTML content directly from `generate_html_report` task
+- Extracts email configuration:
+  - SMTP connection ID from Airflow variable
+  - Recipients list (comma-separated) from Airflow variable
+- Sends email with:
+  - Subject: `Migration Report - {run_id}`
+  - Body: Full HTML report (no S3 read required)
+- **Skips email if:**
+  - No recipients configured (`migration_email_recipients` variable empty)
+  - Returns `{'sent': False, 'reason': 'no_recipients'}`
+- Logs delivery status and recipient list
+- Returns result with `sent` status, `recipients`, and `report_path`
+
+---
+
+#### Step 14 - `finalize_run`
 
 **Type:** PySpark  
 **Purpose:** Aggregate statistics and mark migration run as complete
@@ -502,7 +530,7 @@ cleanup_edge (SSH: Cleanup temp files)
 
 ---
 
-#### Step 14 - `cleanup_edge`
+#### Step 15 - `cleanup_edge`
 
 **Type:** SSH  
 **Purpose:** Clean up temporary files on MapR edge node
@@ -621,6 +649,8 @@ cluster_login_setup (Source cluster authentication)
 └─────────────────────────────────────────────┘
     ↓
 generate_html_report (Updated report)
+    ↓
+send_migration_report_email (Email retry report)
     ↓
 finalize_run (Update run stats)
     ↓
@@ -756,6 +786,8 @@ update_parent_run_id
 └───────────────────────────────────────────────┘
     ↓
 generate_iceberg_html_report
+    ↓
+send_iceberg_report_email (PySpark: Email report)
     ↓
 finalize_iceberg_run
 ```
@@ -922,10 +954,34 @@ finalize_iceberg_run
   2. **Table Migration Details** - Per-table status, durations for migration/validation
   3. **Validation Results (Hive vs Iceberg)** - Row count comparison, partition comparison, schema comparison
   4. **Performance Metrics** - Rows migrated, Migration speed (MB/s), rows/second, end-to-end duration
+- Writes HTML report to S3 at `{report_location}/{run_id}_iceberg_report.html`
+- **Returns both:**
+  - `report_path` - S3 location for audit/archival
+  - `html_content` - Full HTML string for direct email delivery
 
 ---
 
-#### Step 11 - `finalize_iceberg_run`
+#### Step 11 - `send_iceberg_report_email`
+
+**Type:** PySpark  
+**Purpose:** Send HTML Iceberg migration report via email using SMTP
+
+- Receives HTML content directly from `generate_iceberg_html_report` task
+- Extracts email configuration:
+  - SMTP connection ID from Airflow variable
+  - Recipients list (comma-separated) from Airflow variable
+- Sends email with:
+  - Subject: `Iceberg Migration Report - {run_id}`
+  - Body: Full HTML report (no S3 read required)
+- **Skips email if:**
+  - No recipients configured (`migration_email_recipients` variable empty)
+  - Returns `{'sent': False, 'reason': 'no_recipients'}`
+- Logs delivery status and recipient list
+- Returns result with `sent` status, `recipients`, and `report_path`
+
+---
+
+#### Step 12 - `finalize_iceberg_run`
 
 **Type:** PySpark  
 **Purpose:** Aggregate statistics and mark migration run as complete
@@ -1020,6 +1076,8 @@ lookup_parent_migration_run (Link to MapR-S3 migration)
 └─────────────────────────────────────────────┘
     ↓
 generate_iceberg_html_report (Updated report)
+    ↓
+send_iceberg_report_email (Email retry report)
     ↓
 finalize_iceberg_run (Update run stats)
 ```
