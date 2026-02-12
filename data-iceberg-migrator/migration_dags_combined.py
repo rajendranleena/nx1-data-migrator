@@ -294,7 +294,7 @@ def validate_prerequisites(run_id: str) -> dict:
         )
 
 @task.pyspark(conn_id='spark_default')
-def init_tracking_tables(spark, sc) -> dict:
+def init_tracking_tables(spark) -> dict:
     """Create Iceberg tracking tables if they don't exist."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -412,7 +412,7 @@ def init_tracking_tables(spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def create_migration_run(excel_file_path: str, dag_run_id: str, spark, sc) -> str:
+def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
     """Create migration run record in Iceberg tracking table."""
     from datetime import datetime
     import uuid
@@ -443,7 +443,7 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark, sc) -> st
 
 
 @task.pyspark(conn_id='spark_default')
-def parse_excel(excel_file_path: str, run_id: str, spark, sc) -> list:
+def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     """Read Excel config from S3 using pandas.read_excel."""
     import pandas as ps
     from io import BytesIO
@@ -858,7 +858,7 @@ pyspark < {script_path} 2>&1
 
 
 @task.pyspark(conn_id='spark_default')
-def record_discovered_tables(discovery: dict, spark, sc) -> dict:
+def record_discovered_tables(discovery: dict, spark) -> dict:
     """Record discovered tables in Iceberg tracking table."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -1129,7 +1129,7 @@ exit 0
 
 
 @task.pyspark(conn_id='spark_default')
-def update_distcp_status(distcp_result: dict, spark, sc, retry_run_id: str = None) -> dict:
+def update_distcp_status(distcp_result: dict, spark, retry_run_id: str = None) -> dict:
     """Update Iceberg tracking with DistCp results."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -1211,7 +1211,7 @@ def update_distcp_status(distcp_result: dict, spark, sc, retry_run_id: str = Non
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
-def create_hive_tables(distcp_result: dict, spark, sc) -> dict:
+def create_hive_tables(distcp_result: dict, spark) -> dict:
     """Create external Hive tables via Spark. Handles incremental (repairs partitions)."""
     dest_db = distcp_result['dest_database']
     tables = distcp_result['tables']
@@ -1332,7 +1332,7 @@ def create_hive_tables(distcp_result: dict, spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def update_table_create_status(table_result: dict, spark, sc, retry_run_id: str = None) -> dict:
+def update_table_create_status(table_result: dict, spark, retry_run_id: str = None) -> dict:
     """Update Iceberg tracking with table creation results."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -1384,7 +1384,7 @@ def update_table_create_status(table_result: dict, spark, sc, retry_run_id: str 
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
-def validate_destination_tables(source_validation: dict, spark, sc) -> dict:
+def validate_destination_tables(source_validation: dict, spark) -> dict:
     """Validate destination Hive tables: row counts, partition counts, schema comparison."""
     
     config = get_config()
@@ -1514,7 +1514,7 @@ def validate_destination_tables(source_validation: dict, spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def update_validation_status(validation_result: dict, spark, sc, retry_run_id: str = None) -> dict:
+def update_validation_status(validation_result: dict, spark, retry_run_id: str = None) -> dict:
     """Update Iceberg tracking with validation results."""
     
     config = get_config()
@@ -1655,7 +1655,7 @@ def update_validation_status(validation_result: dict, spark, sc, retry_run_id: s
 
 
 @task.pyspark(conn_id='spark_default')
-def generate_html_report(run_id: str, spark, sc) -> str:
+def generate_html_report(run_id: str, spark) -> str:
     """Generate comprehensive HTML migration report."""
     from datetime import datetime
     
@@ -2189,7 +2189,7 @@ def generate_html_report(run_id: str, spark, sc) -> str:
 
 
 @task.pyspark(conn_id='spark_default')
-def finalize_run(run_id: str, spark, sc) -> dict:
+def finalize_run(run_id: str, spark) -> dict:
     """Finalize migration run - update stats in Iceberg tracking."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -2245,7 +2245,7 @@ def cleanup_edge(cluster_setup: dict, run_id: str) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def send_migration_report_email(report_result: dict, run_id: str, spark, sc) -> dict:
+def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict:
     """Send HTML migration report via email using SMTP."""
 
     config = get_config()
@@ -2281,7 +2281,7 @@ def send_migration_report_email(report_result: dict, run_id: str, spark, sc) -> 
 # =============================================================================
 
 @task.pyspark(conn_id='spark_default')
-def create_retry_migration_run(parent_run_id: str, dag_run_id: str, spark, sc) -> str:
+def create_retry_migration_run(parent_run_id: str, dag_run_id: str, spark) -> str:
     """Create retry migration run record with parent linkage."""
     from datetime import datetime
     import uuid
@@ -2328,7 +2328,7 @@ def create_retry_migration_run(parent_run_id: str, dag_run_id: str, spark, sc) -
     return run_id
 
 @task.pyspark(conn_id='spark_default')
-def get_failed_tables(parent_run_id: str, spark, sc) -> list:
+def get_failed_tables(parent_run_id: str, spark) -> list:
     """ Query tracking table to identify tables that need retry. """
     config = get_config()
     tracking_db = config['tracking_database']
@@ -2402,7 +2402,7 @@ def get_failed_tables(parent_run_id: str, spark, sc) -> list:
     return failed_tables
 
 @task.pyspark(conn_id='spark_default')
-def group_failed_tables_by_database(failed_tables: list, spark, sc) -> list:
+def group_failed_tables_by_database(failed_tables: list, spark) -> list:
     """ Group failed tables by database for efficient batch processing. """
     from collections import defaultdict
 
@@ -2427,7 +2427,7 @@ def group_failed_tables_by_database(failed_tables: list, spark, sc) -> list:
 # DAG 3: ICEBERG MIGRATION TASKS
 # =============================================================================
 @task.pyspark(conn_id='spark_default')
-def init_iceberg_tracking_tables(spark, sc) -> dict:
+def init_iceberg_tracking_tables(spark) -> dict:
     """Create Iceberg tracking tables for Iceberg migration if they don't exist."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -2495,7 +2495,7 @@ def init_iceberg_tracking_tables(spark, sc) -> dict:
     return {'status': 'initialized', 'database': tracking_db}
 
 @task.pyspark(conn_id='spark_default')
-def create_iceberg_migration_run(excel_file_path: str, dag_run_id: str, spark, sc) -> str:
+def create_iceberg_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
     """Create migration run record."""
     from datetime import datetime
     import uuid
@@ -2528,7 +2528,7 @@ def create_iceberg_migration_run(excel_file_path: str, dag_run_id: str, spark, s
 
 
 @task.pyspark(conn_id='spark_default')
-def parse_iceberg_excel(excel_file_path: str, run_id: str, spark, sc) -> list:
+def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
     """Read Excel config for Iceberg migration from S3."""
     import pandas as ps
     from io import BytesIO
@@ -2571,7 +2571,7 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark, sc) -> list:
 
 
 @task.pyspark(conn_id='spark_default')
-def lookup_parent_migration_run(excel_configs: list, spark, sc) -> dict:
+def lookup_parent_migration_run(excel_configs: list, spark) -> dict:
     """Query migration_table_status to find the parent migration run_id."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -2628,7 +2628,7 @@ def lookup_parent_migration_run(excel_configs: list, spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def update_parent_run_id(parent_lookup: dict, run_id: str, spark, sc) -> dict:
+def update_parent_run_id(parent_lookup: dict, run_id: str, spark) -> dict:
     """Update the iceberg_migration_runs table with parent_migration_run_id after lookup."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -2650,7 +2650,7 @@ def update_parent_run_id(parent_lookup: dict, run_id: str, spark, sc) -> dict:
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
-def discover_hive_tables(db_config: dict, spark, sc) -> dict:
+def discover_hive_tables(db_config: dict, spark) -> dict:
     """Discover Hive tables matching the pattern in the source database."""
     src_db = db_config['source_database']
     tbl_pattern = db_config['table_pattern']
@@ -2699,7 +2699,7 @@ def discover_hive_tables(db_config: dict, spark, sc) -> dict:
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
-def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: str, spark, sc, retry_run_id: str = None) -> dict:
+def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: str, spark, retry_run_id: str = None) -> dict:
     """Migrate discovered Hive tables to Iceberg format."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -2893,7 +2893,7 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
 
 
 @task.pyspark(conn_id='spark_default')
-def update_migration_durations(migration_result: dict, spark, sc) -> dict:
+def update_migration_durations(migration_result: dict, spark) -> dict:
     """Update tracking table with migration durations from XCom."""
     
     config = get_config()
@@ -2927,7 +2927,7 @@ def update_migration_durations(migration_result: dict, spark, sc) -> dict:
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
-def validate_iceberg_tables(migration_result: dict, spark, sc) -> dict:
+def validate_iceberg_tables(migration_result: dict, spark) -> dict:
     """Validate Iceberg tables: row counts, partition counts, schema comparison between source Hive and destination Iceberg."""
     
     config = get_config()
@@ -3034,7 +3034,7 @@ def validate_iceberg_tables(migration_result: dict, spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def update_iceberg_validation_status(validation_result: dict, spark, sc, retry_run_id: str = None) -> dict:
+def update_iceberg_validation_status(validation_result: dict, spark, retry_run_id: str = None) -> dict:
     """Update Iceberg tracking with validation results."""
     
     config = get_config()
@@ -3107,7 +3107,7 @@ def update_iceberg_validation_status(validation_result: dict, spark, sc, retry_r
 
 
 @task.pyspark(conn_id='spark_default')
-def generate_iceberg_html_report(run_id: str, spark, sc) -> str:
+def generate_iceberg_html_report(run_id: str, spark) -> str:
     """Generate comprehensive HTML Iceberg migration report."""
     from datetime import datetime
     
@@ -3466,7 +3466,7 @@ def generate_iceberg_html_report(run_id: str, spark, sc) -> str:
 
 
 @task.pyspark(conn_id='spark_default')
-def finalize_iceberg_run(run_id: str, spark, sc) -> dict:
+def finalize_iceberg_run(run_id: str, spark) -> dict:
     """Finalize Iceberg migration run - aggregate statistics."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -3517,7 +3517,7 @@ def finalize_iceberg_run(run_id: str, spark, sc) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def send_iceberg_report_email(report_result: dict, run_id: str, spark, sc) -> dict:
+def send_iceberg_report_email(report_result: dict, run_id: str, spark) -> dict:
     """Send HTML Iceberg migration report via email using SMTP."""
     from airflow.utils.email import send_email
 
@@ -3553,7 +3553,7 @@ def send_iceberg_report_email(report_result: dict, run_id: str, spark, sc) -> di
 # =============================================================================
 
 @task.pyspark(conn_id='spark_default')
-def create_retry_iceberg_migration_run(parent_run_id: str, dag_run_id: str, spark, sc) -> str:
+def create_retry_iceberg_migration_run(parent_run_id: str, dag_run_id: str, spark) -> str:
     """Create retry Iceberg migration run record with parent linkage."""
     from datetime import datetime
     import uuid
@@ -3602,7 +3602,7 @@ def create_retry_iceberg_migration_run(parent_run_id: str, dag_run_id: str, spar
     return run_id
 
 @task.pyspark(conn_id='spark_default')
-def get_failed_iceberg_migrations(parent_run_id: str, spark, sc) -> list:
+def get_failed_iceberg_migrations(parent_run_id: str, spark) -> list:
     """ Query Iceberg tracking table to identify failed Iceberg migrations. """
     config = get_config()
     tracking_db = config['tracking_database']
@@ -3639,7 +3639,7 @@ def get_failed_iceberg_migrations(parent_run_id: str, spark, sc) -> list:
 
 
 @task.pyspark(conn_id='spark_default')
-def group_iceberg_failures(failed_tables: list, spark, sc) -> list:
+def group_iceberg_failures(failed_tables: list, spark) -> list:
     """ Group failed Iceberg migrations by database and migration type. """
     from collections import defaultdict
 
@@ -3687,7 +3687,7 @@ with DAG(
     dag_id='mapr_to_s3_migration',
     default_args=DEFAULT_ARGS,
     description='Migrate Hive tables from MapR-FS to S3',
-    schedule_interval=None,
+    schedule=None,
     start_date=datetime(2025, 1, 1),
     catchup=False,
     max_active_runs=1,
@@ -3763,7 +3763,7 @@ with DAG(
     dag_id='mapr_to_s3_migration_retry', 
     default_args=DEFAULT_ARGS,
     description='Retry failed tables from previous MapR to S3 migration run',
-    schedule_interval=None, 
+    schedule=None, 
     start_date=datetime(2025, 1, 1),
     catchup=False,
     max_active_runs=1,
@@ -3837,7 +3837,7 @@ with DAG(
     dag_id='iceberg_migration',
     default_args=DEFAULT_ARGS,
     description='Migrate existing Hive tables in S3 to Iceberg format',
-    schedule_interval=None,
+    schedule=None,
     start_date=datetime(2025, 1, 1),
     catchup=False,
     max_active_runs=1,
@@ -3912,7 +3912,7 @@ with DAG(
     dag_id='iceberg_migration_retry', 
     default_args=DEFAULT_ARGS,
     description='Retry failed Iceberg migrations from previous run',
-    schedule_interval=None,
+    schedule=None,
     start_date=datetime(2025, 1, 1),
     catchup=False,
     max_active_runs=1,
