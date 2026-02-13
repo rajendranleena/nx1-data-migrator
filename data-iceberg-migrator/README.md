@@ -214,12 +214,12 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 
 **Required Columns:**
 
-| Column          | Required | Description                               | Example                 |
-| --------------- | -------- | ----------------------------------------- | ----------------------- |
-| `database`      | **Yes**  | Source database name                      | `sales_data`            |
-| `table`         | No       | Table pattern (supports `*` wildcards)    | `transactions_*` or `*` |
-| `dest database` | No       | Destination database (defaults to source) | `sales_data_s3`         |
-| `bucket`        | No       | S3 bucket (defaults to variable)          | `s3a://data-lake`       |
+| Column          | Required | Description                                                                    | Example                 |
+| --------------- | -------- | ------------------------------------------------------------------------------ | ----------------------- |
+| `database`      | **Yes**  | Source database name                                                           | `sales_data`            |
+| `table`         | No       | Table pattern (supports `*` wildcards, doesn't support comma-seperated values) | `transactions_*` or `*` |
+| `dest database` | No       | Destination database (defaults to source)                                      | `sales_data_s3`         |
+| `bucket`        | No       | S3 bucket (defaults to variable)                                               | `s3a://data-lake`       |
 
 ---
 
