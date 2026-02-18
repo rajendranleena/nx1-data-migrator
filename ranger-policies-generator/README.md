@@ -13,19 +13,20 @@ The Excel file should have the following columns:
 
 | Column | Description | Required | Example |
 |--------|-------------|----------|---------|
-| role | Role name (becomes Ranger group) | Yes | `data_analysts` |
+| role | Role name (becomes Ranger group); optional for users-only rows (synthetic role is created) | Conditional | `data_analysts` |
 | database | Database/schema names (comma-separated, or `*` for wildcard) | Yes* | `sales,marketing` or `*` |
 | tables | Table names (* for all, comma-separated) | No | `*` or `customers,orders` |
 | columns | Column names (* for all, comma-separated) | No | `*` or `name,email,phone` |
 | url | URL for storage-based policies | Yes* | `s3a://bucket/path/*` |
 | permissions | Access level (read, write, or both) | Yes | `read` or `read,write` |
 | groups | Keycloak groups to assign the role | No | `engineering,data-team` |
-| users | Users to assign the role (optional, derived from roles) | No | `alice,bob` |
+| users | Users to assign the role (users must already exist in Keycloak) | No | `alice,bob` |
 | rowfilter | Row-level filter expression for table policies only (optional, must not contain `;` or newlines) | No | `region = 'US'` |
 
-*Note: 
-For database, you may use `*` as a wildcard to apply the policy to all databases. 
-Rowfilters are only supported for table policies; URL-based rows with a rowfilter are skipped.
+*Note:
+- Exactly one of `database` or `url` must be provided per row (not both, not neither).
+- For database, you may use `*` as a wildcard to apply the policy to all databases.
+- Rowfilters are only supported for table policies; URL-based rows with a rowfilter are skipped.
 *
 
 # Policy Name Generation
@@ -67,44 +68,27 @@ The Excel file with sample values:
 - If a row specifies only users (no groups, no role), a role named `role_<username>` is created for each user and mapped to that user.
 - If both users and groups are present with a role, both are mapped to the role.
 - Roles and mappings are created in Keycloak, and groups are created in Ranger as needed.
+- Ranger policy grants are role/group-based only (no direct Ranger user grants).
+- Ranger policy assignment for a role proceeds when at least one Keycloak principal mapping (group or user) is successful/already exists.
+- A role is blocked for Ranger policy assignment only when all attempted Keycloak principal mappings fail for that role (or role creation fails).
 
-# SQL Injection Safeguards
+# Validation and SQL Safeguards
 
 - All policy names and rowfilters are sanitized before being used in SQL.
 - Rowfilters containing `;` or newlines are rejected and logged.
+- Invalid Excel rows are skipped, persisted in `tracking_ranger_policy_skipped_rows`, and shown in the HTML report.
 
-## Generated Policy Names
-
-Based on the Excel data, policy names are generated as follows:
-
-0. **For all-database access (database=`*`):**
-    - Policy name: `iceberg`
-    - Example: `iceberg`
-
-1. **For database-level access (tables=*, columns=*):**
-   - Policy name: `iceberg.{database}`
-   - Example: `iceberg.sales`
-
-2. **For table-level access (columns=*):**
-   - Policy name: `iceberg.{database}.{table}`
-   - Example: `iceberg.sales.customers`
-
-3. **For column-level access:**
-   - Policy name: `iceberg.{database}.{table}.{column}`
-   - Example: `iceberg.finance.transactions.amount`
-
-4. **For URL-based policies:**
-   - Policy name: `{url}`
-   - Example: `s3a://ml-bucket/models/*`
-
-*Note: Policy names are prefixed with `iceberg` to match the catalog used for table-type policies in Ranger. The `iceberg` catalog supports both Iceberg and Hive tables.
+*Note: Policy names are prefixed with `iceberg` to match the catalog used for table-type policies in Ranger.*
 
 ## Permission Mappings
 
 | Excel Permission | Ranger Access Types |
 |-----------------|---------------------|
 | `read` | select, use, execute, show, read_sysinfo |
-| `write` | select, insert, update, delete, create, drop, alter, use, show, grant, revoke, execute, read, write, read_sysinfo, write_sysinfo |
+| `write` | select, insert, update, delete, create, drop, alter, index, lock, use, show, grant, revoke, execute, read, write, read_sysinfo, write_sysinfo |
+| `all` | select, insert, update, delete, create, drop, alter, index, lock, use, show, grant, revoke, impersonate, execute, read, write, read_sysinfo, write_sysinfo |
+
+Explicit permissions such as `select,update,create,drop,index,alter,all,read,lock,write` are also accepted and passed through.
 
 ## Airflow Variables Required
 
@@ -172,28 +156,32 @@ place the utils under utils/migrations directory in airflow/jupyter
 ## Task Flow
 
 ```
-parse_excel
+init_tracking_tables
     │
     ▼
-create_ranger_groups
+create_run_record
     │
-    ├────────────────────┐
-    ▼                    ▼
-create_ranger_policies   create_keycloak_roles_and_mappings
-    │                    │
-    └────────────────────┘
-              │
-              ▼
-        generate_summary
+    ▼
+parse_excel ──► write_skipped_rows ──► write_initial_policy_status
+    │
+    ├──► check_keycloak_health ──► create_keycloak_roles_and_mappings
+    │                                  │
+    └──────────────────────────────────┼──► create_ranger_groups_and_policies
+                                       │
+                                       └──► write_object_statuses
+
+create_ranger_groups_and_policies ──► build_final_policy_status ──► write_final_policy_status
+
+write_object_statuses + write_final_policy_status ──► finalize_run ──► generate_html_report
 ```
 
 ## Outputs
 
 The DAG produces a summary with:
 - Number of policies created/updated/failed
-- Number of Ranger groups created
+- Number of Ranger groups created/existing
 - Number of Keycloak roles created
-- Number of group-role mappings created
+- Number of mappings created/existing/failed
 - List of any failures with error messages
 
 

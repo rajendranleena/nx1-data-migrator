@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Set, Any
 import logging
 import string
 import secrets
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +34,12 @@ class Permissions:
     READ = ["select", "use", "execute", "show", "read_sysinfo"]
     WRITE = [
         "select", "insert", "update", "delete", "create", "drop",
-        "alter", "use", "show", "grant", "revoke", "execute",
+        "alter", "index", "lock", "use", "show", "grant", "revoke", "execute",
         "read", "write", "read_sysinfo", "write_sysinfo"
     ]
     ALL = [
         "select", "insert", "update", "delete", "create", "drop",
-        "alter", "use", "show", "grant", "revoke", "impersonate",
+        "alter", "index", "lock", "use", "show", "grant", "revoke", "impersonate",
         "execute", "read", "write", "read_sysinfo", "write_sysinfo"
     ]
     
@@ -341,15 +342,23 @@ class RangerPolicyManager:
                 'policy_name': policy_name,
                 'error': str(e)
             }
+
+    @staticmethod
+    def _is_valid_role_name(role_name: Any) -> bool:
+        """Return True when role_name is present and not a null-like token."""
+        if role_name is None:
+            return False
+        text = str(role_name).strip()
+        if not text:
+            return False
+        return text.lower() not in {'nan', 'null', 'none'}
     
     def _build_policy_items(self, role_permissions: List[Dict[str, Any]]) -> List[RangerPolicyItem]:
-        """Build policy items from role_permissions list, supporting users and rowfilter."""
+        """Build policy items from role_permissions list using group principals only."""
         policy_items = []
         for rp in role_permissions:
             role = rp.get('role')
             permissions = rp.get('permissions', ['read'])
-            groups = rp.get('groups', [])
-            users = rp.get('users', [])
 
             # Expand permissions to access types
             access_types = set()
@@ -358,12 +367,12 @@ class RangerPolicyManager:
 
             allow_item = RangerPolicyItem()
             # Add role as Ranger group (NOT Keycloak groups)
-            if role:
+            if self._is_valid_role_name(role):
                 allow_item.groups = [role]
             else:
                 allow_item.groups = []
-            # Add users directly
-            allow_item.users = users if users else []
+            # Strict RBAC: do not grant direct user access in Ranger policies
+            allow_item.users = []
 
             allow_item.conditions = []
             allow_item.accesses = [
@@ -373,13 +382,11 @@ class RangerPolicyManager:
         return policy_items
     
     def _build_url_policy_items(self, role_permissions: List[Dict[str, Any]]) -> List[RangerPolicyItem]:
-        """Build policy items for URL-based policies, supporting users and rowfilter."""
+        """Build policy items for URL-based policies using group principals only."""
         policy_items = []
         for rp in role_permissions:
             role = rp.get('role')
             permissions = rp.get('permissions', ['read'])
-            groups = rp.get('groups', [])
-            users = rp.get('users', [])
 
             # For URL policies, map to read/write
             access_types = set()
@@ -395,12 +402,12 @@ class RangerPolicyManager:
 
             allow_item = RangerPolicyItem()
             # Add role as Ranger group (NOT Keycloak groups)
-            if role:
+            if self._is_valid_role_name(role):
                 allow_item.groups = [role]
             else:
                 allow_item.groups = []
-            # Add users directly
-            allow_item.users = users if users else []
+            # Strict RBAC: do not grant direct user access in Ranger policies
+            allow_item.users = []
 
             allow_item.conditions = []
             allow_item.accesses = [
@@ -618,13 +625,11 @@ class RangerPolicyManager:
             logger.debug(f"Role permission {idx}: {rp.keys()} - rowfilter='{rowfilter}'")
             
             # Skip if no rowfilter or if it's 'nan'
-            if not rowfilter or rowfilter.lower() == 'nan':
+            if not rowfilter or rowfilter.lower() in {'nan', 'null', 'none'}:
                 logger.debug(f"Skipping role permission {idx} - no valid rowfilter")
                 continue
                 
             role = rp.get('role')
-            groups = rp.get('groups', [])
-            users = rp.get('users', [])
             permissions = rp.get('permissions', ['read'])  # Get permissions for row filter
             
             # For rowfilter, only 'select' and '_ALL' are valid access types
@@ -639,19 +644,14 @@ class RangerPolicyManager:
                     # If it's already a valid access type, check if it's allowable
                     access_types.add('select')
             
-            # Build groups list
-            group_list = []
-            if role:
-                group_list.append(role)
-            if groups:
-                group_list.extend(groups)
-            group_list = list(set(group_list))  # Deduplicate
+            # Strict RBAC: row filter applies only to Ranger role-group, not Keycloak groups
+            group_list = [role] if self._is_valid_role_name(role) else []
             
-            logger.info(f"Creating row filter item: role={role}, groups={group_list}, users={users}, filter='{rowfilter}', accesses={list(access_types)}")
+            logger.info(f"Creating row filter item: role={role}, groups={group_list}, filter='{rowfilter}', accesses={list(access_types)}")
             
             row_filter_items.append({
                 "groups": group_list,
-                "users": users if users else [],
+                "users": [],
                 "accesses": [{"type": a, "isAllowed": True} for a in access_types],  # Only 'select' for row filters
                 "rowFilterInfo": {
                     "filterExpr": rowfilter
@@ -697,12 +697,23 @@ class RangerPolicyManager:
         for policy_name, policy_config in policies_dict.items():
             policy_type = policy_config.get('type', 'table')
             role_permissions = policy_config.get('roles', [])
+            valid_role_permissions = [
+                rp for rp in role_permissions
+                if self._is_valid_role_name(rp.get('role'))
+            ]
+
+            if not valid_role_permissions:
+                results['failed'].append({
+                    'name': policy_name,
+                    'error': 'No valid role principal found for this policy (role is empty/null-like).'
+                })
+                continue
             
             if policy_type == 'url':
                 result = self.create_url_policy(
                     policy_name=policy_name,
                     url=policy_config.get('url', ''),
-                    role_permissions=role_permissions
+                    role_permissions=valid_role_permissions
                 )
             else:
                 result = self.create_table_policy(
@@ -711,7 +722,7 @@ class RangerPolicyManager:
                     schema=policy_config.get('schema', '*'),
                     table=policy_config.get('table', '*'),
                     column=policy_config.get('column', '*'),
-                    role_permissions=role_permissions
+                    role_permissions=valid_role_permissions
                 )
             
             status = result.get('status', 'failed')
@@ -757,6 +768,7 @@ class KeycloakRoleManager:
         realm_name: str,
         client_id: str,
         client_secret: str,
+        ca_cert_path: Optional[str] = None,
         max_retries: int = 3,
         connection_timeout: int = 10
     ):
@@ -768,6 +780,7 @@ class KeycloakRoleManager:
             realm_name: Realm name
             client_id: Admin client ID
             client_secret: Admin client secret
+            ca_cert_path: Optional path to CA bundle PEM file for TLS verification
             max_retries: Number of connection retry attempts (default: 3)
             connection_timeout: Connection timeout in seconds (default: 10)
         """
@@ -778,7 +791,31 @@ class KeycloakRoleManager:
         self.realm_name = realm_name
         self.max_retries = max_retries
         self.connection_timeout = connection_timeout
+        normalized_ca_path = None
+        if ca_cert_path:
+            normalized_ca_path = str(ca_cert_path).strip().strip("\"'")
+            if not normalized_ca_path:
+                normalized_ca_path = None
+
+        self.ca_cert_path = normalized_ca_path
         self.keycloak_admin = None
+        if self.ca_cert_path:
+            if not os.path.exists(self.ca_cert_path):
+                raise ConnectionError(
+                    f"Keycloak CA certificate path does not exist: {self.ca_cert_path}. "
+                    "Set Airflow Variable 'keycloak_cacert' to a valid readable PEM file path on the worker/scheduler."
+                )
+            if not os.path.isfile(self.ca_cert_path):
+                raise ConnectionError(
+                    f"Keycloak CA certificate path is not a file: {self.ca_cert_path}. "
+                    "Set Airflow Variable 'keycloak_cacert' to a PEM file path."
+                )
+            if not os.access(self.ca_cert_path, os.R_OK):
+                raise ConnectionError(
+                    f"Keycloak CA certificate file is not readable: {self.ca_cert_path}. "
+                    "Adjust file permissions for the Airflow runtime user."
+                )
+        verify_setting = self.ca_cert_path if self.ca_cert_path else True
         
         # Try to connect with exponential backoff retry logic
         last_error = None
@@ -789,7 +826,7 @@ class KeycloakRoleManager:
                     realm_name=realm_name,
                     client_id=client_id,
                     client_secret_key=client_secret,
-                    verify=True,
+                    verify=verify_setting,
                     timeout=connection_timeout
                 )
                 

@@ -48,6 +48,15 @@ keycloak_task_args = {
 def sql_str(value: str) -> str:
     return value.replace("'", "''") if value else ""
 
+def is_empty_like(value: Any) -> bool:
+    """Return True for empty/null-like values coming from Excel/Pandas."""
+    if value is None:
+        return True
+    text = str(value).strip()
+    if not text:
+        return True
+    return text.lower() in {'nan', 'null', 'none'}
+
 def validate_rowfilter(rowfilter: str) -> str:
     """
     Reject rowfilter values containing dangerous SQL characters (e.g., ; or newlines).
@@ -68,6 +77,7 @@ def get_config() -> dict:
         'keycloak_realm': Variable.get('keycloak_realm'),
         'keycloak_client_id': Variable.get('keycloak_admin_client_id'),
         'keycloak_client_secret': Variable.get('keycloak_admin_client_secret', deserialize_json=False),
+        'keycloak_cacert': Variable.get('keycloak_cacert', default_var=''),
         'spark_conn_id': Variable.get('spark_conn_id', default_var='spark_default'),
         'tracking_database': Variable.get('policy_tracking_database', default_var='policy_tracking'),
         'tracking_location': Variable.get('policy_tracking_location', default_var='s3a://data-lake/policy_tracking'),
@@ -76,12 +86,12 @@ def get_config() -> dict:
 
 def parse_permission_string(permissions: str) -> List[str]:
     """Parse permission string into list."""
-    if not permissions or str(permissions).lower() == 'nan':
+    if is_empty_like(permissions):
         return ['read']
     
     perm_list = [p.strip().lower() for p in str(permissions).split(',') if p.strip()]
     
-    valid_perms = {'read', 'write', 'all', 'select', 'insert', 'update', 'delete', 'create', 'drop', 'alter', 'use', 'show', 'grant', 'revoke', 'execute', 'impersonate', 'read_sysinfo', 'write_sysinfo'}
+    valid_perms = {'read', 'write', 'all', 'select', 'insert', 'update', 'delete', 'create', 'drop', 'alter', 'index', 'lock', 'use', 'show', 'grant', 'revoke', 'execute', 'impersonate', 'read_sysinfo', 'write_sysinfo'}
     invalid_perms = [p for p in perm_list if p not in valid_perms]
     
     if invalid_perms:
@@ -92,7 +102,7 @@ def parse_permission_string(permissions: str) -> List[str]:
 
 def parse_csv_field(value: str) -> List[str]:
     """Parse comma-separated field into list."""
-    if not value or str(value).lower() == 'nan':
+    if is_empty_like(value):
         return []
     return [v.strip() for v in str(value).split(',') if v.strip()]
 
@@ -139,8 +149,10 @@ with DAG(
             permissions = []
             rowfilter = None
             for r in pdata.get('roles', []):
+                role = r.get('role')
                 users.extend(r.get('users', []))
-                groups.extend(r.get('groups', []))
+                if not is_empty_like(role):
+                    groups.append(role)
                 permissions.extend(r.get('permissions', []))
                 if r.get('rowfilter'):
                     if rowfilter and rowfilter != r['rowfilter']:
@@ -185,9 +197,9 @@ with DAG(
 
         for idx, row in df.iterrows():
             role = str(row.get('role', '')).strip()
-            if role.lower() == 'nan':
+            if is_empty_like(role):
                 role = ''
-                logger.debug(f"Row {idx}: Role field was 'nan', treating as empty")
+                logger.debug(f"Row {idx}: Role field was empty/null-like, treating as empty")
             databases = str(row.get('database', '')).strip()
             tables = str(row.get('tables', '*')).strip() or '*'
             columns = str(row.get('columns', '*')).strip() or '*'
@@ -196,12 +208,12 @@ with DAG(
             groups = str(row.get('groups', '')).strip()
             users = str(row.get('users', '')).strip()  
             rowfilter = str(row.get('rowfilter', '')).strip()  
-            if rowfilter.lower() == 'nan':
+            if is_empty_like(rowfilter):
                 rowfilter = ''
-                logger.debug(f"Row {idx}: Rowfilter field was 'nan', treating as empty")
+                logger.debug(f"Row {idx}: Rowfilter field was empty/null-like, treating as empty")
             # Enforce: Either database or url must be provided, not both or neither
-            has_db = bool(databases and databases.lower() != 'nan')
-            has_url = bool(url and url.lower() != 'nan' and url != '-' and url != '*')
+            has_db = not is_empty_like(databases)
+            has_url = bool(not is_empty_like(url) and url != '-' and url != '*')
             if (has_db and has_url) or (not has_db and not has_url):
                 reason = f"Row must have either database or url (but not both/neither). Skipped. role={role}, database={databases}, url={url}"
                 logger.error(reason)
@@ -219,7 +231,9 @@ with DAG(
                 role_principals.setdefault(role, {'groups': [], 'users': []}) 
             if group_list:
                 if not role: # If group input is present, role is mandatory
-                    logger.error(f"Row with groups {group_list} must have a role. Skipping row.")
+                    reason = f"Row with groups {group_list} must have a role. Skipping row."
+                    logger.error(reason)
+                    skipped_rows.append({'row_index': idx, 'role': role, 'database': databases, 'url': url, 'reason': reason})
                     continue
                 for g in group_list:
                     if g not in role_principals[role]['groups']:
@@ -229,43 +243,68 @@ with DAG(
                     if u not in role_principals[role]['users']:
                         role_principals[role]['users'].append(u)
             # If only users are present and no group, and no role is specified, create role_<username> for each user
-            if user_list and not group_list and (not role or role.lower() == 'nan'):
+            if user_list and not group_list and is_empty_like(role):
                 for u in user_list:
                     user_role = f"role_{u}"
                     role_principals.setdefault(user_role, {'groups': [], 'users': []})
                     if u not in role_principals[user_role]['users']:
                         role_principals[user_role]['users'].append(u)
 
+            # Build effective role bindings for policy assignment (normalized).
+            # - explicit role: one role bound to all row users
+            # - users-only row: one synthetic role per user (role_<user>)
+            if role:
+                effective_role_bindings = [{'role': role, 'users': user_list}]
+            elif user_list and not group_list:
+                effective_role_bindings = [{'role': f"role_{u}", 'users': [u]} for u in user_list]
+            else:
+                reason = (
+                    f"Row does not define a valid role binding. Skipped. "
+                    f"role={role}, groups={group_list}, users={user_list}"
+                )
+                logger.error(reason)
+                skipped_rows.append({
+                    'row_index': idx,
+                    'role': role,
+                    'database': databases,
+                    'url': url,
+                    'reason': reason,
+                })
+                continue
+
             perm_list = parse_permission_string(permissions)
 
-            if url and url.lower() != 'nan' and url != '-' and url != '*':
+            if not is_empty_like(url) and url != '-' and url != '*':
                 policy_name = url
                 if policy_name not in policies:
                     policies[policy_name] = {'type': 'url', 'url': url, 'roles': []}
-                existing_roles = [r['role'] for r in policies[policy_name]['roles']]
-                if role not in existing_roles:
-                    policies[policy_name]['roles'].append({'role': role, 'permissions': perm_list, 'groups': group_list, 'users': user_list, 'rowfilter': rowfilter})
-                else:
-                    for r in policies[policy_name]['roles']:
-                        if r['role'] == role:
-                            for p in perm_list:
-                                if p not in r['permissions']:
-                                    r['permissions'].append(p)
-                            # Merge groups, users, rowfilter
-                            r['groups'] = list(set(r.get('groups', []) + group_list))
-                            r['users'] = list(set(r.get('users', []) + user_list))
-                            if rowfilter:
-                                if r.get('rowfilter') and r['rowfilter'] != rowfilter:
-                                    raise ValueError(
-                                        f"Conflicting rowfilters for role {role} in policy {policy_name}: "
-                                        f"{r['rowfilter']} vs {rowfilter}")
-                                r['rowfilter'] = rowfilter
+                for binding in effective_role_bindings:
+                    effective_role = binding['role']
+                    effective_users = binding['users']
+                    existing_roles = [r['role'] for r in policies[policy_name]['roles']]
+                    if effective_role not in existing_roles:
+                        policies[policy_name]['roles'].append({'role': effective_role, 'permissions': perm_list, 'groups': group_list, 'users': effective_users, 'rowfilter': rowfilter})
+                    else:
+                        for r in policies[policy_name]['roles']:
+                            if r['role'] == effective_role:
+                                for p in perm_list:
+                                    if p not in r['permissions']:
+                                        r['permissions'].append(p)
+                                # Merge groups, users, rowfilter
+                                r['groups'] = list(set(r.get('groups', []) + group_list))
+                                r['users'] = list(set(r.get('users', []) + effective_users))
+                                if rowfilter:
+                                    if r.get('rowfilter') and r['rowfilter'] != rowfilter:
+                                        raise ValueError(
+                                            f"Conflicting rowfilters for role {effective_role} in policy {policy_name}: "
+                                            f"{r['rowfilter']} vs {rowfilter}")
+                                    r['rowfilter'] = rowfilter
             else:
                 db_list = parse_csv_field(databases)
                 table_list = parse_csv_field(tables) or ['*']
                 column_list = parse_csv_field(columns) or ['*']
                 for database in db_list:
-                    if not database or database.lower() == 'nan':
+                    if is_empty_like(database):
                         continue
                     for table in table_list:
                         for column in column_list:
@@ -279,20 +318,23 @@ with DAG(
                                     'column': column or '*',
                                     'roles': []
                                 }
-                            existing_roles = [r['role'] for r in policies[policy_name]['roles']]
-                            if role not in existing_roles:
-                                policies[policy_name]['roles'].append({'role': role, 'permissions': perm_list, 'groups': group_list, 'users': user_list, 'rowfilter': rowfilter})
-                            else:
-                                for r in policies[policy_name]['roles']:
-                                    if r['role'] == role:
-                                        for p in perm_list:
-                                            if p not in r['permissions']:
-                                                r['permissions'].append(p)
-                                        # Merge groups, users, rowfilter
-                                        r['groups'] = list(set(r.get('groups', []) + group_list))
-                                        r['users'] = list(set(r.get('users', []) + user_list))
-                                        if rowfilter:
-                                            r['rowfilter'] = rowfilter
+                            for binding in effective_role_bindings:
+                                effective_role = binding['role']
+                                effective_users = binding['users']
+                                existing_roles = [r['role'] for r in policies[policy_name]['roles']]
+                                if effective_role not in existing_roles:
+                                    policies[policy_name]['roles'].append({'role': effective_role, 'permissions': perm_list, 'groups': group_list, 'users': effective_users, 'rowfilter': rowfilter})
+                                else:
+                                    for r in policies[policy_name]['roles']:
+                                        if r['role'] == effective_role:
+                                            for p in perm_list:
+                                                if p not in r['permissions']:
+                                                    r['permissions'].append(p)
+                                            # Merge groups, users, rowfilter
+                                            r['groups'] = list(set(r.get('groups', []) + group_list))
+                                            r['users'] = list(set(r.get('users', []) + effective_users))
+                                            if rowfilter:
+                                                r['rowfilter'] = rowfilter
 
         logger.info(f"Parsed {len(policies)} policies and {len(role_principals)} role-principal mappings, {len(skipped_rows)} rows skipped")
         return {'policies': policies, 'role_principals': role_principals, 'skipped_rows': skipped_rows}
@@ -502,7 +544,7 @@ with DAG(
     # Ranger & Keycloak tasks
     # -----------------------------
     @task
-    def create_ranger_groups_and_policies(parsed_data: Dict[str, Any], tracking_run_id: str) -> Dict[str, Any]:
+    def create_ranger_groups_and_policies(parsed_data: Dict[str, Any], tracking_run_id: str, keycloak_result: Dict[str, Any]) -> Dict[str, Any]:
         """
         Create Ranger groups and policies.
         Returns both summary (for finalize) and statuses (for tracking).
@@ -524,20 +566,67 @@ with DAG(
         groups_created = []
         groups_existing = []
 
-        # Ensure groups exist (for both groups and users)
-        all_groups = set()
-        all_users = set()
+        # Roles are excluded from Ranger policy assignment only when all attempted
+        # Keycloak principal mappings (group/user) fail for that role.
+        roles_with_successful_keycloak_principal_mapping = set()
+        for mapping in keycloak_result.get('summary', {}).get('created_mappings', []):
+            if isinstance(mapping, dict) and mapping.get('role'):
+                roles_with_successful_keycloak_principal_mapping.add(mapping.get('role'))
+        for mapping in keycloak_result.get('summary', {}).get('existing_mappings', []):
+            if isinstance(mapping, dict) and mapping.get('role'):
+                roles_with_successful_keycloak_principal_mapping.add(mapping.get('role'))
+
+        roles_with_failed_keycloak_mapping_attempt = set()
+        principals_with_failed_keycloak_mapping_attempt = set()
+        roles_with_failed_keycloak_principal_mapping = set()
+        principals_with_failed_keycloak_principal_mapping = set()
+        for failed in keycloak_result.get('summary', {}).get('failed', []):
+            if not isinstance(failed, dict):
+                continue
+            operation = failed.get('operation')
+            if operation == 'create_role':
+                role_name = failed.get('role')
+                if role_name:
+                    roles_with_failed_keycloak_principal_mapping.add(role_name)
+                principal_name = failed.get('principal') or failed.get('user')
+                if principal_name:
+                    principals_with_failed_keycloak_principal_mapping.add(principal_name)
+            elif operation in ('assign_role', 'assign_role_user'):
+                role_name = failed.get('role')
+                principal_name = failed.get('principal') or failed.get('user')
+                if role_name:
+                    roles_with_failed_keycloak_mapping_attempt.add(role_name)
+                if principal_name:
+                    principals_with_failed_keycloak_mapping_attempt.add(principal_name)
+
+        # Block only roles that had mapping attempts but no successful/existing mapping.
+        for role_name in roles_with_failed_keycloak_mapping_attempt:
+            if role_name not in roles_with_successful_keycloak_principal_mapping:
+                roles_with_failed_keycloak_principal_mapping.add(role_name)
+
+        if roles_with_failed_keycloak_principal_mapping and principals_with_failed_keycloak_mapping_attempt:
+            principals_with_failed_keycloak_principal_mapping.update(principals_with_failed_keycloak_mapping_attempt)
+
+        if roles_with_failed_keycloak_principal_mapping:
+            logger.warning(
+                "Excluding %d role principal(s) from Ranger policy assignment due to failed Keycloak "
+                "principal mapping (no successful mapping for role). roles=%s principals=%s",
+                len(roles_with_failed_keycloak_principal_mapping),
+                sorted(roles_with_failed_keycloak_principal_mapping),
+                sorted(principals_with_failed_keycloak_principal_mapping),
+            )
+
+        # Ensure Ranger role-groups exist (strict RBAC model)
         all_roles = set(role_principals.keys())
         for policy_data in policies.values():
             for r in policy_data.get('roles', []):
-                all_roles.add(r['role'])
-                if 'groups' in r:
-                    all_groups.update(r['groups'])
-                if 'users' in r:
-                    all_users.update(r['users'])
+                role = r.get('role')
+                # Only add valid roles (not empty, None, or 'nan')
+                if not is_empty_like(role):
+                    all_roles.add(role)
 
-        # Ensure all groups exist in Ranger (users are handled by user management, not here)
-        groups_result = manager.ensure_groups_exist(list(all_groups | all_roles))
+        # Ensure role groups exist in Ranger (Keycloak groups/users are handled on Keycloak side)
+        groups_result = manager.ensure_groups_exist(list(all_roles))
 
         for g, created in groups_result.items():
             if created:
@@ -558,31 +647,75 @@ with DAG(
                 "completed_at": dt.now(timezone.utc)
             })
         
-        # Track users (assumed to already exist via LDAP/SSO, not created by this DAG)
-        for user in sorted(all_users):
-            statuses.append({
-                "run_id": tracking_run_id,
-                "object_type": "user",
-                "object_name": user,
-                "object_key": "",
-                "status": "ALREADY_EXISTS",
-                "error_message": "",
-                "attempt": 1,
-                "started_at": dt.now(timezone.utc),
-                "completed_at": dt.now(timezone.utc)
-            })
+        # Users are not tracked in object_status as they are external (AD/Keycloak) users
+        # Policy creation will validate user existence at runtime
 
         patched_policies = {}
+        prevalidated_policy_failures = []
+        applied_policy_roles = {}
+        excluded_policy_roles = {}
         for policy_name, policy_data in policies.items():
             patched_policy = dict(policy_data)
             patched_policy['roles'] = []
+            excluded_roles_in_policy = []
+            applied_roles_in_policy = []
             for r in policy_data.get('roles', []):
+                role_name = r.get('role')
+                if is_empty_like(role_name):
+                    logger.error(
+                        "Skipping Ranger policy assignment for invalid role in policy %s: %s",
+                        policy_name,
+                        role_name,
+                    )
+                    continue
+
+                # Ranger policies are role-group based.
+                # Always use the role name as the Ranger group principal, even when Excel groups is empty.
+                # This allows service-account/user-only rows (groups=null) to create valid Ranger policies.
+                if role_name in roles_with_failed_keycloak_principal_mapping:
+                    logger.error(
+                        "Excluding role principal %s from Ranger policy %s due to failed Keycloak "
+                        "principal mapping (no successful group/user assignment)",
+                        role_name,
+                        policy_name,
+                    )
+                    excluded_roles_in_policy.append(role_name)
+                    continue
                 patched_role = dict(r)
-                patched_role['groups'] = r.get('groups', [])
-                # NOTE: Users are assumed to already exist in Ranger; we do not create users here
-                patched_role['users'] = r.get('users', [])
+                patched_role['groups'] = [role_name]
+                # Strict RBAC: Ranger grants are role/group-based, users are handled via Keycloak mapping
+                patched_role['users'] = []
                 patched_role['rowfilter'] = r.get('rowfilter', '')
                 patched_policy['roles'].append(patched_role)
+                applied_roles_in_policy.append(role_name)
+            if applied_roles_in_policy:
+                applied_policy_roles[policy_name] = sorted(set(applied_roles_in_policy))
+            if excluded_roles_in_policy:
+                excluded_policy_roles[policy_name] = sorted(set(excluded_roles_in_policy))
+            if not patched_policy['roles']:
+                if excluded_roles_in_policy:
+                    failure_reason = (
+                        "Ranger policy was not created because required Keycloak principal mapping failed for "
+                        f"role principal(s): {', '.join(sorted(set(excluded_roles_in_policy)))}."
+                    )
+                else:
+                    failure_reason = (
+                        "Ranger policy was not created because no valid role principal could be built from the input rows. "
+                        "The role value is empty/invalid, and no users-only fallback was available."
+                    )
+                prevalidated_policy_failures.append({'name': policy_name, 'error': failure_reason})
+                statuses.append({
+                    "run_id": tracking_run_id,
+                    "object_type": "policy",
+                    "object_name": policy_name,
+                    "object_key": "",
+                    "status": "FAILED",
+                    "error_message": failure_reason,
+                    "attempt": 1,
+                    "started_at": dt.now(timezone.utc),
+                    "completed_at": dt.now(timezone.utc)
+                })
+                continue
             patched_policies[policy_name] = patched_policy
 
         policies_result = manager.sync_policies_from_dict(patched_policies)
@@ -682,11 +815,17 @@ with DAG(
                 "completed_at": dt.now(timezone.utc)
             })
 
+        policies_failed.extend(prevalidated_policy_failures)
+
         # Return only summary and statuses; policy_statuses is not used downstream
         return {
             "summary": {
                 "groups": {"created": groups_created, "existing": groups_existing},
                 "policies": {"created": policies_created, "updated": policies_updated, "failed": policies_failed}
+            },
+            "policy_principals": {
+                "applied_roles": applied_policy_roles,
+                "excluded_roles": excluded_policy_roles,
             },
             "statuses": statuses
         }
@@ -707,8 +846,7 @@ with DAG(
                 realm_name=cfg["keycloak_realm"],
                 client_id=cfg["keycloak_client_id"],
                 client_secret=cfg["keycloak_client_secret"],
-                max_retries=3,
-                connection_timeout=10
+                ca_cert_path=(cfg.get("keycloak_cacert") or None)
             )
             logger.info("✓ Keycloak health check passed")
             return {
@@ -749,8 +887,7 @@ with DAG(
                 realm_name=cfg["keycloak_realm"],
                 client_id=cfg["keycloak_client_id"],
                 client_secret=cfg["keycloak_client_secret"],
-                max_retries=2,
-                connection_timeout=10
+                ca_cert_path=(cfg.get("keycloak_cacert") or None)
             )
         except ConnectionError as e:
             # Connection failed - record all roles and mappings as FAILED for audit trail
@@ -833,8 +970,6 @@ with DAG(
                 "statuses": statuses,
                 "connection_error": True
             }
-            # Re-raise so Airflow knows this task failed and can retry/alert
-            raise
 
 
         # Map roles to principals (groups and users) based on parsed data
@@ -1052,23 +1187,16 @@ with DAG(
         roles_existing = len(keycloak_summary.get('existing_roles', []))
         mappings_created = len(keycloak_summary.get('created_mappings', []))
         mappings_existing = len(keycloak_summary.get('existing_mappings', []))
-        keycloak_failed = len(keycloak_summary.get('failed', []))
 
-        total_objects = (
-            groups_created + groups_existing +
-            policies_created + policies_updated + policies_failed +
-            roles_created + roles_existing +
-            mappings_created + mappings_existing + keycloak_failed
+        all_statuses = []
+        all_statuses.extend(ranger_result.get("statuses", []))
+        all_statuses.extend(keycloak_result.get("statuses", []))
+
+        total_objects = len(all_statuses)
+        successful_objects = sum(
+            1 for s in all_statuses if s.get("status") in ("CREATED", "UPDATED", "ALREADY_EXISTS")
         )
-
-        successful_objects = (
-            groups_created + groups_existing +
-            policies_created + policies_updated +
-            roles_created + roles_existing +
-            mappings_created + mappings_existing
-        )
-
-        failed_objects = policies_failed + keycloak_failed
+        failed_objects = sum(1 for s in all_statuses if s.get("status") == "FAILED")
 
         overall_status = "COMPLETED" if failed_objects == 0 else "PARTIAL_FAILURE"
         safe_overall_status = sql_str(overall_status)
@@ -1093,7 +1221,7 @@ with DAG(
                 roles_existing = {roles_existing},
                 mappings_created = {mappings_created},
                 mappings_existing = {mappings_existing},
-                failed_operations = {keycloak_failed},
+                failed_operations = {failed_objects},
                 updated_at = current_timestamp()
             WHERE run_id = '{safe_tracking_run_id}'
         """)
@@ -1106,6 +1234,173 @@ with DAG(
                 error_message = '{safe_fallback_message}',
                 updated_at = current_timestamp()
             WHERE run_id = '{safe_tracking_run_id}' AND status = 'RUNNING'
+        """)
+
+        spark.sql(f"""
+            MERGE INTO {db}.tracking_ranger_policy_object_status t
+            USING (
+                SELECT run_id, policy_name AS object_name, policy_name, policy_id
+                FROM {db}.tracking_ranger_policy_status
+                WHERE run_id = '{safe_tracking_run_id}'
+                UNION ALL
+                SELECT run_id, concat(policy_name, '__rowfilter') AS object_name, policy_name, policy_id
+                FROM {db}.tracking_ranger_policy_status
+                WHERE run_id = '{safe_tracking_run_id}'
+            ) s
+            ON t.run_id = s.run_id
+               AND t.object_type = 'policy'
+               AND t.object_name = s.object_name
+            WHEN MATCHED
+              AND ((t.policy_id IS NULL OR t.policy_id = '') OR (t.policy_name IS NULL OR t.policy_name = ''))
+            THEN UPDATE SET
+              t.policy_name = s.policy_name,
+              t.policy_id = s.policy_id,
+              t.updated_at = current_timestamp()
+        """)
+
+        spark.sql(f"""
+            MERGE INTO {db}.tracking_ranger_policy_object_status t
+            USING (
+                SELECT
+                    principal,
+                    concat_ws(', ', sort_array(collect_set(policy_name))) AS policy_name,
+                    concat_ws(', ', sort_array(collect_set(policy_id))) AS policy_id
+                FROM (
+                    SELECT explode(groups) AS principal, policy_name, policy_id
+                    FROM {db}.tracking_ranger_policy_status
+                    WHERE run_id = '{safe_tracking_run_id}'
+                    UNION ALL
+                    SELECT explode(users) AS principal, policy_name, policy_id
+                    FROM {db}.tracking_ranger_policy_status
+                    WHERE run_id = '{safe_tracking_run_id}'
+                ) principals
+                WHERE principal IS NOT NULL AND trim(principal) <> ''
+                GROUP BY principal
+            ) s
+            ON t.run_id = '{safe_tracking_run_id}'
+               AND t.object_type IN ('ranger_group', 'keycloak_group')
+               AND t.object_name = s.principal
+            WHEN MATCHED
+              AND ((t.policy_id IS NULL OR t.policy_id = '') OR (t.policy_name IS NULL OR t.policy_name = ''))
+            THEN UPDATE SET
+              t.policy_name = s.policy_name,
+              t.policy_id = s.policy_id,
+              t.updated_at = current_timestamp()
+        """)
+
+        spark.sql(f"""
+            MERGE INTO {db}.tracking_ranger_policy_object_status t
+            USING (
+                SELECT
+                    principal_assoc.principal,
+                    principal_assoc.policy_name,
+                    principal_assoc.policy_id
+                FROM (
+                    SELECT
+                        principal,
+                        concat_ws(', ', sort_array(collect_set(policy_name))) AS policy_name,
+                        concat_ws(', ', sort_array(collect_set(policy_id))) AS policy_id
+                    FROM (
+                        SELECT explode(groups) AS principal, policy_name, policy_id
+                        FROM {db}.tracking_ranger_policy_status
+                        WHERE run_id = '{safe_tracking_run_id}'
+                        UNION ALL
+                        SELECT explode(users) AS principal, policy_name, policy_id
+                        FROM {db}.tracking_ranger_policy_status
+                        WHERE run_id = '{safe_tracking_run_id}'
+                    ) principals
+                    WHERE principal IS NOT NULL AND trim(principal) <> ''
+                    GROUP BY principal
+                ) principal_assoc
+            ) s
+            ON t.run_id = '{safe_tracking_run_id}'
+               AND t.object_type = 'mapping'
+               AND trim(regexp_extract(t.object_name, '->([^\\(]+)\\s*\\((group|user)\\)$', 1)) = s.principal
+            WHEN MATCHED
+              AND ((t.policy_id IS NULL OR t.policy_id = '') OR (t.policy_name IS NULL OR t.policy_name = ''))
+            THEN UPDATE SET
+              t.policy_name = s.policy_name,
+              t.policy_id = s.policy_id,
+              t.updated_at = current_timestamp()
+        """)
+
+        spark.sql(f"""
+            MERGE INTO {db}.tracking_ranger_policy_object_status t
+            USING (
+                SELECT
+                    role_name,
+                    concat_ws(', ', sort_array(collect_set(policy_name))) AS policy_name,
+                    concat_ws(', ', sort_array(collect_set(policy_id))) AS policy_id
+                FROM (
+                    SELECT
+                        trim(regexp_extract(object_name, '^(.+?)->', 1)) AS role_name,
+                        policy_name,
+                        policy_id
+                    FROM {db}.tracking_ranger_policy_object_status
+                    WHERE run_id = '{safe_tracking_run_id}'
+                      AND object_type = 'mapping'
+                      AND policy_name IS NOT NULL
+                      AND policy_name <> ''
+                ) mapped_roles
+                WHERE role_name IS NOT NULL AND role_name <> ''
+                GROUP BY role_name
+            ) s
+            ON t.run_id = '{safe_tracking_run_id}'
+               AND t.object_type = 'role'
+               AND t.object_name = s.role_name
+            WHEN MATCHED
+              AND ((t.policy_id IS NULL OR t.policy_id = '') OR (t.policy_name IS NULL OR t.policy_name = ''))
+            THEN UPDATE SET
+              t.policy_name = s.policy_name,
+              t.policy_id = s.policy_id,
+              t.updated_at = current_timestamp()
+        """)
+
+        spark.sql(f"""
+                    MERGE INTO {db}.tracking_ranger_policy_object_status t
+                    USING (
+                            SELECT object_name, policy_name, policy_id
+                            FROM {db}.tracking_ranger_policy_object_status
+                            WHERE run_id = '{safe_tracking_run_id}'
+                                AND object_type = 'role'
+                                AND policy_name IS NOT NULL
+                                AND policy_name <> ''
+                    ) s
+                    ON t.run_id = '{safe_tracking_run_id}'
+                            AND t.object_type = 'ranger_group'
+                            AND t.object_name = s.object_name
+                    WHEN MATCHED
+                        AND ((t.policy_id IS NULL OR t.policy_id = '') OR (t.policy_name IS NULL OR t.policy_name = ''))
+                    THEN UPDATE SET
+                        t.policy_name = s.policy_name,
+                        t.policy_id = s.policy_id,
+                        t.updated_at = current_timestamp()
+            """)
+
+        spark.sql(f"""
+                MERGE INTO {db}.tracking_ranger_policy_object_status t
+                USING (
+                        SELECT
+                                trim(regexp_extract(object_name, '->([^\\(]+)\\s*\\(group\\)$', 1)) AS group_name,
+                                concat_ws(', ', sort_array(collect_set(policy_name))) AS policy_name,
+                                concat_ws(', ', sort_array(collect_set(policy_id))) AS policy_id
+                        FROM {db}.tracking_ranger_policy_object_status
+                        WHERE run_id = '{safe_tracking_run_id}'
+                            AND object_type = 'mapping'
+                            AND object_name RLIKE '->[^\\(]+\\s*\\(group\\)$'
+                            AND policy_name IS NOT NULL
+                            AND policy_name <> ''
+                        GROUP BY trim(regexp_extract(object_name, '->([^\\(]+)\\s*\\(group\\)$', 1))
+                ) s
+                ON t.run_id = '{safe_tracking_run_id}'
+                        AND t.object_type = 'keycloak_group'
+                        AND t.object_name = s.group_name
+                WHEN MATCHED
+                    AND ((t.policy_id IS NULL OR t.policy_id = '') OR (t.policy_name IS NULL OR t.policy_name = ''))
+                THEN UPDATE SET
+                    t.policy_name = s.policy_name,
+                    t.policy_id = s.policy_id,
+                    t.updated_at = current_timestamp()
         """)
         return {
             "run_id": tracking_run_id,
@@ -1455,6 +1750,9 @@ with DAG(
     def build_final_policy_statuses(parsed_data: Dict[str, Any], tracking_run_id: str, ranger_result: Dict[str, Any]) -> List[Dict]:
         from datetime import datetime as dt, timezone
         policies = parsed_data.get('policies', {})
+        policy_principals = ranger_result.get('policy_principals', {})
+        applied_role_map = policy_principals.get('applied_roles', {})
+        excluded_role_map = policy_principals.get('excluded_roles', {})
         now = dt.now(timezone.utc)
         # Build map of base policy names to their numeric IDs from ranger_result
         policy_id_map = {}
@@ -1478,12 +1776,14 @@ with DAG(
         status_list = []
         for policy_name, pdata in policies.items():
             users = []
-            groups = []
+            parsed_groups = []
             permissions = []
             rowfilter = None
             for r in pdata.get('roles', []):
+                role = r.get('role')
                 users.extend(r.get('users', []))
-                groups.extend(r.get('groups', []))
+                if not is_empty_like(role):
+                    parsed_groups.append(role)
                 permissions.extend(r.get('permissions', []))
                 if r.get('rowfilter'):
                     if rowfilter and rowfilter != r['rowfilter']:
@@ -1492,8 +1792,17 @@ with DAG(
                             f"{rowfilter} vs {r['rowfilter']}"
                         )
                     rowfilter = r['rowfilter']
-            status = policy_status_map.get(policy_name, {}).get("status", "SUCCESS")
+            status = policy_status_map.get(policy_name, {}).get("status", "RUNNING")
             error_message = policy_status_map.get(policy_name, {}).get("error_message", "")
+            excluded_roles = excluded_role_map.get(policy_name, [])
+            if excluded_roles and status != "FAILED":
+                exclusion_note = (
+                    f"Excluded role principal(s) due to failed Keycloak principal mapping (no successful group/user assignment): {', '.join(excluded_roles)}"
+                )
+                error_message = f"{error_message} | {exclusion_note}" if error_message else exclusion_note
+
+            effective_groups = applied_role_map.get(policy_name)
+            groups = effective_groups if effective_groups is not None else list(set(parsed_groups))
             # Use numeric policy_id from ranger_result if available, otherwise use policy_name
             numeric_policy_id = policy_id_map.get(policy_name, policy_name)
             status_list.append({
@@ -1501,7 +1810,7 @@ with DAG(
                 'policy_id': numeric_policy_id,
                 'policy_name': policy_name,
                 'users': list(set(users)),
-                'groups': list(set(groups)),
+                'groups': groups,
                 'permissions': list(set(permissions)),
                 'rowfilter': rowfilter,
                 'status': status,
@@ -1593,11 +1902,11 @@ with DAG(
     write_initial_policy_statuses = write_policy_statuses.override(
                     task_id="write_initial_policy_statuses")(initial_policy_statuses)
 
-    ranger_result = create_ranger_groups_and_policies(parsed_data, tracking_run_id)
-    
     # Check Keycloak health before attempting role creation
     keycloak_health = check_keycloak_health()
     keycloak_result = create_keycloak_roles(parsed_data, tracking_run_id, keycloak_health)
+
+    ranger_result = create_ranger_groups_and_policies(parsed_data, tracking_run_id, keycloak_result)
 
     final_policy_statuses = build_final_policy_statuses(parsed_data, tracking_run_id, ranger_result)
     write_final_policy_statuses = write_policy_statuses.override(
@@ -1622,9 +1931,10 @@ with DAG(
     init_tables >> tracking_run_id
     tracking_run_id >> parsed_data
     parsed_data >> write_skipped
-    parsed_data >> [initial_policy_statuses, ranger_result]
+    parsed_data >> initial_policy_statuses
     parsed_data >> keycloak_health
     keycloak_health >> keycloak_result
+    [parsed_data, keycloak_result] >> ranger_result
     initial_policy_statuses >> write_initial_policy_statuses
     ranger_result >> [debug_result, final_policy_statuses]
     final_policy_statuses >> write_final_policy_statuses
