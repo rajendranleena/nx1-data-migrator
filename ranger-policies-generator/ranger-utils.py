@@ -34,12 +34,12 @@ class Permissions:
     READ = ["select", "use", "execute", "show", "read_sysinfo"]
     WRITE = [
         "select", "insert", "update", "delete", "create", "drop",
-        "alter", "index", "lock", "use", "show", "grant", "revoke", "execute",
+        "alter", "use", "show", "grant", "revoke", "execute",
         "read", "write", "read_sysinfo", "write_sysinfo"
     ]
     ALL = [
         "select", "insert", "update", "delete", "create", "drop",
-        "alter", "index", "lock", "use", "show", "grant", "revoke", "impersonate",
+        "alter", "use", "show", "grant", "revoke", "impersonate",
         "execute", "read", "write", "read_sysinfo", "write_sysinfo"
     ]
     
@@ -109,8 +109,89 @@ class RangerPolicyManager:
         ranger_auth = (ranger_username, ranger_password)
         self.client = RangerClient(ranger_url, ranger_auth)
         self.user_mgmt_client = RangerUserMgmtClient(self.client)
+        self.supported_access_types = self._load_supported_access_types_once()
         
         logger.info(f"Initialized RangerPolicyManager for service: {service_name}")
+
+    def _load_supported_access_types_once(self) -> Optional[Set[str]]:
+        """Load supported access types from Ranger service definition once per manager instance."""
+        try:
+            service = self.client.get_service(self.service_name)
+        except Exception as e:
+            logger.warning(
+                "Could not fetch Ranger service '%s' to resolve supported access types; proceeding without filtering: %s",
+                self.service_name,
+                e,
+            )
+            return None
+
+        service_def_id = None
+        service_def_name = None
+        if isinstance(service, dict):
+            service_def_id = service.get('typeId') or service.get('serviceDefId')
+            service_def_name = service.get('type') or service.get('serviceDefName')
+
+        service_def = None
+        try:
+            if hasattr(self.client, 'get_service_def'):
+                if service_def_id is not None:
+                    service_def = self.client.get_service_def(service_def_id)
+                elif service_def_name:
+                    service_def = self.client.get_service_def(service_def_name)
+        except Exception as e:
+            logger.warning(
+                "Could not fetch Ranger service definition for '%s'; proceeding without filtering: %s",
+                self.service_name,
+                e,
+            )
+            return None
+
+        if not isinstance(service_def, dict):
+            logger.warning(
+                "Ranger service definition for '%s' is unavailable; proceeding without filtering.",
+                self.service_name,
+            )
+            return None
+
+        access_types = service_def.get('accessTypes', [])
+        supported = {
+            str(access.get('name', '')).strip().lower()
+            for access in access_types
+            if isinstance(access, dict) and str(access.get('name', '')).strip()
+        }
+
+        if not supported:
+            logger.warning(
+                "No access types found in Ranger service definition for '%s'; proceeding without filtering.",
+                self.service_name,
+            )
+            return None
+
+        logger.info(
+            "Loaded %d supported access types for service '%s': %s",
+            len(supported),
+            self.service_name,
+            sorted(supported),
+        )
+        return supported
+
+    def _filter_access_types(self, requested_access_types: Set[str], role_name: Any, policy_name: Optional[str] = None) -> Set[str]:
+        """Filter requested access types to those supported by Ranger service definition."""
+        normalized = {str(a).strip().lower() for a in requested_access_types if str(a).strip()}
+        if self.supported_access_types is None:
+            return normalized
+
+        valid = normalized & self.supported_access_types
+        dropped = normalized - self.supported_access_types
+        if dropped:
+            logger.warning(
+                "Dropping unsupported access types for policy '%s', role '%s': %s. Supported: %s",
+                policy_name,
+                role_name,
+                sorted(dropped),
+                sorted(self.supported_access_types),
+            )
+        return valid
     
     def ensure_group_exists(self, group_name: str) -> bool:
         """
@@ -222,9 +303,16 @@ class RangerPolicyManager:
             logger.debug(f"create_table_policy called: policy_name={policy_name}, schema={schema}, table={table}, column={column}")
             logger.debug(f"role_permissions: {role_permissions}")
             
+            role_permissions_with_policy_context = [{**rp, 'policy_name': policy_name} for rp in role_permissions]
+
             # Build policy items and row filter items separately
-            policy_items = self._build_policy_items(role_permissions)
+            policy_items = self._build_policy_items(role_permissions_with_policy_context)
             row_filter_items = self._build_row_filter_items(role_permissions)
+
+            if not policy_items:
+                raise ValueError(
+                    f"No supported access types remain for policy '{policy_name}' after filtering unsupported permissions"
+                )
             
             logger.debug(f"Built {len(policy_items)} policy items and {len(row_filter_items)} row filter items")
             
@@ -319,9 +407,16 @@ class RangerPolicyManager:
             
             existing_policy = self.get_existing_policy(policy_name)
             
+            role_permissions_with_policy_context = [{**rp, 'policy_name': policy_name} for rp in role_permissions]
+
             # Build policy items (no row filters for URL policies)
-            policy_items = self._build_url_policy_items(role_permissions)
+            policy_items = self._build_url_policy_items(role_permissions_with_policy_context)
             row_filter_items = []  # URLs don't support row filters
+
+            if not policy_items:
+                raise ValueError(
+                    f"No supported access types remain for URL policy '{policy_name}' after filtering unsupported permissions"
+                )
             
             # Build resources
             resources = {
@@ -358,12 +453,21 @@ class RangerPolicyManager:
         policy_items = []
         for rp in role_permissions:
             role = rp.get('role')
+            policy_name = rp.get('policy_name')
             permissions = rp.get('permissions', ['read'])
 
             # Expand permissions to access types
             access_types = set()
             for perm in permissions:
                 access_types.update(Permissions.get_access_types(perm))
+            access_types = self._filter_access_types(access_types, role, policy_name)
+            if not access_types:
+                logger.warning(
+                    "Skipping role '%s' in policy '%s' because no supported access types remain after filtering",
+                    role,
+                    policy_name,
+                )
+                continue
 
             allow_item = RangerPolicyItem()
             # Add role as Ranger group (NOT Keycloak groups)
@@ -386,6 +490,7 @@ class RangerPolicyManager:
         policy_items = []
         for rp in role_permissions:
             role = rp.get('role')
+            policy_name = rp.get('policy_name')
             permissions = rp.get('permissions', ['read'])
 
             # For URL policies, map to read/write
@@ -399,6 +504,14 @@ class RangerPolicyManager:
                     access_types.add('write')
                 else:
                     access_types.add(perm_lower)
+            access_types = self._filter_access_types(access_types, role, policy_name)
+            if not access_types:
+                logger.warning(
+                    "Skipping role '%s' in URL policy '%s' because no supported access types remain after filtering",
+                    role,
+                    policy_name,
+                )
+                continue
 
             allow_item = RangerPolicyItem()
             # Add role as Ranger group (NOT Keycloak groups)
@@ -480,7 +593,15 @@ class RangerPolicyManager:
         row_filter_items: List[Dict[str, Any]],
         description: Optional[str]
     ) -> Dict[str, Any]:
-        """Update an existing policy, merging groups, users, and rowfilter conditions."""
+        """
+        Update an existing policy, merging groups, users, and permissions.
+
+        Merge behavior:
+        - For each group in the new input, if the group exists in the policy, users and permissions are merged (union of old and new).
+        - For row filters, if a group exists, the filter expression and accesses are updated, but users are merged.
+        - No groups, users, or permissions are removed if they are not present in the new input.
+        - This ensures that policy updates are always additive and non-destructive unless explicitly overwritten.
+        """
         policy_name = existing_policy['name']
         policy_id = existing_policy['id']
 
@@ -503,7 +624,7 @@ class RangerPolicyManager:
                 if new_group in group_to_item:
                     idx = group_to_item[new_group]
                     item = existing_items[idx]
-                    # Merge users
+                    # Merge users (union)
                     existing_users = set(item.get('users', []))
                     new_users = set(new_item.users or [])
                     item['users'] = list(existing_users | new_users)
@@ -528,7 +649,7 @@ class RangerPolicyManager:
                     group_to_item[new_group] = len(existing_items) - 1
 
         existing_policy['policyItems'] = existing_items
-        
+
         # Merge row filter items (similar to policy items merging)
         if row_filter_items:
             # Build a mapping from groups to existing row filter items
@@ -537,7 +658,7 @@ class RangerPolicyManager:
             for idx, item in enumerate(existing_rowfilters):
                 for group in item.get('groups', []):
                     group_to_rowfilter[group] = idx
-            
+
             # Merge or add new row filter items
             for new_item in row_filter_items:
                 groups = new_item.get('groups', [])
@@ -546,7 +667,7 @@ class RangerPolicyManager:
                         # Update existing row filter item for this group
                         idx = group_to_rowfilter[group]
                         existing_item = existing_rowfilters[idx]
-                        # Merge users
+                        # Merge users (union)
                         existing_users = set(existing_item.get('users', []))
                         new_users = set(new_item.get('users', []))
                         existing_item['users'] = list(existing_users | new_users)
@@ -558,7 +679,7 @@ class RangerPolicyManager:
                         existing_rowfilters.append(new_item)
                         for group in groups:
                             group_to_rowfilter[group] = len(existing_rowfilters) - 1
-            
+
             existing_policy['rowFilterPolicyItems'] = existing_rowfilters
             existing_policy['policyType'] = 2  # policyType 2 = Row Filter policy
             logger.debug(f"Merged {len(row_filter_items)} row filter items for policy '{policy_name}'")
@@ -768,6 +889,7 @@ class KeycloakRoleManager:
         realm_name: str,
         client_id: str,
         client_secret: str,
+        verify_ssl: bool = False,
         ca_cert_path: Optional[str] = None,
         max_retries: int = 3,
         connection_timeout: int = 10
@@ -780,6 +902,7 @@ class KeycloakRoleManager:
             realm_name: Realm name
             client_id: Admin client ID
             client_secret: Admin client secret
+            verify_ssl: Whether TLS certificate verification is enabled
             ca_cert_path: Optional path to CA bundle PEM file for TLS verification
             max_retries: Number of connection retry attempts (default: 3)
             connection_timeout: Connection timeout in seconds (default: 10)
@@ -791,6 +914,7 @@ class KeycloakRoleManager:
         self.realm_name = realm_name
         self.max_retries = max_retries
         self.connection_timeout = connection_timeout
+        self.verify_ssl = bool(verify_ssl)
         normalized_ca_path = None
         if ca_cert_path:
             normalized_ca_path = str(ca_cert_path).strip().strip("\"'")
@@ -799,7 +923,7 @@ class KeycloakRoleManager:
 
         self.ca_cert_path = normalized_ca_path
         self.keycloak_admin = None
-        if self.ca_cert_path:
+        if self.verify_ssl and self.ca_cert_path:
             if not os.path.exists(self.ca_cert_path):
                 raise ConnectionError(
                     f"Keycloak CA certificate path does not exist: {self.ca_cert_path}. "
@@ -815,7 +939,9 @@ class KeycloakRoleManager:
                     f"Keycloak CA certificate file is not readable: {self.ca_cert_path}. "
                     "Adjust file permissions for the Airflow runtime user."
                 )
-        verify_setting = self.ca_cert_path if self.ca_cert_path else True
+        if not self.verify_ssl:
+            logger.warning("Keycloak TLS certificate verification is disabled (verify_ssl=false).")
+        verify_setting = self.ca_cert_path if (self.verify_ssl and self.ca_cert_path) else self.verify_ssl
         
         # Try to connect with exponential backoff retry logic
         last_error = None

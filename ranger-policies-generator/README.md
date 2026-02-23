@@ -1,5 +1,7 @@
 # Ranger Policy Automation - Setup Guide
 
+Users responsible for authoring the Excel input and running the Ranger policy automation DAG, start with [USER_GUIDE.md](USER_GUIDE.md).
+
 ## Overview
 
 This solution automates the creation of Apache Ranger policies and Keycloak role mappings based on an Excel configuration file.
@@ -85,10 +87,12 @@ The Excel file with sample values:
 | Excel Permission | Ranger Access Types |
 |-----------------|---------------------|
 | `read` | select, use, execute, show, read_sysinfo |
-| `write` | select, insert, update, delete, create, drop, alter, index, lock, use, show, grant, revoke, execute, read, write, read_sysinfo, write_sysinfo |
-| `all` | select, insert, update, delete, create, drop, alter, index, lock, use, show, grant, revoke, impersonate, execute, read, write, read_sysinfo, write_sysinfo |
+| `write` | select, insert, update, delete, create, drop, alter, use, show, grant, revoke, execute, read, write, read_sysinfo, write_sysinfo |
+| `all` | select, insert, update, delete, create, drop, alter, use, show, grant, revoke, impersonate, execute, read, write, read_sysinfo, write_sysinfo |
 
-Explicit permissions such as `select,update,create,drop,index,alter,all,read,lock,write` are also accepted and passed through.
+Explicit permissions such as `select,update,create,drop,alter,all,read,write` are also accepted and passed through.
+
+If a permissions list contains unsupported values, those values are ignored and policy creation continues with the remaining supported permissions.
 
 ## Airflow Variables Required
 
@@ -106,7 +110,16 @@ Variable.set("keycloak_url", "https://keycloak.example.com/auth")
 Variable.set("keycloak_realm", "your-realm")
 Variable.set("keycloak_admin_client_id", "ranger-user-sync")
 Variable.set("keycloak_admin_client_secret", "your_client_secret")
+Variable.set("keycloak_verify_ssl", "false")  # optional, default false
+Variable.set("keycloak_cacert", "/path/to/ca-bundle.pem")  # optional, used when verify_ssl=true
+
+# Email / SMTP Configuration (optional)
+Variable.set("policy_smtp_conn_id", "smtp_default")
+Variable.set("policy_email_recipients", "ops@example.com,security@example.com")
 ```
+
+`keycloak_verify_ssl=false` disables TLS certificate verification for Keycloak connections.
+When `keycloak_verify_ssl=true`, `keycloak_cacert` can be set to a custom CA bundle path.
 
 ## DAG Parameters
 
@@ -140,6 +153,12 @@ Configure the required Airflow Variables via the UI or CLI:
 airflow variables set ranger_url "https://ranger.example.com"
 airflow variables set ranger_username "admin"
 # ... etc
+airflow variables set keycloak_verify_ssl "false"
+# Optional when using a private/internal CA:
+airflow variables set keycloak_cacert "/path/to/ca-bundle.pem"
+# Optional email report delivery:
+airflow variables set policy_smtp_conn_id "smtp_default"
+airflow variables set policy_email_recipients "ops@example.com,security@example.com"
 ```
 
 ### 4. Trigger the DAG
@@ -172,7 +191,8 @@ parse_excel ──► write_skipped_rows ──► write_initial_policy_status
 
 create_ranger_groups_and_policies ──► build_final_policy_status ──► write_final_policy_status
 
-write_object_statuses + write_final_policy_status ──► finalize_run ──► generate_html_report
+write_object_statuses + write_final_policy_status ──► finalize_run ──► generate_policy_report
+generate_policy_report ──► send_policy_report_email
 ```
 
 ## Outputs
@@ -202,6 +222,8 @@ After each run, an HTML report is generated and saved to the configured output l
 - Skipped/invalid Excel rows with reasons for skipping (for audit and troubleshooting)
 
 You can use this report for auditing, troubleshooting, and compliance tracking.
+
+If `policy_email_recipients` is configured, the generated report is also emailed as an HTML attachment via the SMTP connection defined by `policy_smtp_conn_id`.
 
 ## Tracking Tables
 

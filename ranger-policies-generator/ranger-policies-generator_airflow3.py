@@ -48,6 +48,19 @@ keycloak_task_args = {
 def sql_str(value: str) -> str:
     return value.replace("'", "''") if value else ""
 
+def parse_bool_config(value: Any, default: bool = True) -> bool:
+    """Parse bool-like config values from Airflow Variables."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {'true', '1', 'yes', 'y', 'on'}:
+        return True
+    if text in {'false', '0', 'no', 'n', 'off'}:
+        return False
+    return default
+
 def is_empty_like(value: Any) -> bool:
     """Return True for empty/null-like values coming from Excel/Pandas."""
     if value is None:
@@ -77,7 +90,10 @@ def get_config() -> dict:
         'keycloak_realm': Variable.get('keycloak_realm'),
         'keycloak_client_id': Variable.get('keycloak_admin_client_id'),
         'keycloak_client_secret': Variable.get('keycloak_admin_client_secret', deserialize_json=False),
+        'keycloak_verify_ssl': parse_bool_config(Variable.get('keycloak_verify_ssl', default_var='false'), default=False),
         'keycloak_cacert': Variable.get('keycloak_cacert', default_var=''),
+        'smtp_conn_id': Variable.get('policy_smtp_conn_id', default_var='smtp_default'),
+        'email_recipients': Variable.get('policy_email_recipients', default_var=''),
         'spark_conn_id': Variable.get('spark_conn_id', default_var='spark_default'),
         'tracking_database': Variable.get('policy_tracking_database', default_var='policy_tracking'),
         'tracking_location': Variable.get('policy_tracking_location', default_var='s3a://data-lake/policy_tracking'),
@@ -91,7 +107,7 @@ def parse_permission_string(permissions: str) -> List[str]:
     
     perm_list = [p.strip().lower() for p in str(permissions).split(',') if p.strip()]
     
-    valid_perms = {'read', 'write', 'all', 'select', 'insert', 'update', 'delete', 'create', 'drop', 'alter', 'index', 'lock', 'use', 'show', 'grant', 'revoke', 'execute', 'impersonate', 'read_sysinfo', 'write_sysinfo'}
+    valid_perms = {'read', 'write', 'all', 'select', 'insert', 'update', 'delete', 'create', 'drop', 'alter', 'use', 'show', 'grant', 'revoke', 'execute', 'impersonate', 'read_sysinfo', 'write_sysinfo'}
     invalid_perms = [p for p in perm_list if p not in valid_perms]
     
     if invalid_perms:
@@ -424,7 +440,6 @@ with DAG(
                 run_id STRING,
                 object_type STRING,
                 object_name STRING,
-                object_key STRING,
                 policy_id STRING,
                 policy_name STRING,
                 status STRING,
@@ -566,55 +581,6 @@ with DAG(
         groups_created = []
         groups_existing = []
 
-        # Roles are excluded from Ranger policy assignment only when all attempted
-        # Keycloak principal mappings (group/user) fail for that role.
-        roles_with_successful_keycloak_principal_mapping = set()
-        for mapping in keycloak_result.get('summary', {}).get('created_mappings', []):
-            if isinstance(mapping, dict) and mapping.get('role'):
-                roles_with_successful_keycloak_principal_mapping.add(mapping.get('role'))
-        for mapping in keycloak_result.get('summary', {}).get('existing_mappings', []):
-            if isinstance(mapping, dict) and mapping.get('role'):
-                roles_with_successful_keycloak_principal_mapping.add(mapping.get('role'))
-
-        roles_with_failed_keycloak_mapping_attempt = set()
-        principals_with_failed_keycloak_mapping_attempt = set()
-        roles_with_failed_keycloak_principal_mapping = set()
-        principals_with_failed_keycloak_principal_mapping = set()
-        for failed in keycloak_result.get('summary', {}).get('failed', []):
-            if not isinstance(failed, dict):
-                continue
-            operation = failed.get('operation')
-            if operation == 'create_role':
-                role_name = failed.get('role')
-                if role_name:
-                    roles_with_failed_keycloak_principal_mapping.add(role_name)
-                principal_name = failed.get('principal') or failed.get('user')
-                if principal_name:
-                    principals_with_failed_keycloak_principal_mapping.add(principal_name)
-            elif operation in ('assign_role', 'assign_role_user'):
-                role_name = failed.get('role')
-                principal_name = failed.get('principal') or failed.get('user')
-                if role_name:
-                    roles_with_failed_keycloak_mapping_attempt.add(role_name)
-                if principal_name:
-                    principals_with_failed_keycloak_mapping_attempt.add(principal_name)
-
-        # Block only roles that had mapping attempts but no successful/existing mapping.
-        for role_name in roles_with_failed_keycloak_mapping_attempt:
-            if role_name not in roles_with_successful_keycloak_principal_mapping:
-                roles_with_failed_keycloak_principal_mapping.add(role_name)
-
-        if roles_with_failed_keycloak_principal_mapping and principals_with_failed_keycloak_mapping_attempt:
-            principals_with_failed_keycloak_principal_mapping.update(principals_with_failed_keycloak_mapping_attempt)
-
-        if roles_with_failed_keycloak_principal_mapping:
-            logger.warning(
-                "Excluding %d role principal(s) from Ranger policy assignment due to failed Keycloak "
-                "principal mapping (no successful mapping for role). roles=%s principals=%s",
-                len(roles_with_failed_keycloak_principal_mapping),
-                sorted(roles_with_failed_keycloak_principal_mapping),
-                sorted(principals_with_failed_keycloak_principal_mapping),
-            )
 
         # Ensure Ranger role-groups exist (strict RBAC model)
         all_roles = set(role_principals.keys())
@@ -639,7 +605,6 @@ with DAG(
                 "run_id": tracking_run_id,
                 "object_type": "ranger_group",  # Explicitly track as Ranger group
                 "object_name": g,
-                "object_key": "",
                 "status": status,
                 "error_message": "",
                 "attempt": 1,
@@ -654,6 +619,7 @@ with DAG(
         prevalidated_policy_failures = []
         applied_policy_roles = {}
         excluded_policy_roles = {}
+
         for policy_name, policy_data in policies.items():
             patched_policy = dict(policy_data)
             patched_policy['roles'] = []
@@ -669,13 +635,26 @@ with DAG(
                     )
                     continue
 
-                # Ranger policies are role-group based.
-                # Always use the role name as the Ranger group principal, even when Excel groups is empty.
-                # This allows service-account/user-only rows (groups=null) to create valid Ranger policies.
-                if role_name in roles_with_failed_keycloak_principal_mapping:
+                # Context-specific: check if at least one mapping for this role's users/groups in this policy succeeded
+                users = r.get('users', []) or []
+                groups = r.get('groups', []) or []
+                mapping_success = False
+                # Check group mappings
+                for g in groups:
+                    if {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('created_mappings', []) or \
+                       {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('existing_mappings', []):
+                        mapping_success = True
+                        break
+                # Check user mappings if not already successful
+                if not mapping_success:
+                    for u in users:
+                        if {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('created_mappings', []) or \
+                           {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('existing_mappings', []):
+                            mapping_success = True
+                            break
+                if not mapping_success:
                     logger.error(
-                        "Excluding role principal %s from Ranger policy %s due to failed Keycloak "
-                        "principal mapping (no successful group/user assignment)",
+                        "Excluding role principal %s from Ranger policy %s due to failed Keycloak principal mapping for all users/groups in this policy row",
                         role_name,
                         policy_name,
                     )
@@ -683,7 +662,6 @@ with DAG(
                     continue
                 patched_role = dict(r)
                 patched_role['groups'] = [role_name]
-                # Strict RBAC: Ranger grants are role/group-based, users are handled via Keycloak mapping
                 patched_role['users'] = []
                 patched_role['rowfilter'] = r.get('rowfilter', '')
                 patched_policy['roles'].append(patched_role)
@@ -692,6 +670,7 @@ with DAG(
                 applied_policy_roles[policy_name] = sorted(set(applied_roles_in_policy))
             if excluded_roles_in_policy:
                 excluded_policy_roles[policy_name] = sorted(set(excluded_roles_in_policy))
+            # Only create the Ranger policy if there is at least one applied role
             if not patched_policy['roles']:
                 if excluded_roles_in_policy:
                     failure_reason = (
@@ -708,7 +687,6 @@ with DAG(
                     "run_id": tracking_run_id,
                     "object_type": "policy",
                     "object_name": policy_name,
-                    "object_key": "",
                     "status": "FAILED",
                     "error_message": failure_reason,
                     "attempt": 1,
@@ -733,7 +711,6 @@ with DAG(
                 "run_id": tracking_run_id,
                 "object_type": "policy",
                 "object_name": policy_name,
-                "object_key": str(policy_id) if policy_id else "",  # Use actual Ranger policy ID
                 "policy_id": str(policy_id) if policy_id else "",  # Track policy ID for association
                 "policy_name": policy_name,  # Track policy name for association
                 "status": "CREATED",
@@ -746,12 +723,10 @@ with DAG(
             # Track rowfilter policy if it was created separately
             if p.get('rowfilter_policy_id'):
                 rowfilter_policy_name = p.get('rowfilter_policy_name', 'UNKNOWN')
-                rowfilter_policy_id = p.get('rowfilter_policy_id')
                 statuses.append({
                     "run_id": tracking_run_id,
                     "object_type": "policy",
                     "object_name": rowfilter_policy_name,
-                    "object_key": str(rowfilter_policy_id) if rowfilter_policy_id else "",
                     "policy_id": str(policy_id) if policy_id else "",  # Reference parent access policy ID
                     "policy_name": policy_name,  # Reference parent base policy name
                     "status": "CREATED",
@@ -770,7 +745,6 @@ with DAG(
                 "run_id": tracking_run_id,
                 "object_type": "policy",
                 "object_name": policy_name,
-                "object_key": str(policy_id) if policy_id else "",  # Use actual Ranger policy ID
                 "policy_id": str(policy_id) if policy_id else "",  # Track policy ID for association
                 "policy_name": policy_name,  # Track policy name for association
                 "status": "UPDATED",
@@ -783,12 +757,10 @@ with DAG(
             # Track rowfilter policy if it exists
             if p.get('rowfilter_policy_id'):
                 rowfilter_policy_name = p.get('rowfilter_policy_name', 'UNKNOWN')
-                rowfilter_policy_id = p.get('rowfilter_policy_id')
                 statuses.append({
                     "run_id": tracking_run_id,
                     "object_type": "policy",
                     "object_name": rowfilter_policy_name,
-                    "object_key": str(rowfilter_policy_id) if rowfilter_policy_id else "",
                     "policy_id": str(policy_id) if policy_id else "",  # Reference parent access policy ID
                     "policy_name": policy_name,  # Reference parent base policy name
                     "status": "UPDATED",
@@ -807,7 +779,6 @@ with DAG(
                 "run_id": tracking_run_id,
                 "object_type": "policy",
                 "object_name": policy_name,
-                "object_key": "",
                 "status": "FAILED",
                 "error_message": error,
                 "attempt": 1,
@@ -846,6 +817,7 @@ with DAG(
                 realm_name=cfg["keycloak_realm"],
                 client_id=cfg["keycloak_client_id"],
                 client_secret=cfg["keycloak_client_secret"],
+                verify_ssl=cfg.get("keycloak_verify_ssl", False),
                 ca_cert_path=(cfg.get("keycloak_cacert") or None)
             )
             logger.info("✓ Keycloak health check passed")
@@ -887,6 +859,7 @@ with DAG(
                 realm_name=cfg["keycloak_realm"],
                 client_id=cfg["keycloak_client_id"],
                 client_secret=cfg["keycloak_client_secret"],
+                verify_ssl=cfg.get("keycloak_verify_ssl", False),
                 ca_cert_path=(cfg.get("keycloak_cacert") or None)
             )
         except ConnectionError as e:
@@ -903,7 +876,6 @@ with DAG(
                     "run_id": tracking_run_id,
                     "object_type": "role",
                     "object_name": role_name,
-                    "object_key": "",
                     "status": "FAILED",
                     "error_message": f"Keycloak connection failed: {error_msg}",
                     "attempt": attempt_num,
@@ -921,7 +893,6 @@ with DAG(
                     "run_id": tracking_run_id,
                     "object_type": "keycloak_group",
                     "object_name": group_name,
-                    "object_key": "",
                     "status": "FAILED",
                     "error_message": f"Keycloak connection failed: {error_msg}",
                     "attempt": attempt_num,
@@ -936,7 +907,6 @@ with DAG(
                         "run_id": tracking_run_id,
                         "object_type": "mapping",
                         "object_name": f"{role_name}->{group_name} (group)",
-                        "object_key": "",
                         "status": "FAILED",
                         "error_message": f"Keycloak connection failed: {error_msg}",
                         "attempt": attempt_num,
@@ -948,7 +918,6 @@ with DAG(
                         "run_id": tracking_run_id,
                         "object_type": "mapping",
                         "object_name": f"{role_name}->{user_name} (user)",
-                        "object_key": "",
                         "status": "FAILED",
                         "error_message": f"Keycloak connection failed: {error_msg}",
                         "attempt": attempt_num,
@@ -984,7 +953,6 @@ with DAG(
                 "run_id": tracking_run_id,
                 "object_type": "role",
                 "object_name": name,
-                "object_key": "",
                 "status": "CREATED",
                 "error_message": "",
                 "attempt": 1,
@@ -998,7 +966,6 @@ with DAG(
                 "run_id": tracking_run_id,
                 "object_type": "role",
                 "object_name": name,
-                "object_key": "",
                 "status": "ALREADY_EXISTS",
                 "error_message": "",
                 "attempt": 1,
@@ -1012,7 +979,6 @@ with DAG(
                 "run_id": tracking_run_id,
                 "object_type": "keycloak_group",  # Explicitly track as Keycloak group
                 "object_name": group_name,
-                "object_key": "",
                 "status": "CREATED",
                 "error_message": "",
                 "attempt": 1,
@@ -1025,7 +991,6 @@ with DAG(
                 "run_id": tracking_run_id,
                 "object_type": "keycloak_group",  # Explicitly track as Keycloak group
                 "object_name": group_name,
-                "object_key": "",
                 "status": "ALREADY_EXISTS",
                 "error_message": "",
                 "attempt": 1,
@@ -1045,7 +1010,6 @@ with DAG(
                 "run_id": tracking_run_id,
                 "object_type": "mapping",
                 "object_name": name,
-                "object_key": "",
                 "status": "CREATED",
                 "error_message": "",
                 "attempt": 1,
@@ -1064,7 +1028,6 @@ with DAG(
                 "run_id": tracking_run_id,
                 "object_type": "mapping",
                 "object_name": name,
-                "object_key": "",
                 "status": "ALREADY_EXISTS",
                 "error_message": "",
                 "attempt": 1,
@@ -1086,7 +1049,6 @@ with DAG(
                 "run_id": tracking_run_id,
                 "object_type": "mapping",
                 "object_name": name,
-                "object_key": "",
                 "status": "FAILED",
                 "error_message": error,
                 "attempt": 1,
@@ -1241,11 +1203,17 @@ with DAG(
             USING (
                 SELECT run_id, policy_name AS object_name, policy_name, policy_id
                 FROM {db}.tracking_ranger_policy_status
-                WHERE run_id = '{safe_tracking_run_id}'
+                                WHERE run_id = '{safe_tracking_run_id}'
+                                    AND status IN ('CREATED', 'UPDATED')
+                                    AND policy_name IS NOT NULL AND trim(policy_name) <> ''
+                                    AND policy_id IS NOT NULL AND trim(policy_id) <> ''
                 UNION ALL
                 SELECT run_id, concat(policy_name, '__rowfilter') AS object_name, policy_name, policy_id
                 FROM {db}.tracking_ranger_policy_status
-                WHERE run_id = '{safe_tracking_run_id}'
+                                WHERE run_id = '{safe_tracking_run_id}'
+                                    AND status IN ('CREATED', 'UPDATED')
+                                    AND policy_name IS NOT NULL AND trim(policy_name) <> ''
+                                    AND policy_id IS NOT NULL AND trim(policy_id) <> ''
             ) s
             ON t.run_id = s.run_id
                AND t.object_type = 'policy'
@@ -1268,11 +1236,17 @@ with DAG(
                 FROM (
                     SELECT explode(groups) AS principal, policy_name, policy_id
                     FROM {db}.tracking_ranger_policy_status
-                    WHERE run_id = '{safe_tracking_run_id}'
+                                        WHERE run_id = '{safe_tracking_run_id}'
+                                            AND status IN ('CREATED', 'UPDATED')
+                                            AND policy_name IS NOT NULL AND trim(policy_name) <> ''
+                                            AND policy_id IS NOT NULL AND trim(policy_id) <> ''
                     UNION ALL
                     SELECT explode(users) AS principal, policy_name, policy_id
                     FROM {db}.tracking_ranger_policy_status
-                    WHERE run_id = '{safe_tracking_run_id}'
+                                        WHERE run_id = '{safe_tracking_run_id}'
+                                            AND status IN ('CREATED', 'UPDATED')
+                                            AND policy_name IS NOT NULL AND trim(policy_name) <> ''
+                                            AND policy_id IS NOT NULL AND trim(policy_id) <> ''
                 ) principals
                 WHERE principal IS NOT NULL AND trim(principal) <> ''
                 GROUP BY principal
@@ -1303,11 +1277,17 @@ with DAG(
                     FROM (
                         SELECT explode(groups) AS principal, policy_name, policy_id
                         FROM {db}.tracking_ranger_policy_status
-                        WHERE run_id = '{safe_tracking_run_id}'
+                                                WHERE run_id = '{safe_tracking_run_id}'
+                                                    AND status IN ('CREATED', 'UPDATED')
+                                                    AND policy_name IS NOT NULL AND trim(policy_name) <> ''
+                                                    AND policy_id IS NOT NULL AND trim(policy_id) <> ''
                         UNION ALL
                         SELECT explode(users) AS principal, policy_name, policy_id
                         FROM {db}.tracking_ranger_policy_status
-                        WHERE run_id = '{safe_tracking_run_id}'
+                                                WHERE run_id = '{safe_tracking_run_id}'
+                                                    AND status IN ('CREATED', 'UPDATED')
+                                                    AND policy_name IS NOT NULL AND trim(policy_name) <> ''
+                                                    AND policy_id IS NOT NULL AND trim(policy_id) <> ''
                     ) principals
                     WHERE principal IS NOT NULL AND trim(principal) <> ''
                     GROUP BY principal
@@ -1416,7 +1396,7 @@ with DAG(
 
 
     @task.pyspark(conn_id="spark_default")
-    def generate_policy_report(tracking_run_id: str, skipped_rows: list, spark) -> str:
+    def generate_policy_report(tracking_run_id: str, skipped_rows: list, spark) -> Dict[str, str]:
         """
         Generate a multi-row formatted HTML report for Ranger & Keycloak policy run.
         Includes object counts, status badges, and error messages.
@@ -1679,12 +1659,70 @@ with DAG(
         </html>
         """
 
-        # Save HTML to S3
-        report_path = f"{report_location}/{tracking_run_id}_policy_report.html"
-        spark.createDataFrame([(html,)], ["content"]).coalesce(1).write.mode("overwrite").text(report_path)
+        report_filename = f"{tracking_run_id}_policy_report.html"
+        report_path = f"{report_location}/{report_filename}"
+
+        hadoop_conf = spark._jsc.hadoopConfiguration()
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark._jvm.java.net.URI(report_path),
+            hadoop_conf
+        )
+        output_path = spark._jvm.org.apache.hadoop.fs.Path(report_path)
+        output_stream = fs.create(output_path, True)
+        output_stream.write(html.encode('utf-8'))
+        output_stream.close()
 
         logger.info(f"Report generated at: {report_path}")
-        return report_path
+        return {
+            "report_path": report_path,
+            "html_content": html,
+        }
+
+    @task.pyspark(conn_id='spark_default')
+    def send_policy_report_email(report_result: Dict[str, Any], tracking_run_id: str, spark) -> Dict[str, Any]:
+        """Send HTML policy report via email using SMTP."""
+        cfg = get_config()
+        smtp_conn_id = cfg.get('smtp_conn_id', 'smtp_default')
+        recipients_str = cfg.get('email_recipients', '')
+
+        if not recipients_str:
+            logger.warning("[Email] No recipients configured in 'policy_email_recipients' variable. Skipping email.")
+            return {'sent': False, 'reason': 'no_recipients'}
+
+        recipients = [r.strip() for r in recipients_str.split(',') if r.strip()]
+        html_content = report_result.get('html_content', '')
+        report_path = report_result.get('report_path', '')
+
+        try:
+            import tempfile
+            import os
+            from airflow.utils.email import send_email
+
+            tmp = tempfile.NamedTemporaryFile(
+                mode='w',
+                suffix='.html',
+                prefix=f'{tracking_run_id}_report_',
+                delete=False
+            )
+            tmp.write(html_content)
+            tmp.close()
+
+            send_email(
+                to=recipients,
+                subject=f"Ranger Policy Report - {tracking_run_id}",
+                html_content=(
+                    f"<p>Please find the Ranger policy report for run "
+                    f"<strong>{tracking_run_id}</strong> attached.</p>"
+                ),
+                files=[tmp.name],
+                conn_id=smtp_conn_id,
+            )
+            os.unlink(tmp.name)
+            logger.info(f"[Email] Report sent successfully to: {recipients}")
+            return {'sent': True, 'recipients': recipients, 'report_path': report_path}
+        except Exception as e:
+            logger.error(f"[Email] Failed to send report: {str(e)}")
+            raise Exception(f"Failed to send policy report email: {str(e)}") from e
 
     @task.pyspark(conn_id="spark_default")
     def write_policy_statuses(initial_policy_statuses: List[Dict], spark) -> int:
@@ -1763,7 +1801,7 @@ with DAG(
                 base_name = full_name.replace("__rowfilter", "") if full_name.endswith("__rowfilter") else full_name
                 # Only store base policy numeric ID (not the rowfilter policy)
                 if not full_name.endswith("__rowfilter"):
-                    policy_id_map[base_name] = obj["object_key"]
+                    policy_id_map[base_name] = obj.get("policy_id", "")
         policy_status_map = {}
         for obj in ranger_result.get("statuses", []):
             if obj["object_type"] == "policy":
@@ -1841,7 +1879,6 @@ with DAG(
             obj_run_id = sql_str(obj["run_id"])
             obj_type = sql_str(obj["object_type"])
             obj_name = sql_str(obj["object_name"])
-            obj_key = sql_str(obj.get("object_key", ""))
             status = sql_str(obj.get("status", "SUCCESS"))
             error_msg = sql_str(obj.get("error_message", ""))
             attempt = obj.get("attempt", 1)
@@ -1868,12 +1905,12 @@ with DAG(
                         attempt = {attempt},
                         updated_at = current_timestamp()
                     WHEN NOT MATCHED THEN INSERT (
-                        run_id, object_type, object_name, object_key,
+                        run_id, object_type, object_name,
                         policy_id, policy_name,
                         status, error_message, started_at, completed_at,
                         attempt, created_at, updated_at
                     ) VALUES (
-                        '{obj_run_id}', '{obj_type}', '{obj_name}', '{obj_key}',
+                        '{obj_run_id}', '{obj_type}', '{obj_name}',
                         '{policy_id}', '{policy_name_val}',
                         '{status}', '{error_msg}', {started_at_sql}, {completed_at_sql},
                         {attempt}, current_timestamp(), current_timestamp()
@@ -1926,7 +1963,8 @@ with DAG(
     )
 
 
-    report_path = generate_policy_report(tracking_run_id, parsed_data['skipped_rows'])
+    report_result = generate_policy_report(tracking_run_id, parsed_data['skipped_rows'])
+    send_email_result = send_policy_report_email(report_result, tracking_run_id)
 
     init_tables >> tracking_run_id
     tracking_run_id >> parsed_data
@@ -1942,4 +1980,4 @@ with DAG(
     [ranger_result, keycloak_result] >> all_statuses
     all_statuses >> write_statuses
     [write_statuses, write_final_policy_statuses] >> finalize
-    finalize >> report_path
+    finalize >> report_result >> send_email_result
