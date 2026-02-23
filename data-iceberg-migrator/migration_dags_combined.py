@@ -2478,7 +2478,6 @@ def init_iceberg_tracking_tables(spark) -> dict:
             run_id STRING,
             dag_run_id STRING,
             excel_file_path STRING,
-            parent_migration_run_id STRING,
             migration_type STRING,
             started_at TIMESTAMP,
             completed_at TIMESTAMP,
@@ -2517,8 +2516,7 @@ def init_iceberg_tracking_tables(spark) -> dict:
             validation_completed_at TIMESTAMP,
             validation_duration_seconds DOUBLE,
             error_message STRING,
-            updated_at TIMESTAMP,
-            parent_migration_run_id STRING
+            updated_at TIMESTAMP
         )
         USING iceberg
         PARTITIONED BY (source_database)
@@ -2544,7 +2542,6 @@ def create_iceberg_migration_run(excel_file_path: str, dag_run_id: str, spark) -
             '{dag_run_id}',
             '{excel_file_path}',
             NULL,
-            'PENDING',
             current_timestamp(),
             NULL,
             'RUNNING',
@@ -2600,84 +2597,6 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
 
 
 @task.pyspark(conn_id='spark_default')
-def lookup_parent_migration_run(excel_configs: list, spark) -> dict:
-    """Query migration_table_status to find the parent migration run_id."""
-    config = get_config()
-    tracking_db = config['tracking_database']
-    
-    tables_to_lookup = []
-    for cfg in excel_configs:
-        src_db = cfg['source_database']
-        tbl_pattern = cfg['table_pattern']
-        
-        all_tables = [row.tableName for row in spark.sql(f"SHOW TABLES IN {src_db}").collect()]
-        
-        if tbl_pattern == '*':
-            matched_tables = all_tables
-        else:
-            import fnmatch
-            matched_tables = [t for t in all_tables if fnmatch.fnmatch(t, tbl_pattern)]
-        
-        for tbl in matched_tables:
-            tables_to_lookup.append((src_db, tbl))
-    
-    parent_mapping = {}
-    
-    for src_db, src_tbl in tables_to_lookup:
-        try:
-            result = spark.sql(f"""
-                SELECT run_id
-                FROM {tracking_db}.migration_table_status
-                WHERE source_database = '{src_db}'
-                  AND source_table = '{src_tbl}'
-                  AND overall_status IN ('TABLE_CREATED', 'COPIED')
-                ORDER BY updated_at DESC
-                LIMIT 1
-            """).collect()
-            
-            if result:
-                parent_mapping[f"{src_db}.{src_tbl}"] = result[0]['run_id']
-            else:
-                parent_mapping[f"{src_db}.{src_tbl}"] = None 
-        except Exception as e:
-            parent_mapping[f"{src_db}.{src_tbl}"] = None
-    
-    from collections import Counter
-    valid_parents = [v for v in parent_mapping.values() if v is not None]
-    
-    if valid_parents:
-        most_common_parent = Counter(valid_parents).most_common(1)[0][0]
-    else:
-        most_common_parent = None 
-    
-    return {
-        'parent_migration_run_id': most_common_parent,
-        'table_parent_mapping': parent_mapping
-    }
-
-
-@task.pyspark(conn_id='spark_default')
-def update_parent_run_id(parent_lookup: dict, run_id: str, spark) -> dict:
-    """Update the iceberg_migration_runs table with parent_migration_run_id after lookup."""
-    config = get_config()
-    tracking_db = config['tracking_database']
-    
-    parent_run_id = parent_lookup.get('parent_migration_run_id')
-    
-    if parent_run_id:
-        spark.sql(f"""
-            UPDATE {tracking_db}.iceberg_migration_runs
-            SET parent_migration_run_id = '{parent_run_id}'
-            WHERE run_id = '{run_id}'
-        """)
-    
-    return {
-        'run_id': run_id,
-        'parent_updated': parent_run_id is not None
-    }
-
-
-@task.pyspark(conn_id='spark_default')
 @track_duration
 def discover_hive_tables(db_config: dict, spark) -> dict:
     """Discover Hive tables matching the pattern in the source database."""
@@ -2728,7 +2647,7 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
-def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: str, spark, **context) -> dict:
+def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context) -> dict:
     """Migrate discovered Hive tables to Iceberg format."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -2736,10 +2655,7 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
     src_db = discovery['source_database']
     dest_db = discovery['destination_iceberg_database']
     inplace = discovery['inplace_migration']
-    parent_run_id_from_discovery = discovery['run_id']
-    run_id = parent_run_id_from_discovery
-
-    table_parent_mapping = parent_lookup.get('table_parent_mapping', {})
+    run_id = discovery['run_id']
     
     if not inplace:
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
@@ -2749,9 +2665,6 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
     for tbl_meta in discovery.get('discovered_tables', []):
         tbl = tbl_meta['table']
         location = tbl_meta.get('location')
-        table_key = f"{src_db}.{tbl}"
-        parent_run_id = table_parent_mapping.get(table_key)
-        parent_run_id_sql = f"'{parent_run_id}'" if parent_run_id else 'NULL'
 
         logger.info(f"[IcebergMigrate] Starting migration for {src_db}.{tbl} | strategy={'INPLACE' if inplace else 'SNAPSHOT'} | dest={dest_db}.{tbl}")
         from datetime import datetime as _dt
@@ -2881,8 +2794,7 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
                     NULL,
                     NULL,
                     NULL,
-                    current_timestamp(),
-                    {parent_run_id_sql}
+                    current_timestamp()
                 )
             """)
             
@@ -2932,8 +2844,7 @@ def migrate_tables_to_iceberg(discovery: dict, parent_lookup: dict, dag_run_id: 
                     NULL,
                     NULL,
                     '{error_msg}',
-                    current_timestamp(),
-                    {parent_run_id_sql}
+                    current_timestamp()
                 )
             """)
             logger.error(f"ERROR: {error_msg}")
@@ -3871,17 +3782,10 @@ with DAG(
         excel_file_path="{{ params.excel_file_path }}",
         run_id=t_ice_run_id
     )
-    t_ice_parent_lookup = lookup_parent_migration_run(
-        excel_configs=t_ice_excel
-    )
-    t_ice_update_parent = update_parent_run_id(
-        run_id=t_ice_run_id,
-        parent_lookup=t_ice_parent_lookup
-    )
     
     # Per-database processing
     t_ice_discover = discover_hive_tables.expand(db_config=t_ice_excel)
-    t_ice_migrate = migrate_tables_to_iceberg.partial(dag_run_id="{{ run_id }}", parent_lookup=t_ice_parent_lookup).expand(discovery=t_ice_discover)
+    t_ice_migrate = migrate_tables_to_iceberg.partial(dag_run_id="{{ run_id }}").expand(discovery=t_ice_discover)
     t_ice_migrate.operator.trigger_rule = 'all_done'
 
     # Duration update
@@ -3908,7 +3812,5 @@ with DAG(
     t_ice_final.operator.trigger_rule = 'all_done'
     
     # Dependencies
-    t_ice_init >> t_ice_run_id >> t_ice_excel >> t_ice_parent_lookup >> t_ice_update_parent
-    t_ice_excel >> t_ice_discover
-    [t_ice_discover, t_ice_update_parent] >> t_ice_migrate >> t_ice_durations
+    t_ice_init >> t_ice_run_id >> t_ice_excel >> t_ice_discover >> t_ice_migrate >> t_ice_durations
     t_ice_durations >> t_ice_validate >> t_ice_val_status >> t_ice_report >> t_ice_email >> t_ice_final
