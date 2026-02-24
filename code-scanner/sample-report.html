@@ -1,0 +1,1309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spark Migration Scan Report</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }
+        h2 { color: #444; margin-top: 30px; }
+        h3 { color: #555; }
+        .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }
+        .stat-card { background: #f8f9fa; padding: 20px; border-radius: 8px; text-align: center; }
+        .stat-card .number { font-size: 2em; font-weight: bold; color: #007bff; }
+        .stat-card .label { color: #666; }
+        .severity-badge { padding: 4px 8px; border-radius: 4px; color: white; font-size: 0.8em; font-weight: bold; }
+        .issue { background: #f8f9fa; margin: 15px 0; padding: 15px; border-radius: 8px; border-left: 4px solid; }
+        .issue code { background: #e9ecef; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+        .issue pre { background: #282c34; color: #abb2bf; padding: 10px; border-radius: 4px; overflow-x: auto; }
+        .suggestion { background: #d4edda; padding: 10px; border-radius: 4px; margin-top: 10px; }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Spark Migration Scan Report</h1>
+        <p><strong>Generated:</strong> 2026-02-20 15:44:33</p>
+        
+        <div class="summary">
+            <div class="stat-card">
+                <div class="number">5</div>
+                <div class="label">Files Scanned</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">500</div>
+                <div class="label">Lines Scanned</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">354</div>
+                <div class="label">Issues Found</div>
+            </div>
+        </div>
+        
+        <h2>Issues by Severity</h2>
+        <table>
+            <tr><th>Severity</th><th>Count</th></tr>
+            <tr><td><span class="severity-badge" style="background:#dc3545">CRITICAL</span></td><td>44</td></tr>
+            <tr><td><span class="severity-badge" style="background:#fd7e14">HIGH</span></td><td>139</td></tr>
+            <tr><td><span class="severity-badge" style="background:#ffc107">MEDIUM</span></td><td>145</td></tr>
+            <tr><td><span class="severity-badge" style="background:#17a2b8">LOW</span></td><td>11</td></tr>
+            <tr><td><span class="severity-badge" style="background:#6c757d">INFO</span></td><td>15</td></tr>
+        </table>
+        
+        <h2>Issues by Category</h2>
+        <table>
+            <tr><th>Category</th><th>Count</th></tr>
+            <tr><td>Spark SQL Changes</td><td>176</td></tr>
+            <tr><td>Python 2 to 3 Migration</td><td>93</td></tr>
+            <tr><td>JDK 8/11 to 17 Migration</td><td>48</td></tr>
+            <tr><td>HDFS to S3 Migration</td><td>22</td></tr>
+            <tr><td>Spark API Changes</td><td>12</td></tr>
+            <tr><td>Performance Considerations</td><td>3</td></tr>
+        </table>
+        
+        <h2>Detailed Findings</h2>
+        <h3>Spark API Changes (12 issues)</h3>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [SPARK-001] Removed: SQLContext</strong>
+            <p>SQLContext was removed in Spark 3.0. Use SparkSession instead.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Replace with SparkSession: spark = SparkSession.builder.getOrCreate()</div>
+            <p><strong>Found in 7 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:4</code><pre>from pyspark import SparkContext, SQLContext</pre></li>
+                <li><code>test_samples/sample_spark_app.py:10</code><pre># Issue SPARK-001: SQLContext usage</pre></li>
+                <li><code>test_samples/sample_spark_app.py:12</code><pre>sqlContext = SQLContext(sc)</pre></li>
+                <li><code>test_samples/sample_spark_app.py:15</code><pre>df = sqlContext.read.parquet("hdfs://namenode:8020/data/users")</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:21</code><pre>from pyspark.sql import SQLContext</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:137</code><pre>sqlContext = SQLContext(sc)</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:140</code><pre>df = sqlContext.read.parquet("hdfs://namenode:8020/data")</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [SPARK-003] Removed: DataFrame.registerTempTable</strong>
+            <p>registerTempTable was removed. Use createOrReplaceTempView instead.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Replace with .createOrReplaceTempView()</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:16</code><pre>df.registerTempTable("users")</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:141</code><pre>df.registerTempTable("my_table")</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [SPARK-009] Changed: Dataset.unionAll renamed to union</strong>
+            <p>unionAll was renamed to union in Spark 2.0 and removed in 3.0.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Replace .unionAll() with .union()</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:21</code><pre>combined = df1.unionAll(df2)</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [SPARK-012] Changed: Window function defaults</strong>
+            <p>Window functions now require explicit frame specification in some cases.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Add explicit frame spec: .rowsBetween(Window.unboundedPreceding, Window.currentRow)</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:57</code><pre>window_spec = Window.partitionBy("user_id").orderBy("timestamp")</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [SPARK-030] Removed: spark.mllib (RDD-based ML)</strong>
+            <p>RDD-based MLlib (spark.mllib) is deprecated. Use spark.ml (DataFrame-based).</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Migrate to DataFrame-based ML: pyspark.ml / org.apache.spark.ml</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:8</code><pre>from pyspark.mllib.classification import LogisticRegressionWithLBFGS</pre></li>
+            </ul>
+        </div>
+        <h3>Spark SQL Changes (176 issues)</h3>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [SQL-005] Changed: Grouping without aggregation</strong>
+            <p>SELECT with GROUP BY requires aggregation functions in Spark 3.x.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Ensure all non-grouped columns use aggregation functions</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:77</code><pre>-- GROUP BY settings (REMOVE)</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:159</code><pre>GROUP BY customer_id</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:172</code><pre>GROUP BY region, product, year(sale_date), month(sale_date);</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [SQL-007] Changed: String comparison behavior</strong>
+            <p>String comparisons use different collation in Spark 3.x.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Review string comparisons for collation-sensitive queries</div>
+            <p><strong>Found in 4 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:158</code><pre>WHERE transaction_date >= '2024-01-01'</pre></li>
+                <li><code>test_samples/sample_spark_app.py:36</code><pre>data_path = "hdfs://namenode:8020/warehouse/sales"</pre></li>
+                <li><code>test_samples/sample_spark_app.py:37</code><pre>legacy_s3_path = "s3://old-bucket/archive"</pre></li>
+                <li><code>test_samples/sample_spark_app.py:38</code><pre>legacy_s3n_path = "s3n://another-bucket/data"</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [SQL-011] Deprecated: HiveQL syntax</strong>
+            <p>Some HiveQL-specific syntax deprecated in Spark 3.x.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use ORDER BY with window functions or DataFrame API for explicit control</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:160</code><pre>DISTRIBUTE BY customer_id</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:161</code><pre>SORT BY total_amount DESC;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [SQL-013] Changed: INSERT OVERWRITE partition behavior</strong>
+            <p>INSERT OVERWRITE with dynamic partitions behavior changed.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Review spark.sql.sources.partitionOverwriteMode setting (dynamic vs static)</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:164</code><pre>INSERT OVERWRITE TABLE sales_summary PARTITION (year, month)</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-001] Remove: SET hive.execution.engine</strong>
+            <p>hive.execution.engine is not applicable in Spark SQL.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove this SET command; Spark uses its own execution engine</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:5</code><pre>SET hive.execution.engine=tez;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:6</code><pre>SET hive.execution.engine=mr;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-002] Remove: SET hive.exec.* properties</strong>
+            <p>hive.exec.* properties are Hive-specific and should be removed.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.exec.* properties; use equivalent Spark configs (spark.sql.*)</div>
+            <p><strong>Found in 13 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:9</code><pre>SET hive.exec.parallel=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:10</code><pre>SET hive.exec.parallel.thread.number=16;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:11</code><pre>SET hive.exec.dynamic.partition=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:12</code><pre>SET hive.exec.dynamic.partition.mode=nonstrict;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:13</code><pre>SET hive.exec.max.dynamic.partitions=10000;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:14</code><pre>SET hive.exec.max.dynamic.partitions.pernode=1000;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:15</code><pre>SET hive.exec.compress.output=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:16</code><pre>SET hive.exec.compress.intermediate=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:17</code><pre>SET hive.exec.reducers.bytes.per.reducer=256000000;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:18</code><pre>SET hive.exec.reducers.max=1000;</pre></li>
+                <li><em>... and 3 more</em></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-003] Remove: SET hive.mapred.* properties</strong>
+            <p>hive.mapred.* properties are not used by Spark.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.mapred.* properties; Spark does not use MapReduce</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:24</code><pre>SET hive.mapred.mode=nonstrict;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:25</code><pre>SET hive.mapred.reduce.tasks.speculative.execution=false;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-004] Remove: SET hive.tez.* properties</strong>
+            <p>hive.tez.* properties are Tez-specific and not applicable to Spark.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.tez.* properties; Spark does not use Tez</div>
+            <p><strong>Found in 5 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:28</code><pre>SET hive.tez.container.size=4096;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:29</code><pre>SET hive.tez.java.opts=-Xmx3276m;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:30</code><pre>SET hive.tez.auto.reducer.parallelism=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:31</code><pre>SET hive.tez.min.partition.factor=0.25;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:32</code><pre>SET hive.tez.max.partition.factor=2.0;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-005] Remove: SET hive.vectorized.* properties</strong>
+            <p>hive.vectorized.* properties are Hive-specific vectorization settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.vectorized.* properties; Spark has its own vectorization (spark.sql.columnVector.*)</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:35</code><pre>SET hive.vectorized.execution.enabled=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:36</code><pre>SET hive.vectorized.execution.reduce.enabled=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:37</code><pre>SET hive.vectorized.execution.reduce.groupby.enabled=true;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-006] Remove: SET hive.cbo.* properties</strong>
+            <p>hive.cbo.* (Cost-Based Optimizer) properties are Hive-specific.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.cbo.* properties; use spark.sql.cbo.* for Spark's CBO</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:40</code><pre>SET hive.cbo.enable=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:41</code><pre>SET hive.cbo.returnpath.hiveop=true;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-007] Remove: SET hive.stats.* properties</strong>
+            <p>hive.stats.* properties are Hive-specific statistics settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.stats.* properties; use ANALYZE TABLE for Spark statistics</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:44</code><pre>SET hive.stats.autogather=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:45</code><pre>SET hive.stats.fetch.column.stats=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:46</code><pre>SET hive.stats.fetch.partition.stats=true;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-008] Remove: SET hive.optimize.* properties</strong>
+            <p>hive.optimize.* properties are Hive optimizer settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.optimize.* properties; use spark.sql.* optimizer configs</div>
+            <p><strong>Found in 8 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:49</code><pre>SET hive.optimize.ppd=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:50</code><pre>SET hive.optimize.ppd.storage=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:51</code><pre>SET hive.optimize.index.filter=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:52</code><pre>SET hive.optimize.sort.dynamic.partition=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:53</code><pre>SET hive.optimize.bucketmapjoin=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:54</code><pre>SET hive.optimize.bucketmapjoin.sortedmerge=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:55</code><pre>SET hive.optimize.skewjoin=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:56</code><pre>SET hive.optimize.metadataonly=true;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-009] Remove: SET hive.merge.* properties</strong>
+            <p>hive.merge.* properties control Hive file merging behavior.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.merge.* properties; use coalesce() or repartition() in Spark</div>
+            <p><strong>Found in 5 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:59</code><pre>SET hive.merge.mapfiles=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:60</code><pre>SET hive.merge.mapredfiles=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:61</code><pre>SET hive.merge.size.per.task=256000000;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:62</code><pre>SET hive.merge.smallfiles.avgsize=16000000;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:63</code><pre>SET hive.merge.tezfiles=true;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-010] Remove: SET hive.auto.convert.join*</strong>
+            <p>hive.auto.convert.join* properties are Hive join optimization settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove; use spark.sql.autoBroadcastJoinThreshold for Spark broadcast joins</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:66</code><pre>SET hive.auto.convert.join=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:67</code><pre>SET hive.auto.convert.join.noconditionaltask=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:68</code><pre>SET hive.auto.convert.join.noconditionaltask.size=200000000;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-011] Remove: SET hive.map.aggr*</strong>
+            <p>hive.map.aggr* properties control Hive map-side aggregation.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove; Spark handles aggregation optimization automatically</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:73</code><pre>SET hive.map.aggr=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:74</code><pre>SET hive.map.aggr.hash.min.reduction=0.5;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:75</code><pre>SET hive.map.aggr.hash.percentmemory=0.5;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-012] Remove: SET hive.groupby.* properties</strong>
+            <p>hive.groupby.* properties are Hive GROUP BY optimization settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.groupby.* properties; Spark handles GROUP BY differently</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:78</code><pre>SET hive.groupby.skewindata=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:79</code><pre>SET hive.groupby.orderby.position.alias=true;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-013] Remove: SET hive.skewjoin.* properties</strong>
+            <p>hive.skewjoin.* properties are Hive skew join settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove; use spark.sql.adaptive.skewJoin.* for Spark 3.x skew handling</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:82</code><pre>SET hive.skewjoin.key=100000;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:83</code><pre>SET hive.skewjoin.mapjoin.map.tasks=10000;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:84</code><pre>SET hive.skewjoin.mapjoin.min.split=33554432;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-014] Remove: SET hive.input.format</strong>
+            <p>hive.input.format is a Hive-specific input format setting.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove; Spark uses its own input format handling</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:87</code><pre>SET hive.input.format=org.apache.hadoop.hive.ql.io.CombineHiveInputFormat;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-015] Remove: SET hive.fetch.task.*</strong>
+            <p>hive.fetch.task.* properties control Hive fetch task behavior.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.fetch.task.* properties; not applicable to Spark</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:90</code><pre>SET hive.fetch.task.conversion=more;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:91</code><pre>SET hive.fetch.task.conversion.threshold=1073741824;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:92</code><pre>SET hive.fetch.task.aggr=false;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-017] Remove: SET hive.support.concurrency</strong>
+            <p>hive.support.concurrency is a Hive locking/concurrency setting.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove; Spark has different concurrency handling</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:106</code><pre>SET hive.support.concurrency=true;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-018] Remove: SET hive.txn.* properties</strong>
+            <p>hive.txn.* properties are Hive ACID transaction settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove; use Delta Lake or Iceberg for ACID transactions in Spark</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:103</code><pre>SET hive.txn.manager=org.apache.hadoop.hive.ql.lockmgr.DbTxnManager;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-019] Remove: SET hive.compactor.* properties</strong>
+            <p>hive.compactor.* properties are Hive compaction settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove; use Delta Lake OPTIMIZE or Iceberg compaction</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:104</code><pre>SET hive.compactor.initiator.on=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:105</code><pre>SET hive.compactor.worker.threads=1;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-021] Remove: SET hive.server2.* properties</strong>
+            <p>hive.server2.* properties are HiveServer2 settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove; use Spark Thrift Server configs (spark.sql.thriftServer.*)</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:109</code><pre>SET hive.server2.enable.doAs=false;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:110</code><pre>SET hive.server2.thrift.port=10000;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-023] Remove: SET hive.session.* properties</strong>
+            <p>hive.session.* properties are Hive session settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.session.* properties; not applicable to Spark</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:113</code><pre>SET hive.session.id=my_session;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:114</code><pre>SET hive.session.history.enabled=true;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-024] Remove: SET hive.llap.* properties</strong>
+            <p>hive.llap.* properties are Hive LLAP (Live Long And Process) settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove hive.llap.* properties; LLAP is not used by Spark</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:98</code><pre>SET hive.llap.execution.mode=all;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:99</code><pre>SET hive.llap.io.enabled=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:100</code><pre>SET hive.llap.daemon.service.hosts=@llap0;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-029] Remove: SET hive.query.* properties</strong>
+            <p>hive.query.* properties are Hive query execution settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove; use spark.sql.* for query configuration</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:95</code><pre>SET hive.query.timeout.seconds=600;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-099] Review: SET hive.* property detected</strong>
+            <p>Generic hive.* property detected; review for Spark compatibility.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Review and remove Hive-specific properties; migrate to Spark equivalents</div>
+            <p><strong>Found in 72 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:5</code><pre>SET hive.execution.engine=tez;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:6</code><pre>SET hive.execution.engine=mr;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:9</code><pre>SET hive.exec.parallel=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:10</code><pre>SET hive.exec.parallel.thread.number=16;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:11</code><pre>SET hive.exec.dynamic.partition=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:12</code><pre>SET hive.exec.dynamic.partition.mode=nonstrict;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:13</code><pre>SET hive.exec.max.dynamic.partitions=10000;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:14</code><pre>SET hive.exec.max.dynamic.partitions.pernode=1000;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:15</code><pre>SET hive.exec.compress.output=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:16</code><pre>SET hive.exec.compress.intermediate=true;</pre></li>
+                <li><em>... and 62 more</em></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-100] Remove: SET mapred.* properties</strong>
+            <p>mapred.* properties are MapReduce settings not used by Spark.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove mapred.* properties; Spark does not use MapReduce</div>
+            <p><strong>Found in 6 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:117</code><pre>SET mapred.job.queue.name=default;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:118</code><pre>SET mapred.reduce.tasks=100;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:119</code><pre>SET mapred.map.tasks=200;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:120</code><pre>SET mapred.job.name=my_hive_job;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:121</code><pre>SET mapred.output.compress=true;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:122</code><pre>SET mapred.output.compression.codec=org.apache.hadoop.io.compress.SnappyCodec;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-101] Remove: SET mapreduce.* properties</strong>
+            <p>mapreduce.* properties are MapReduce settings not used by Spark.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove mapreduce.* properties; Spark does not use MapReduce</div>
+            <p><strong>Found in 7 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:124</code><pre>SET mapreduce.job.queuename=default;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:125</code><pre>SET mapreduce.map.memory.mb=4096;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:126</code><pre>SET mapreduce.reduce.memory.mb=8192;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:127</code><pre>SET mapreduce.map.java.opts=-Xmx3276m;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:128</code><pre>SET mapreduce.reduce.java.opts=-Xmx6553m;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:129</code><pre>SET mapreduce.job.reduces=100;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:130</code><pre>SET mapreduce.input.fileinputformat.split.maxsize=268435456;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-103] Remove: SET tez.* properties</strong>
+            <p>tez.* properties are Tez execution engine settings.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove tez.* properties; Spark does not use Tez</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:137</code><pre>SET tez.am.resource.memory.mb=4096;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:138</code><pre>SET tez.task.resource.memory.mb=4096;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:139</code><pre>SET tez.runtime.io.sort.mb=512;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [HIVE-110] Review: ADD JAR command</strong>
+            <p>ADD JAR is Hive-specific; use --jars or spark.jars config.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove ADD JAR; use --jars in spark-submit or spark.jars config</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:142</code><pre>ADD JAR hdfs:///user/hive/lib/my-udf.jar;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:143</code><pre>ADD JAR /opt/hive/lib/custom-serde.jar;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-111] Review: ADD FILE command</strong>
+            <p>ADD FILE is Hive-specific; use --files or spark.files config.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove ADD FILE; use --files in spark-submit or spark.files config</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:144</code><pre>ADD FILE hdfs:///user/hive/scripts/transform.py;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-112] Review: dfs command in SQL</strong>
+            <p>dfs commands are Hive CLI specific.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove dfs commands; use Spark file APIs or shell scripts</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:147</code><pre>dfs -ls /user/hive/warehouse;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:148</code><pre>dfs -mkdir -p /user/hive/warehouse/my_table;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [HIVE-113] Review: source command in SQL</strong>
+            <p>source command is Hive CLI specific.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove source command; execute SQL files directly in Spark</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:150</code><pre>source /opt/hive/scripts/setup.sql;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [SQL-003] Changed: from_json schema parameter</strong>
+            <p>from_json now requires explicit schema; inference removed.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Add explicit schema: from_json(col, schema)</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:30</code><pre>parsed = df.select(from_json(col("json_col")))</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [SQL-004] Changed: Date/Timestamp parsing</strong>
+            <p>Date and timestamp parsing is stricter in Spark 3.x.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Add explicit format: to_date(col, 'yyyy-MM-dd')</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:33</code><pre>date_df = df.select(to_date(col("date_string")))</pre></li>
+            </ul>
+        </div>
+        <h3>HDFS to S3 Migration (22 issues)</h3>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [S3-001] HDFS Path: Requires S3 conversion</strong>
+            <p>HDFS paths need to be converted to S3 paths.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Replace hdfs://namenode:port/path with s3a://bucket/path</div>
+            <p><strong>Found in 8 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:142</code><pre>ADD JAR hdfs:///user/hive/lib/my-udf.jar;</pre></li>
+                <li><code>test_samples/legacy_hive_script.sql:144</code><pre>ADD FILE hdfs:///user/hive/scripts/transform.py;</pre></li>
+                <li><code>test_samples/sample_spark_app.py:15</code><pre>df = sqlContext.read.parquet("hdfs://namenode:8020/data/users")</pre></li>
+                <li><code>test_samples/sample_spark_app.py:19</code><pre>df1 = spark.read.parquet("hdfs://namenode:8020/data/part1")</pre></li>
+                <li><code>test_samples/sample_spark_app.py:20</code><pre>df2 = spark.read.parquet("hdfs://namenode:8020/data/part2")</pre></li>
+                <li><code>test_samples/sample_spark_app.py:36</code><pre>data_path = "hdfs://namenode:8020/warehouse/sales"</pre></li>
+                <li><code>test_samples/sample_spark_app.py:61</code><pre>df.write.parquet("hdfs://namenode:8020/output/processed")</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:140</code><pre>df = sqlContext.read.parquet("hdfs://namenode:8020/data")</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [S3-003] Deprecated: s3n/s3 protocol</strong>
+            <p>Use s3a:// protocol instead of deprecated s3:// or s3n://.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use s3a:// protocol for better performance and features</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:29</code><pre>json_df = spark.read.json("s3n://bucket/json_data")</pre></li>
+                <li><code>test_samples/sample_spark_app.py:37</code><pre>legacy_s3_path = "s3://old-bucket/archive"</pre></li>
+                <li><code>test_samples/sample_spark_app.py:38</code><pre>legacy_s3n_path = "s3n://another-bucket/data"</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#6c757d">
+            <strong><span class="severity-badge" style="background:#6c757d">INFO</span> [S3-010] Required: S3A credentials configuration</strong>
+            <p>S3 access requires credential configuration.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Ensure IAM roles or access keys are configured properly</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:44</code><pre>spark.conf.set("fs.s3a.access.key", "AKIAIOSFODNN7EXAMPLE")</pre></li>
+                <li><code>test_samples/sample_spark_app.py:45</code><pre>spark.conf.set("fs.s3a.secret.key", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [S3-011] Recommended: S3A committer configuration</strong>
+            <p>Use S3A committers for reliable output.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Configure spark.hadoop.fs.s3a.committer.name=magic or directory</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:41</code><pre>df.write.mode("append").parquet("s3a://bucket/output")</pre></li>
+                <li><code>test_samples/sample_spark_app.py:61</code><pre>df.write.parquet("hdfs://namenode:8020/output/processed")</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [S3-023] Performance: Append operations</strong>
+            <p>S3 doesn't support append; requires full rewrite.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use partitioned writes or consider Delta Lake/Iceberg for append patterns</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:41</code><pre>df.write.mode("append").parquet("s3a://bucket/output")</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#6c757d">
+            <strong><span class="severity-badge" style="background:#6c757d">INFO</span> [S3-040] Recommended: Use table formats for S3</strong>
+            <p>Consider Delta Lake, Iceberg, or Hudi for S3 workloads.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Consider Delta Lake, Iceberg, or Hudi for ACID transactions on S3</div>
+            <p><strong>Found in 6 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:15</code><pre>df = sqlContext.read.parquet("hdfs://namenode:8020/data/users")</pre></li>
+                <li><code>test_samples/sample_spark_app.py:19</code><pre>df1 = spark.read.parquet("hdfs://namenode:8020/data/part1")</pre></li>
+                <li><code>test_samples/sample_spark_app.py:20</code><pre>df2 = spark.read.parquet("hdfs://namenode:8020/data/part2")</pre></li>
+                <li><code>test_samples/sample_spark_app.py:41</code><pre>df.write.mode("append").parquet("s3a://bucket/output")</pre></li>
+                <li><code>test_samples/sample_spark_app.py:61</code><pre>df.write.parquet("hdfs://namenode:8020/output/processed")</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:140</code><pre>df = sqlContext.read.parquet("hdfs://namenode:8020/data")</pre></li>
+            </ul>
+        </div>
+        <h3>Performance Considerations (3 issues)</h3>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [PERF-001] Performance: collect() on large datasets</strong>
+            <p>collect() brings all data to driver; risky for large datasets.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use take(), head(), or write to storage instead of collect()</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:48</code><pre>all_data = df.collect()</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:144</code><pre>result = df.rdd.map(lambda (x, y): x + y).collect()</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [PERF-003] Performance: UDF usage</strong>
+            <p>Python UDFs are slower than native Spark functions.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Consider using built-in functions or Pandas UDFs for better performance</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:24</code><pre>@udf</pre></li>
+            </ul>
+        </div>
+        <h3>JDK 8/11 to 17 Migration (48 issues)</h3>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [JDK-030] Removed: -XX:+UseConcMarkSweepGC (CMS)</strong>
+            <p>CMS garbage collector removed in JDK 14.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use G1GC (-XX:+UseG1GC) or ZGC (-XX:+UseZGC) instead</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:5</code><pre>-XX:+UseConcMarkSweepGC</pre></li>
+                <li><code>test_samples/spark-jvm-opts.conf:7</code><pre>-XX:CMSInitiatingOccupancyFraction=75</pre></li>
+                <li><code>test_samples/spark-jvm-opts.conf:8</code><pre>-XX:+UseCMSInitiatingOccupancyOnly</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [JDK-031] Removed: -XX:+UseParallelOldGC</strong>
+            <p>ParallelOldGC flag removed; Parallel GC uses it by default.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove flag; use -XX:+UseParallelGC if needed</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:6</code><pre>-XX:+UseParallelOldGC</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [JDK-032] Removed: -XX:+AggressiveOpts</strong>
+            <p>AggressiveOpts flag removed in JDK 11.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove flag; optimizations are enabled by default</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:18</code><pre>-XX:+AggressiveOpts</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [JDK-033] Removed: -Xincgc</strong>
+            <p>Incremental GC flag removed.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove flag; use modern GC options</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:9</code><pre>-Xincgc</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [JDK-034] Removed: -XX:MaxPermSize</strong>
+            <p>PermGen space removed in JDK 8; MaxPermSize is obsolete.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use -XX:MaxMetaspaceSize instead for JDK 8+</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:12</code><pre>-XX:MaxPermSize=512m</pre></li>
+                <li><code>test_samples/spark-jvm-opts.conf:13</code><pre>-XX:PermSize=256m</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#17a2b8">
+            <strong><span class="severity-badge" style="background:#17a2b8">LOW</span> [JDK-035] Deprecated: -XX:+PrintGCDetails</strong>
+            <p>Legacy GC logging flags deprecated; use Unified Logging.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use -Xlog:gc* for unified GC logging in JDK 9+</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:21</code><pre>-XX:+PrintGCDetails</pre></li>
+                <li><code>test_samples/spark-jvm-opts.conf:22</code><pre>-XX:+PrintGCTimeStamps</pre></li>
+                <li><code>test_samples/spark-jvm-opts.conf:23</code><pre>-XX:+PrintGCDateStamps</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#6c757d">
+            <strong><span class="severity-badge" style="background:#6c757d">INFO</span> [JDK-036] Changed: -XX:+UseContainerSupport</strong>
+            <p>Container support enabled by default in JDK 10+.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Flag is enabled by default; can be removed unless explicitly disabling</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:45</code><pre>-XX:+UseContainerSupport</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#17a2b8">
+            <strong><span class="severity-badge" style="background:#17a2b8">LOW</span> [JDK-037] Removed: -XX:+TraceClassLoading</strong>
+            <p>Class loading trace flags replaced with Unified Logging.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use -Xlog:class+load=info for class loading trace</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:26</code><pre>-XX:+TraceClassLoading</pre></li>
+                <li><code>test_samples/spark-jvm-opts.conf:27</code><pre>-XX:+TraceClassUnloading</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [JDK-038] Removed: -Djava.endorsed.dirs</strong>
+            <p>Endorsed directories mechanism removed in JDK 9.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use --upgrade-module-path or module system</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:30</code><pre>-Djava.endorsed.dirs=/opt/endorsed</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [JDK-039] Removed: -Djava.ext.dirs</strong>
+            <p>Extension directories mechanism removed in JDK 9.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Add JARs to classpath or use module system</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:31</code><pre>-Djava.ext.dirs=/opt/ext</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#17a2b8">
+            <strong><span class="severity-badge" style="background:#17a2b8">LOW</span> [JDK-040] Deprecated: Biased locking</strong>
+            <p>Biased locking disabled by default in JDK 15, deprecated in JDK 17.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Remove flag; biased locking provides minimal benefit on modern hardware</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:34</code><pre>-XX:+UseBiasedLocking</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [JDK-071] Module: Illegal access workaround</strong>
+            <p>--illegal-access flag removed in JDK 17.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Replace with specific --add-opens/--add-exports flags</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:37</code><pre>--illegal-access=permit</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#6c757d">
+            <strong><span class="severity-badge" style="background:#6c757d">INFO</span> [JDK-072] Module: Add-opens for common frameworks</strong>
+            <p>Common frameworks may need --add-opens flags.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Document required --add-opens flags for deployment</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/spark-jvm-opts.conf:40</code><pre>--add-opens java.base/java.lang=ALL-UNNAMED</pre></li>
+                <li><code>test_samples/spark-jvm-opts.conf:41</code><pre>--add-opens java.base/java.util=ALL-UNNAMED</pre></li>
+                <li><code>test_samples/spark-jvm-opts.conf:42</code><pre>--add-opens java.base/sun.nio.ch=ALL-UNNAMED</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [JDK-014] Removed: Security Manager</strong>
+            <p>Security Manager deprecated for removal in JDK 17.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use container-based security, OS-level sandboxing, or module system</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_hive_script.sql:70</code><pre>SET hive.auto.convert.sortmerge.join.bigtable.selection.policy=org.apache.hadoop.hive.ql.optimizer.AvgPartitionSizeBasedBigTableSelectorForAutoSMJ;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [JDK-001] Removed: sun.misc.Unsafe direct access</strong>
+            <p>Direct access to sun.misc.Unsafe is restricted in JDK 17.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use VarHandle or MethodHandles for low-level operations; add --add-opens if absolutely required</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:3</code><pre>import sun.misc.Unsafe;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [JDK-002] Removed: sun.misc.BASE64Encoder/Decoder</strong>
+            <p>sun.misc.BASE64Encoder/Decoder removed in JDK 9+.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use java.util.Base64.getEncoder()/getDecoder()</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:4</code><pre>import sun.misc.BASE64Encoder;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [JDK-003] Removed: javax.xml.bind (JAXB)</strong>
+            <p>JAXB was removed from JDK 11+. Add external dependency.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Add jakarta.xml.bind-api and jaxb-runtime dependencies</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:5</code><pre>import javax.xml.bind.JAXBContext;</pre></li>
+                <li><code>test_samples/LegacySparkJob.java:6</code><pre>import javax.xml.bind.Marshaller;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [JDK-004] Removed: javax.activation</strong>
+            <p>JavaBeans Activation Framework removed from JDK 11+.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Add jakarta.activation dependency</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:7</code><pre>import javax.activation.DataHandler;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [JDK-005] Removed: javax.annotation</strong>
+            <p>Common annotations (JSR 250) removed from JDK 11+.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Add jakarta.annotation-api dependency</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:9</code><pre>import javax.annotation.PostConstruct;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [JDK-006] Removed: javax.xml.ws (JAX-WS)</strong>
+            <p>JAX-WS was removed from JDK 11+.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Add jakarta.xml.ws-api and jaxws-rt dependencies</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:8</code><pre>import javax.xml.ws.WebServiceClient;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [JDK-010] Removed: Nashorn JavaScript Engine</strong>
+            <p>Nashorn JavaScript engine removed in JDK 15+.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use GraalJS or another JavaScript engine</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:35</code><pre>ScriptEngine engine = manager.getEngineByName("nashorn");</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [JDK-020] Encapsulated: sun.* internal APIs</strong>
+            <p>sun.* packages are strongly encapsulated in JDK 17.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use supported APIs or add --add-opens/--add-exports JVM flags</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:4</code><pre>import sun.misc.BASE64Encoder;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [JDK-021] Encapsulated: com.sun.* internal APIs</strong>
+            <p>com.sun.* packages are strongly encapsulated in JDK 17.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use supported APIs; check for public alternatives</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:10</code><pre>import com.sun.org.apache.xerces.internal.impl.XMLStreamReaderImpl;</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [JDK-023] Reflection: setAccessible on JDK internals</strong>
+            <p>setAccessible(true) on JDK internal classes fails in JDK 17.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Avoid reflective access to internals; use --add-opens if required</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:66</code><pre>field.setAccessible(true);</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [JDK-024] Reflection: Illegal reflective access</strong>
+            <p>Deep reflection on platform classes restricted in JDK 17.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Review reflective access; may need --add-opens for platform classes</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:65</code><pre>java.lang.reflect.Field field = String.class.getDeclaredField("value");</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#17a2b8">
+            <strong><span class="severity-badge" style="background:#17a2b8">LOW</span> [JDK-050] Changed: URL constructor</strong>
+            <p>URL constructor deprecated in favor of URI.toURL().</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use URI.create(string).toURL() instead</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:46</code><pre>URL url = new URL("http://example.com");</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [JDK-051] Changed: finalize() method</strong>
+            <p>Object.finalize() deprecated for removal.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use try-with-resources, Cleaner, or PhantomReference</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:27</code><pre>protected void finalize() throws Throwable {</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [JDK-052] Deprecated: Thread.stop()</strong>
+            <p>Thread.stop() is deprecated and may be removed.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use interrupt() and cooperative thread termination</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:69</code><pre>// JDK-052: Thread.stop</pre></li>
+                <li><code>test_samples/LegacySparkJob.java:71</code><pre>t.stop();</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [JDK-054] Changed: Locale data</strong>
+            <p>CLDR locale data is default in JDK 9+; may affect formatting.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Test locale-sensitive formatting; use -Djava.locale.providers=COMPAT if needed</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:16</code><pre>import java.text.SimpleDateFormat;</pre></li>
+                <li><code>test_samples/LegacySparkJob.java:76</code><pre>SimpleDateFormat sdf = SimpleDateFormat.getInstance();</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [JDK-055] Changed: Default charset</strong>
+            <p>Default charset is UTF-8 in JDK 18+; affects file I/O.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Explicitly specify charset: new FileReader(file, StandardCharsets.UTF_8)</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:51</code><pre>FileReader reader = new FileReader("/path/to/file");</pre></li>
+                <li><code>test_samples/LegacySparkJob.java:52</code><pre>FileWriter writer = new FileWriter("/path/to/output");</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#17a2b8">
+            <strong><span class="severity-badge" style="background:#17a2b8">LOW</span> [JDK-056] Deprecated: Primitive wrapper constructors</strong>
+            <p>Constructors like new Integer(x) deprecated; use valueOf().</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use Integer.valueOf(), autoboxing, or static factory methods</div>
+            <p><strong>Found in 4 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/LegacySparkJob.java:57</code><pre>Integer i = new Integer(42);</pre></li>
+                <li><code>test_samples/LegacySparkJob.java:58</code><pre>Long l = new Long(100L);</pre></li>
+                <li><code>test_samples/LegacySparkJob.java:59</code><pre>Double d = new Double(3.14);</pre></li>
+                <li><code>test_samples/LegacySparkJob.java:60</code><pre>Boolean b = new Boolean(true);</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#6c757d">
+            <strong><span class="severity-badge" style="background:#6c757d">INFO</span> [JDK-060] Changed: Text blocks</strong>
+            <p>Text blocks finalized in JDK 15.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Text blocks are production-ready in JDK 15+</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:3</code><pre>"""</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:5</code><pre>"""</pre></li>
+            </ul>
+        </div>
+        <h3>Python 2 to 3 Migration (93 issues)</h3>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-040] Changed: Relative imports</strong>
+            <p>Implicit relative imports removed; use explicit relative imports.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use explicit relative imports: from . import module</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:4</code><pre>from pyspark import SparkContext, SQLContext</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:20</code><pre>from pyspark import SparkContext</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-102] Changed: Octal literals</strong>
+            <p>Octal literals must use 0o prefix.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use 0o prefix for octal: 0o755 instead of 0755</div>
+            <p><strong>Found in 30 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/sample_spark_app.py:10</code><pre># Issue SPARK-001: SQLContext usage</pre></li>
+                <li><code>test_samples/sample_spark_app.py:14</code><pre># Issue SPARK-003: registerTempTable</pre></li>
+                <li><code>test_samples/sample_spark_app.py:23</code><pre># Issue SPARK-014: UDF without explicit return type</pre></li>
+                <li><code>test_samples/sample_spark_app.py:28</code><pre># Issue SQL-003: from_json without schema</pre></li>
+                <li><code>test_samples/sample_spark_app.py:32</code><pre># Issue SQL-004: to_date without format</pre></li>
+                <li><code>test_samples/sample_spark_app.py:35</code><pre># Issue S3-001, S3-003: HDFS and old S3 paths</pre></li>
+                <li><code>test_samples/sample_spark_app.py:40</code><pre># Issue S3-023: Append mode on S3</pre></li>
+                <li><code>test_samples/sample_spark_app.py:43</code><pre># Issue S3-050: Hardcoded AWS credentials</pre></li>
+                <li><code>test_samples/sample_spark_app.py:47</code><pre># Issue PERF-001: collect on potentially large dataset</pre></li>
+                <li><code>test_samples/sample_spark_app.py:50</code><pre># Issue PERF-003: Python UDF</pre></li>
+                <li><em>... and 20 more</em></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [PY-001] Syntax: print statement</strong>
+            <p>print is a function in Python 3, not a statement.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use print() function: print('message')</div>
+            <p><strong>Found in 9 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:24</code><pre>print "Hello World"</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:25</code><pre>print "Value:", x</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:28</code><pre>print >> sys.stderr, "Error message"</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:44</code><pre>print key, value</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:47</code><pre>print k</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:50</code><pre>print v</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:54</code><pre>print my_dict['foo']</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:67</code><pre>print "Error:", e</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:125</code><pre>print "Not equal"</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [PY-002] Syntax: print with >></strong>
+            <p>print >> syntax removed in Python 3.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use print(message, file=sys.stderr)</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:27</code><pre># PY-002: print >> syntax</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:28</code><pre>print >> sys.stderr, "Error message"</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-010] Changed: Integer division</strong>
+            <p>/ returns float in Python 3; use // for integer division.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use // for integer division; verify / behavior is intended</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:1</code><pre>#!/usr/bin/env python</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:102</code><pre>execfile('/path/to/script.py')</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:118</code><pre>f = file('/path/to/file', 'r')</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [PY-020] Removed: unicode() builtin</strong>
+            <p>unicode() removed; str is unicode in Python 3.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use str() instead of unicode()</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:31</code><pre>text = unicode("hello")</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:32</code><pre>text = unicode(data, 'utf-8')</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-021] Changed: basestring type</strong>
+            <p>basestring removed; use str instead.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use str instead of basestring</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:34</code><pre># PY-021: basestring</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:35</code><pre>if isinstance(value, basestring):</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [PY-030] Removed: xrange()</strong>
+            <p>xrange() removed; use range() in Python 3.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use range() instead of xrange()</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:39</code><pre>for i in xrange(100):</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [PY-032] Removed: dict.iterkeys()/itervalues()/iteritems()</strong>
+            <p>dict.iter* methods removed; use keys()/values()/items().</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use .keys()/.values()/.items() instead</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:43</code><pre>for key, value in my_dict.iteritems():</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:46</code><pre>for k in my_dict.iterkeys():</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:49</code><pre>for v in my_dict.itervalues():</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [PY-033] Removed: dict.has_key()</strong>
+            <p>dict.has_key() removed; use 'in' operator.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use 'key in dict' instead of dict.has_key(key)</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:53</code><pre>if my_dict.has_key('foo'):</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [PY-034] Changed: map/filter/zip return iterators</strong>
+            <p>map(), filter(), zip() return iterators in Python 3.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Wrap in list() if indexing needed: list(map(...))[0]</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:57</code><pre>first_result = map(lambda x: x*2, items)[0]</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:58</code><pre>filtered = filter(lambda x: x > 0, items)[1:3]</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-035] Removed: reduce() builtin</strong>
+            <p>reduce() moved to functools module.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use functools.reduce() or rewrite with explicit loop</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:61</code><pre>total = reduce(lambda a, b: a + b, numbers)</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-041] Renamed: ConfigParser module</strong>
+            <p>ConfigParser renamed to configparser (lowercase).</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: import configparser</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:9</code><pre>import ConfigParser</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-042] Renamed: Queue module</strong>
+            <p>Queue module renamed to queue (lowercase).</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: import queue</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:10</code><pre>import Queue</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-043] Renamed: SocketServer module</strong>
+            <p>SocketServer renamed to socketserver.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: import socketserver</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:11</code><pre>import SocketServer</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-044] Renamed: urllib/urllib2</strong>
+            <p>urllib and urllib2 reorganized in Python 3.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use urllib.request, urllib.parse, urllib.error</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:12</code><pre>import urllib2</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:13</code><pre>import urlparse</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-045] Renamed: httplib module</strong>
+            <p>httplib renamed to http.client.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: from http import client as httplib</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:14</code><pre>import httplib</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [PY-046] Renamed: cPickle module</strong>
+            <p>cPickle merged into pickle.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: import pickle (automatically optimized in Python 3)</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:15</code><pre>import cPickle</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-047] Renamed: StringIO module</strong>
+            <p>StringIO and cStringIO moved to io module.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: from io import StringIO, BytesIO</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:16</code><pre>import StringIO</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [PY-048] Renamed: thread module</strong>
+            <p>thread module renamed to _thread.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: import _thread or preferably threading module</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:17</code><pre>import thread</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-049] Renamed: Tkinter module</strong>
+            <p>Tkinter renamed to tkinter.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: import tkinter</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:18</code><pre>import Tkinter</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [PY-050] Syntax: except Exception, e</strong>
+            <p>Old except syntax removed; use 'as' keyword.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: except Exception as e:</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:66</code><pre>except Exception, e:</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [PY-051] Changed: raise syntax</strong>
+            <p>raise Exception, 'message' syntax removed.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: raise Exception('message')</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:70</code><pre>raise ValueError, "Invalid value"</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-052] Changed: StandardError base class</strong>
+            <p>StandardError removed; use Exception instead.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use Exception as base class</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:72</code><pre># PY-052: StandardError</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:73</code><pre>class MyError(StandardError):</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-060] Removed: cmp() builtin</strong>
+            <p>cmp() removed; use (a > b) - (a < b) pattern.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use comparison operators or functools.cmp_to_key()</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:77</code><pre>result = cmp(a, b)</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:82</code><pre>return cmp(self.value, other.value)</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-061] Removed: __cmp__ method</strong>
+            <p>__cmp__ removed; use __lt__, __eq__, etc.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Implement __lt__, __eq__, __le__, etc. or use @functools.total_ordering</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:81</code><pre>def __cmp__(self, other):</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#ffc107">
+            <strong><span class="severity-badge" style="background:#ffc107">MEDIUM</span> [PY-070] Changed: Old-style classes</strong>
+            <p>Old-style classes removed; all classes inherit from object.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Explicit object inheritance optional in Python 3 but recommended for clarity</div>
+            <p><strong>Found in 3 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:80</code><pre>class MyClass:</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:85</code><pre>class OldStyleClass:</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:90</code><pre>class WithMetaclass:</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-071] Changed: metaclass syntax</strong>
+            <p>__metaclass__ attribute doesn't work in Python 3.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: class Foo(metaclass=MyMeta):</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:91</code><pre>__metaclass__ = ABCMeta</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#6c757d">
+            <strong><span class="severity-badge" style="background:#6c757d">INFO</span> [PY-073] Changed: super() syntax</strong>
+            <p>super() can be called without arguments in Python 3.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Can simplify to super() in Python 3</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:96</code><pre>super(Child, self).__init__()</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [PY-080] Removed: raw_input()</strong>
+            <p>raw_input() renamed to input() in Python 3.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use input() instead of raw_input()</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:99</code><pre>name = raw_input("Enter name: ")</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-082] Removed: execfile()</strong>
+            <p>execfile() removed; use exec(open(f).read()).</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: exec(open(filename).read())</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:102</code><pre>execfile('/path/to/script.py')</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-083] Removed: reload() builtin</strong>
+            <p>reload() moved to importlib.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: importlib.reload(module)</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:105</code><pre>reload(my_module)</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-084] Removed: apply() builtin</strong>
+            <p>apply() removed; use func(*args, **kwargs).</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: func(*args, **kwargs)</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:108</code><pre>result = apply(func, args, kwargs)</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-085] Removed: long type</strong>
+            <p>long type removed; int handles arbitrary precision.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use int instead of long</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:111</code><pre>big_number = long(12345678901234567890)</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:112</code><pre>another = 123L</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-086] Removed: buffer() builtin</strong>
+            <p>buffer() removed; use memoryview().</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use memoryview() instead of buffer()</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:115</code><pre>buf = buffer(data, 0, 10)</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-090] Removed: file() builtin</strong>
+            <p>file() removed; use open().</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use open() instead of file()</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:118</code><pre>f = file('/path/to/file', 'r')</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [PY-100] Removed: Backtick repr</strong>
+            <p>Backticks for repr removed; use repr().</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use repr() instead of backticks</div>
+            <p><strong>Found in 1 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:121</code><pre>debug_str = `my_object`</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#dc3545">
+            <strong><span class="severity-badge" style="background:#dc3545">CRITICAL</span> [PY-101] Removed: <> comparison</strong>
+            <p><> operator removed; use != instead.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use != instead of <></div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:123</code><pre># PY-101: <> operator</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:124</code><pre>if a <> b:</pre></li>
+            </ul>
+        </div>
+        <div class="issue" style="border-color:#fd7e14">
+            <strong><span class="severity-badge" style="background:#fd7e14">HIGH</span> [PY-110] PySpark: Python 2 lambda syntax</strong>
+            <p>Python 2 lambda tuple unpacking doesn't work in Python 3.</p>
+            <div class="suggestion">💡 <strong>Suggestion:</strong> Use: lambda x: (x[0], x[1]) instead of lambda (a, b):</div>
+            <p><strong>Found in 2 location(s):</strong></p>
+            <ul>
+                <li><code>test_samples/legacy_python2_app.py:132</code><pre>rdd.map(lambda (k, v): k + v)</pre></li>
+                <li><code>test_samples/legacy_python2_app.py:144</code><pre>result = df.rdd.map(lambda (x, y): x + y).collect()</pre></li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>
