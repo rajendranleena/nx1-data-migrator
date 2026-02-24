@@ -275,7 +275,7 @@ Use stable, descriptive names because policy updates depend on deterministic nam
 ### 8) Identity integration note
 
 - This automation grants access through Keycloak realm roles mapped to groups/users.
-- The `groups` column represents Keycloak groups used in role assignment.
+- The `groups` column specifies Keycloak groups that will be mapped to the corresponding Keycloak role during automation. Ranger policy group assignments are determined by the role column, not the groups column.
 - External identity-provider groups must be synchronized/mapped into Keycloak before they can participate in this flow.
 
 ### 9) Operational checklist
