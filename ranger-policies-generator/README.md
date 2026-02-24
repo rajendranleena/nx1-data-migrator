@@ -24,6 +24,7 @@ The Excel file should have the following columns:
 | groups | Keycloak groups to assign the role | No | `engineering,data-team` |
 | users | Users to assign the role (users must already exist in Keycloak) | No | `alice,bob` |
 | rowfilter | Row-level filter expression for table policies only (optional, must not contain `;` or newlines) | No | `region = 'US'` |
+| policy_label | (Optional) Policy label(s) for Ranger policy. If provided, this value will be used as the policy label(s) in Ranger. | No | `label1,label2` |
 
 *Note:
 - Exactly one of `database` or `url` must be provided per row (not both, not neither).
@@ -31,36 +32,53 @@ The Excel file should have the following columns:
 - Rowfilters are only supported for table policies; URL-based rows with a rowfilter are skipped.
 *
 
+
+
 # Policy Name Generation
 
-1. **For all-database access (database=`*`):**
-    - Policy name: `iceberg`
-    - Example: `iceberg`
-2. **For database-level access (tables=*, columns=*):**
-    - Policy name: `iceberg.{database}`
-    - Example: `iceberg.sales`
-3. **For table-level access (columns=*):**
-    - Policy name: `iceberg.{database}.{table}`
-    - Example: `iceberg.sales.customers`
-4. **For column-level access:**
-    - Policy name: `iceberg.{database}.{table}.{column}`
-    - Example: `iceberg.finance.transactions.amount`
-5. **For URL-based policies:**
-    - Policy name: `{url}`
-    - Example: `s3a://ml-bucket/models/*`
+- If the `policy_label` column is provided and non-empty, its value will be used as the policy label(s) for that row in Ranger.
+- Otherwise, the default logic applies:
+    1. **For all-database access (database=`*`):**
+        - Policy name: `iceberg`
+        - Example: `iceberg`
+    2. **For database-level access (tables=*, columns=*):**
+        - Policy name: `iceberg.{database}`
+        - Example: `iceberg.sales`
+    3. **For table-level access (columns=*):**
+        - Policy name: `iceberg.{database}.{table}`
+        - Example: `iceberg.sales.customers`
+    4. **For column-level access:**
+        - Policy name: `iceberg.{database}.{table}.{column}`
+        - Example: `iceberg.finance.transactions.amount`
+    5. **For URL-based policies:**
+        - Policy name: `{url}`
+        - Example: `s3a://ml-bucket/models/*`
+
+### Best Practice: Trust Default Policy Name Generation
+
+The default policy name generation logic (`{catalog}.{database}.{table}.{column}`) ensures that all permissions and principals for the same resource are merged into a single policy. If multiple rows in your Excel input refer to the same resource, they will generate the same policy name. The automation will:
+- **Create** a new policy if the policy name does not exist yet.
+- **Update** the existing policy if the policy name already exists, merging new roles, permissions, groups, users, and rowfilters as needed.
+
+This prevents duplicate policies and keeps access definitions consolidated. Unless you have a specific need for a custom policy name, it is best practice to trust the default naming logic.
+
+**How does it work?**
+- The system checks if a policy name already exists in the internal policies dictionary.
+- If it exists, it updates the policy; if not, it creates a new one.
+- For example, if row 1 and row 100 both refer to the same resource, only one policy is created and all access is merged.
 
 
 ## Excel Sheet Sample
 
 The Excel file with sample values:
 ```
-| role           | database         | tables    | columns | url                        | permissions  | groups               | users         | rowfilter         |
-|----------------|------------------|-----------|---------|----------------------------|--------------|----------------------|---------------|-------------------|
-| data_analysts  | sales,marketing  | *         | *       |                            | read         | analysts,bi-team     | alice,bob     | region = 'US'     |
-| data_engineers | sales            | customers | *       |                            | read,write   | engineering          | carol         |                   |
-| data_engineers | raw_data         | *         | *       |                            | write        | engineering          |               |                   |
-| ml_team        |                  |           |         | s3a://ml-bucket/models/*   | read,write   | data-science         |               |                   |
-| finance_team   | finance          | transactions | amount,date |                     | read         | finance,accounting   | dave,erin     | dept = 'acct'     |
+| role           | database         | tables    | columns | url                        | permissions  | groups               | users         | rowfilter         | policy_label         |
+|----------------|------------------|-----------|---------|----------------------------|--------------|----------------------|---------------|-------------------|----------------------|
+| data_analysts  | sales,marketing  | *         | *       |                            | read         | analysts,bi-team     | alice,bob     | region = 'US'     | analytics,us         |
+| data_engineers | sales            | customers | *       |                            | read,write   | engineering          | carol         |                   | engineering          |
+| data_engineers | raw_data         | *         | *       |                            | write        | engineering          |               |                   | raw                  |
+| ml_team        |                  |           |         | s3a://ml-bucket/models/*   | read,write   | data-science         |               |                   | ml,models            |
+| finance_team   | finance          | transactions | amount,date |                     | read         | finance,accounting   | dave,erin     | dept = 'acct'     | finance,acct         |
 ```
 
 # Role, Group, and User Mapping Logic

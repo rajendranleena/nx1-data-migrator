@@ -23,10 +23,19 @@ import logging
 import string
 import secrets
 import os
-
+import copy 
 logger = logging.getLogger(__name__)
 
-
+def safe_deepcopy(obj):
+    if isinstance(obj, dict):
+        return {k: safe_deepcopy(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [safe_deepcopy(x) for x in obj]
+    elif isinstance(obj, tuple):
+        return tuple(safe_deepcopy(x) for x in obj)
+    else:
+        return obj
+    
 # Permission mappings
 class Permissions:
     """Standard permission sets for read/write access patterns."""
@@ -258,17 +267,27 @@ class RangerPolicyManager:
     
     def get_existing_policy(self, policy_name: str) -> Optional[Dict]:
         """
-        Get an existing policy by name.
-        
-        Args:
-            policy_name: Name of the policy
-            
-        Returns:
-            Policy dictionary if found, None otherwise
+        Get an existing policy by name using find_policies.
+        Returns the first matching policy dict if found, else None.
         """
         try:
-            return self.client.get_policy(self.service_name, policy_name)
-        except RangerServiceException:
+            logger.debug(f"Looking up existing policy with name: {policy_name} in service: {self.service_name}")
+            policies = self.client.find_policies({
+                'serviceName': self.service_name,
+                'policyName': policy_name
+            })
+            logger.debug(f"find_policies response for '{policy_name}': {policies}")
+            # Support both list and dict response (depends on client)
+            if isinstance(policies, dict) and 'policies' in policies:
+                policy_list = policies['policies']
+            else:
+                policy_list = policies
+            for p in policy_list:
+                logger.debug(f"Examining policy candidate: {p.get('name')}")
+                if p.get('name') == policy_name:
+                    logger.debug(f"Found matching policy: {p}")
+                    return p
+            logger.debug(f"No existing policy found for name: {policy_name}")
             return None
         except Exception as e:
             logger.error(f"Error checking for existing policy {policy_name}: {e}")
@@ -282,7 +301,8 @@ class RangerPolicyManager:
         table: str,
         column: str,
         role_permissions: List[Dict[str, Any]],
-        description: Optional[str] = None
+        description: Optional[str] = None,
+        policy_labels: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         Create or update a table-based policy.
@@ -302,61 +322,68 @@ class RangerPolicyManager:
         try:
             logger.debug(f"create_table_policy called: policy_name={policy_name}, schema={schema}, table={table}, column={column}")
             logger.debug(f"role_permissions: {role_permissions}")
-            
             role_permissions_with_policy_context = [{**rp, 'policy_name': policy_name} for rp in role_permissions]
-
             # Build policy items and row filter items separately
             policy_items = self._build_policy_items(role_permissions_with_policy_context)
             row_filter_items = self._build_row_filter_items(role_permissions)
-
+            logger.debug(f"Policy items built: {policy_items}")
+            logger.debug(f"Row filter items built: {row_filter_items}")
             if not policy_items:
+                logger.error(f"No supported access types remain for policy '{policy_name}' after filtering unsupported permissions")
                 raise ValueError(
                     f"No supported access types remain for policy '{policy_name}' after filtering unsupported permissions"
                 )
-            
             logger.debug(f"Built {len(policy_items)} policy items and {len(row_filter_items)} row filter items")
-            
             # Build resources
-            # Include both the tag (if different from catalog) and the catalog in values
             catalog_values = list(set([catalog]))
             if catalog != 'iceberg':
                 catalog_values.append('iceberg')
-            
             resources = {
                 'catalog': RangerPolicyResource({'values': catalog_values}),
                 'schema': RangerPolicyResource({'values': [schema]}),
                 'table': RangerPolicyResource({'values': [table]}),
                 'column': RangerPolicyResource({'values': [column]})
             }
-            
-            # When there are row filters, create TWO separate policies:
-            # 1. Access Policy (policyType 0) - grants SELECT permission
-            # 2. Row Filter Policy (policyType 2) - applies the SQL filter
-            # This avoids Ranger warnings about missing access policies
+            logger.debug(f"Resources built for policy: {resources}")
             if row_filter_items:
+                # ============================================================
+                # CASE 1: Row Filters Present → Create Separate Policies
+                # ============================================================
                 logger.info(f"Row filters detected. Creating separate Access and Row Filter policies")
-                
-                # Create/update Access Policy (without column resource)
                 access_policy_name = policy_name
-                resources_for_access = {k: v for k, v in resources.items() if k != 'column'}
-                
+                resources_for_access = safe_deepcopy({k: v for k, v in resources.items() if k != "column"})
+                logger.debug(f"Resources for access policy: {resources_for_access}")
                 existing_access_policy = self.get_existing_policy(access_policy_name)
                 if existing_access_policy:
-                    result_access = self._update_policy(existing_access_policy, resources_for_access, policy_items, [], None)
+                    logger.debug(f"Updating existing access policy: {existing_access_policy}")
+                    result_access = self._update_policy(
+                        existing_access_policy, resources_for_access, policy_items, [], None,
+                        policy_labels=policy_labels
+                    )
                 else:
-                    result_access = self._create_policy(access_policy_name, resources_for_access, policy_items, [], None)
-                
-                # Create/update Row Filter Policy (separate policy, also without column resource)
+                    logger.debug(f"Creating new access policy: {access_policy_name}")
+                    result_access = self._create_policy(
+                        access_policy_name, resources_for_access, policy_items, [], None,
+                        policy_labels=policy_labels
+                    )
                 rowfilter_policy_name = f"{policy_name}__rowfilter"
-                resources_for_rowfilter = {k: v for k, v in resources.items() if k != 'column'}
-                
+                resources_for_rowfilter = safe_deepcopy({k: v for k, v in resources.items() if k != "column"})
+                logger.debug(f"Resources for rowfilter policy: {resources_for_rowfilter}")
                 existing_rowfilter_policy = self.get_existing_policy(rowfilter_policy_name)
                 if existing_rowfilter_policy:
-                    result_rowfilter = self._update_policy(existing_rowfilter_policy, resources_for_rowfilter, [], row_filter_items, description)
+                    logger.debug(f"Updating existing rowfilter policy: {existing_rowfilter_policy}")
+                    result_rowfilter = self._update_policy(
+                        existing_rowfilter_policy, resources_for_rowfilter, [], row_filter_items, description,
+                        policy_labels=policy_labels
+                    )
                 else:
-                    result_rowfilter = self._create_policy(rowfilter_policy_name, resources_for_rowfilter, [], row_filter_items, description)
-                
-                # Return with both policy IDs
+                    logger.debug(f"Creating new rowfilter policy: {rowfilter_policy_name}")
+                    result_rowfilter = self._create_policy(
+                        rowfilter_policy_name, resources_for_rowfilter, [], row_filter_items, description,
+                        policy_labels=policy_labels
+                    )
+                logger.debug(f"Access policy result: {result_access}")
+                logger.debug(f"Rowfilter policy result: {result_rowfilter}")
                 return {
                     'status': result_access.get('status'),
                     'policy_name': policy_name,
@@ -365,15 +392,24 @@ class RangerPolicyManager:
                     'rowfilter_policy_id': result_rowfilter.get('policy_id')
                 }
             else:
-                # No row filters - create single Access Policy
-                resources_for_policy = resources
-                
+                # ============================================================
+                # CASE 2: Single Access Policy (No Row Filters)
+                # ============================================================    
+                resources_for_policy = safe_deepcopy(resources)
+                logger.debug(f"Resources for single access policy: {resources_for_policy}")
                 existing_policy = self.get_existing_policy(policy_name)
                 if existing_policy:
-                    return self._update_policy(existing_policy, resources_for_policy, policy_items, [], description)
+                    logger.debug(f"Updating existing policy: {existing_policy}")
+                    return self._update_policy(
+                        existing_policy, resources_for_policy, policy_items, [], description,
+                        policy_labels=policy_labels
+                    )
                 else:
-                    return self._create_policy(policy_name, resources_for_policy, policy_items, [], description)
-                
+                    logger.debug(f"Creating new policy: {policy_name}")
+                    return self._create_policy(
+                        policy_name, resources_for_policy, policy_items, [], description,
+                        policy_labels=policy_labels
+                    )
         except Exception as e:
             logger.error(f"Failed to create/update policy {policy_name}: {e}")
             return {
@@ -387,7 +423,8 @@ class RangerPolicyManager:
         policy_name: str,
         url: str,
         role_permissions: List[Dict[str, Any]],
-        description: Optional[str] = None
+        description: Optional[str] = None,
+        policy_labels: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         Create or update a URL-based policy.
@@ -425,10 +462,16 @@ class RangerPolicyManager:
             
             if existing_policy:
                 # Update existing policy
-                return self._update_policy(existing_policy, resources, policy_items, row_filter_items, description)
+                return self._update_policy(
+                    existing_policy, resources, policy_items, row_filter_items, description,
+                    policy_labels=policy_labels
+                )
             else:
                 # Create new policy
-                return self._create_policy(policy_name, resources, policy_items, row_filter_items, description)
+                return self._create_policy(
+                    policy_name, resources, policy_items, row_filter_items, description,
+                    policy_labels=policy_labels
+                )
                 
         except Exception as e:
             logger.error(f"Failed to create/update URL policy {policy_name}: {e}")
@@ -456,11 +499,15 @@ class RangerPolicyManager:
             policy_name = rp.get('policy_name')
             permissions = rp.get('permissions', ['read'])
 
+            logger.debug(f"Building policy item: role={role}, policy_name={policy_name}, permissions={permissions}")
+
             # Expand permissions to access types
             access_types = set()
             for perm in permissions:
                 access_types.update(Permissions.get_access_types(perm))
+            logger.debug(f"Expanded access_types for role '{role}': {access_types}")
             access_types = self._filter_access_types(access_types, role, policy_name)
+            logger.debug(f"Filtered access_types for role '{role}': {access_types}")
             if not access_types:
                 logger.warning(
                     "Skipping role '%s' in policy '%s' because no supported access types remain after filtering",
@@ -471,17 +518,13 @@ class RangerPolicyManager:
 
             allow_item = RangerPolicyItem()
             # Add role as Ranger group (NOT Keycloak groups)
-            if self._is_valid_role_name(role):
-                allow_item.groups = [role]
-            else:
-                allow_item.groups = []
-            # Strict RBAC: do not grant direct user access in Ranger policies
+            allow_item.groups = [role] if self._is_valid_role_name(role) else []
             allow_item.users = []
-
-            allow_item.conditions = []
-            allow_item.accesses = [
-                RangerPolicyItemAccess({'type': a}) for a in access_types
-            ]
+            allow_item.accesses = [RangerPolicyItemAccess({'type': a}) for a in access_types]
+            allow_item.delegateAdmin = False
+            # Remove roles and conditions keys if present
+            # Only keep groups, users, accesses, delegateAdmin
+            logger.debug(f"Final policy item: groups={allow_item.groups}, users={allow_item.users}, accesses={[a.type for a in allow_item.accesses]}, delegateAdmin={allow_item.delegateAdmin}")
             policy_items.append(allow_item)
         return policy_items
     
@@ -535,7 +578,8 @@ class RangerPolicyManager:
         resources: Dict,
         policy_items: List[RangerPolicyItem],
         row_filter_items: List[Dict[str, Any]],
-        description: Optional[str]
+        description: Optional[str],
+        policy_labels: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """Create a new policy."""
         policy = RangerPolicy()
@@ -544,38 +588,31 @@ class RangerPolicyManager:
         policy.description = description or f"Auto-generated policy: {policy_name}"
         policy.resources = resources
         policy.policyItems = policy_items
-        # Add row filter items if present
         if row_filter_items:
             policy.rowFilterPolicyItems = row_filter_items
-            policy.policyType = 2  # policyType 2 = Row Filter policy (must be set for UI to display in Row Filter tab)
+            policy.policyType = 2
             logger.debug(f"Added {len(row_filter_items)} row filter items to policy '{policy_name}'")
             logger.debug(f"Row filter items: {row_filter_items}")
         else:
-            policy.policyType = 0  # policyType 0 = Access policy
-        
+            policy.policyType = 0
+        # Add policy labels if provided
+        if policy_labels:
+            policy.policyLabels = policy_labels
+            logger.debug(f"Added policyLabels to policy '{policy_name}': {policy_labels}")
         logger.debug(f"Creating policy '{policy_name}' for service '{self.service_name}'")
         logger.debug(f"Resources: {resources}")
-        logger.debug(f"Policy items: {[{'groups': item.groups, 'accesses': [a.type for a in item.accesses]} for item in policy_items]}")
+        logger.debug(f"Policy items before API call: {[{'groups': item.groups, 'accesses': [a.type for a in item.accesses]} for item in policy_items]}")
         logger.debug(f"Policy object before sending: service={policy.service}, name={policy.name}, policyItems={len(policy.policyItems)}, rowFilterPolicyItems={len(policy.rowFilterPolicyItems) if hasattr(policy, 'rowFilterPolicyItems') and policy.rowFilterPolicyItems else 0}")
-        
+        logger.debug(f"Policy payload: {policy.__dict__}")
         try:
             logger.debug(f"Sending create_policy request to Ranger at {self.ranger_url} for service {self.service_name}")
             created_policy = self.client.create_policy(policy)
-            # Check if response is None (indicates silent failure)
             if created_policy is None:
                 logger.error(f"create_policy returned None for policy '{policy_name}' - this typically indicates SSL/network issues or Ranger server problems")
                 raise RuntimeError(f"Ranger API returned None when creating policy '{policy_name}'. The policy was not created in Ranger backend. Check Ranger server logs for more information")
-            
-            policy_id = created_policy.id if hasattr(created_policy, 'id') else None
-            
-            logger.debug(f"API Response type: {type(created_policy)}")
-            logger.debug(f"API Response attributes: {dir(created_policy)}")
-            logger.debug(f"API Response str: {str(created_policy)}")
-            logger.debug(f"API Response repr: {repr(created_policy)}")
-            
+            policy_id = getattr(created_policy, 'id', None)
             logger.info(f"Created policy: {policy_name} (ID: {policy_id})")
             logger.debug(f"Policy creation response: {created_policy}")
-            
             return {
                 'status': 'created',
                 'policy_name': policy_name,
@@ -584,119 +621,128 @@ class RangerPolicyManager:
         except Exception as e:
             logger.error(f"Policy creation failed for '{policy_name}': {e}", exc_info=True)
             raise
-    
+
     def _update_policy(
         self,
-        existing_policy: Dict,
-        resources: Dict,
-        policy_items: List[RangerPolicyItem],
-        row_filter_items: List[Dict[str, Any]],
-        description: Optional[str]
-    ) -> Dict[str, Any]:
+        existing_policy: dict,
+        resources: dict,
+        policy_items: list,
+        row_filter_items: list = None,
+        description: str = None,
+        policy_labels: list = None
+    ) -> dict:
         """
-        Update an existing policy, merging groups, users, and permissions.
+        Update an existing policy, merging groups, users, and permissions safely.
+        Handles both dict and object access representations.
+        """   
+        def get_access_type(a):
+            """Return access type safely whether a is dict or object."""
+            if isinstance(a, dict):
+                return a.get('type')
+            return getattr(a, 'type', None)
 
-        Merge behavior:
-        - For each group in the new input, if the group exists in the policy, users and permissions are merged (union of old and new).
-        - For row filters, if a group exists, the filter expression and accesses are updated, but users are merged.
-        - No groups, users, or permissions are removed if they are not present in the new input.
-        - This ensures that policy updates are always additive and non-destructive unless explicitly overwritten.
-        """
         policy_name = existing_policy['name']
         policy_id = existing_policy['id']
+        logger.info(f"_update_policy called for policy_name={policy_name}, policy_id={policy_id}")
+        logger.info(f"Incoming resources: {resources}")        
+        merged_policy = safe_deepcopy(existing_policy)
 
-        # Update resources
-        existing_policy['resources'] = {
-            k: {'values': v.values if hasattr(v, 'values') else v.get('values', [])}
-            for k, v in resources.items()
-        }
-
-        # Build a mapping from group to item index for fast lookup
+        # Update resources safely
+        merged_policy['resources'] = safe_deepcopy(resources or {})
+        # Build group->item index mapping
         group_to_item = {}
-        existing_items = existing_policy.get('policyItems', [])
+        existing_items = merged_policy.get('policyItems', [])
         for idx, item in enumerate(existing_items):
             for group in item.get('groups', []):
                 group_to_item[group] = idx
 
-        # Merge or update policy items for each group in new policy_items
-        for new_item in policy_items:
-            for new_group in new_item.groups:
+        # Merge or append policy items
+        for new_item in policy_items or []:
+            for new_group in getattr(new_item, 'groups', []):
                 if new_group in group_to_item:
                     idx = group_to_item[new_group]
                     item = existing_items[idx]
-                    # Merge users (union)
+
+                    # Merge users
                     existing_users = set(item.get('users', []))
-                    new_users = set(new_item.users or [])
+                    new_users = set(getattr(new_item, 'users', []) or [])
                     item['users'] = list(existing_users | new_users)
-                    # Merge accesses (union of access types)
-                    existing_accesses = {a['type'] for a in item.get('accesses', [])}
-                    new_accesses = {a.type for a in new_item.accesses}
+
+                    # Merge accesses
+                    existing_accesses = {get_access_type(a) for a in item.get('accesses', []) if get_access_type(a)}
+                    new_accesses = {get_access_type(a) for a in getattr(new_item, 'accesses', []) or [] if get_access_type(a)}
                     merged_accesses = existing_accesses | new_accesses
                     item['accesses'] = [{'type': a, 'isAllowed': True} for a in merged_accesses]
+
                 else:
-                    # Add new group as new policy item
+                    # Append new group as new policy item
                     existing_items.append({
                         'groups': [new_group],
-                        'users': list(new_item.users or []),
-                        'roles': [],
-                        'conditions': [],
+                        'users': list(getattr(new_item, 'users', []) or []),
                         'accesses': [
-                            {'type': a.type, 'isAllowed': True}
-                            for a in new_item.accesses
+                            {'type': get_access_type(a), 'isAllowed': True}
+                            for a in getattr(new_item, 'accesses', []) or []
+                            if get_access_type(a)
                         ],
                         'delegateAdmin': False
                     })
                     group_to_item[new_group] = len(existing_items) - 1
 
-        existing_policy['policyItems'] = existing_items
+        merged_policy['policyItems'] = existing_items
 
-        # Merge row filter items (similar to policy items merging)
+        # Merge row filter items
         if row_filter_items:
-            # Build a mapping from groups to existing row filter items
             group_to_rowfilter = {}
-            existing_rowfilters = existing_policy.get('rowFilterPolicyItems', [])
+            existing_rowfilters = merged_policy.get('rowFilterPolicyItems', [])
             for idx, item in enumerate(existing_rowfilters):
                 for group in item.get('groups', []):
                     group_to_rowfilter[group] = idx
-
-            # Merge or add new row filter items
+    
             for new_item in row_filter_items:
-                groups = new_item.get('groups', [])
-                for group in groups:
+                for group in new_item.get('groups', []):
                     if group in group_to_rowfilter:
-                        # Update existing row filter item for this group
                         idx = group_to_rowfilter[group]
                         existing_item = existing_rowfilters[idx]
-                        # Merge users (union)
                         existing_users = set(existing_item.get('users', []))
                         new_users = set(new_item.get('users', []))
                         existing_item['users'] = list(existing_users | new_users)
-                        # Update filter expression and accesses
                         existing_item['accesses'] = new_item.get('accesses', [])
                         existing_item['rowFilterInfo'] = new_item.get('rowFilterInfo', {})
                     else:
-                        # Add new row filter item
                         existing_rowfilters.append(new_item)
-                        for group in groups:
+                        for group in new_item.get('groups', []):
                             group_to_rowfilter[group] = len(existing_rowfilters) - 1
 
-            existing_policy['rowFilterPolicyItems'] = existing_rowfilters
-            existing_policy['policyType'] = 2  # policyType 2 = Row Filter policy
-            logger.debug(f"Merged {len(row_filter_items)} row filter items for policy '{policy_name}'")
+            merged_policy['rowFilterPolicyItems'] = existing_rowfilters
+            merged_policy['policyType'] = 2
         else:
-            # No row filters in new policy
-            if 'rowFilterPolicyItems' in existing_policy:
-                # Keep existing row filters if none provided (don't delete them)
-                logger.debug(f"No new row filters provided, keeping existing row filters for policy '{policy_name}'")
-                existing_policy['policyType'] = 2  # Keep as row filter policy if it has row filters
-            else:
-                existing_policy['policyType'] = 0  # Access policy only
+            # Keep policyType as Access-only if no row filters
+            merged_policy['policyType'] = 0 if 'rowFilterPolicyItems' not in merged_policy else 2
+
+        # Update description if provided
         if description:
-            existing_policy['description'] = description
+            merged_policy['description'] = description
 
-        self.client.update_policy(self.service_name, policy_id, existing_policy)
-        logger.info(f"Updated policy: {policy_name}")
-
+        # Merge policy labels
+        if policy_labels:
+            merged_policy['policyLabels'] = list(set(merged_policy.get('policyLabels', [])) | set(policy_labels))
+        merged_policy["id"] = policy_id
+        merged_policy["service"] = self.service_name
+        policy_obj = RangerPolicy()
+        for key, value in merged_policy.items():
+            setattr(policy_obj, key, value)
+    
+        policy_obj.id = policy_id
+        policy_obj.service = self.service_name
+        try:
+            logger.debug(f"Sending update_policy request for policy '{policy_name}' (id={policy_id}) using RangerPolicy object (attribute assignment)")
+            self.client.update_policy_by_id(policy_id, policy_obj)
+            logger.info(f"Updated policy: {policy_name}")
+        except Exception as e:
+            logger.error(f"Update failed for policy {policy_name} (id={policy_id}): {e}")
+            raise   
+        updated_policy = self.client.get_policy_by_id(policy_id)
+        logger.info(f"Policy from Ranger after update: {updated_policy}")
         return {
             'status': 'updated',
             'policy_name': policy_name,
@@ -830,11 +876,14 @@ class RangerPolicyManager:
                 })
                 continue
             
+            label_val = policy_config.get('label')
+            policy_labels = label_val if isinstance(label_val, list) else ([label_val] if label_val else None)
             if policy_type == 'url':
                 result = self.create_url_policy(
                     policy_name=policy_name,
                     url=policy_config.get('url', ''),
-                    role_permissions=valid_role_permissions
+                    role_permissions=valid_role_permissions,
+                    policy_labels=policy_labels
                 )
             else:
                 result = self.create_table_policy(
@@ -843,7 +892,8 @@ class RangerPolicyManager:
                     schema=policy_config.get('schema', '*'),
                     table=policy_config.get('table', '*'),
                     column=policy_config.get('column', '*'),
-                    role_permissions=valid_role_permissions
+                    role_permissions=valid_role_permissions,
+                    policy_labels=policy_labels
                 )
             
             status = result.get('status', 'failed')

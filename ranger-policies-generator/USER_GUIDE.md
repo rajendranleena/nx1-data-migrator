@@ -1,3 +1,5 @@
+
+
 # Ranger Policy Automation - User Guide
 
 This guide is for security administrators, data stewards, or anyone responsible for authoring the Excel input and running the Ranger policy automation.
@@ -29,6 +31,7 @@ Your Excel sheet must include these columns (case-insensitive):
 | `groups` | Keycloak groups to map to the role | No | `finance,bi-team` |
 | `users` | Keycloak users to map to the role | No | `alice,bob` |
 | `rowfilter` | SQL row filter for table policies only | No | `region = 'US'` |
+| `policy_label` | (Optional) Policy label(s) for Ranger policy. If provided, this value will be used as the policy label(s) in Ranger. | No | `label1,label2` |
 
 `*` Exactly one of `database` or `url` must be provided in each row:
 - `database` set and `url` empty ✅
@@ -76,16 +79,31 @@ If all roles are skipped, that policy is marked failed.
 
 ---
 
+
 ## Policy naming
 
-### Table-based rows (`database` mode)
-- `database='*'` -> `iceberg`
-- database only -> `iceberg.<database>`
-- database + table -> `iceberg.<database>.<table>`
-- database + table + column -> `iceberg.<database>.<table>.<column>`
+- If the `policy_label` column is provided and non-empty, its value will be used as the policy label(s) for that row in Ranger.
+- Otherwise, the default logic applies:
+  - Table-based rows (`database` mode):
+    - `database='*'` -> `iceberg`
+    - database only -> `iceberg.<database>`
+    - database + table -> `iceberg.<database>.<table>`
+    - database + table + column -> `iceberg.<database>.<table>.<column>`
+  - URL-based rows (`url` mode):
+    - policy name is the URL string itself
 
-### URL-based rows (`url` mode)
-- policy name is the URL string itself
+### Best Practice: Trust Default Policy Name Generation
+
+The default policy name generation logic (`{catalog}.{database}.{table}.{column}`) ensures that all permissions and principals for the same resource are merged into a single policy. If multiple rows in your Excel input refer to the same resource, they will generate the same policy name. The automation will:
+- **Create** a new policy if the policy name does not exist yet.
+- **Update** the existing policy if the policy name already exists, merging new roles, permissions, groups, users, and rowfilters as needed.
+
+This prevents duplicate policies and keeps access definitions consolidated. Unless you have a specific need for a custom policy name, it is best practice to trust the default naming logic.
+
+**How does it work?**
+- The system checks if a policy name already exists in the internal policies dictionary.
+- If it exists, it updates the policy; if not, it creates a new one.
+- For example, if row 1 and row 100 both refer to the same resource, only one policy is created and all access is merged.
 
 ---
 
@@ -99,14 +117,18 @@ This is expected and both can appear in status/report outputs.
 
 ---
 
+
 ## Example Excel rows
 
-| role | database | tables | columns | url | permissions | groups | users | rowfilter |
-|---|---|---|---|---|---|---|---|---|
-| `data_analysts` | `sales` | `*` | `*` |  | `read` | `analytics` | `alice,bob` | `region = 'US'` |
-| `etl_engineers` | `raw` | `*` | `*` |  | `write` | `engineering` |  |  |
-|  | `finance` | `transactions` | `amount` |  | `read` |  | `dave` | `dept = 'acct'` |
-| `ml_team` |  |  |  | `s3a://ml-bucket/models/*` | `read,write` | `data-science` |  |  |
+| role           | database | tables | columns | url | permissions | groups | users | rowfilter | policy_label           |
+|----------------|----------|--------|---------|-----|-------------|--------|-------|-----------|------------------------|
+| `data_analysts`| `sales`  | `*`    | `*`     |     | `read`      | `analytics` | `alice,bob` | `region = 'US'` | analytics,us             |
+| `etl_engineers`| `raw`    | `*`    | `*`     |     | `write`     | `engineering` |           |                   | engineering              |
+|                | `finance`| `transactions` | `amount` | | `read` |        | `dave`| `dept = 'acct'` | finance,acct             |
+| `ml_team`      |          |        |         | `s3a://ml-bucket/models/*` | `read,write` | `data-science` | | | ml,models              |
+| `custom_team`  | `hr`     | `employees` | `salary` | | `read` | `hr-group` | `eve` |           | hr,salary               |
+
+In the last row, the `policy_name` column is used to explicitly set the policy name to `custom_policy_hr_salary` for that policy. For all other rows, the default naming logic applies.
 
 ---
 
