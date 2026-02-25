@@ -367,6 +367,7 @@ def init_tracking_tables(spark) -> dict:
                 validation_duration_seconds DOUBLE,
                 dest_hive_row_count BIGINT,
                 source_partition_count INT,
+                unregistered_partitions BOOLEAN,
                 dest_partition_count INT,
                 row_count_match BOOLEAN,
                 partition_count_match BOOLEAN,
@@ -682,24 +683,37 @@ for tbl in table_list:
             ).collect()[0].c
         except:
             pass
+            
+        partition_cols_from_describe = []
+        in_partition_section = False
+        for row in desc_rows:
+            col_name = (row.col_name or "").strip()
+            if col_name == "# Partition Information":
+                in_partition_section = True
+                continue
+            if in_partition_section and col_name == "# col_name":
+                continue
+            if in_partition_section and col_name.startswith("#"):
+                break
+            if in_partition_section and col_name:
+                partition_cols_from_describe.append(col_name)
+
+        partition_definition = len(partition_cols_from_describe) > 0
+        partition_columns = ",".join(partition_cols_from_describe)
         
         partitions = []
-        partition_columns = ""
-        is_partitioned = False
+        registered_partition_count = 0
         try:
             parts_df = spark.sql(
                 "SHOW PARTITIONS {{0}}.{{1}}".format(src_db, tbl)
             )
             partitions = [row.partition for row in parts_df.collect()]
-            is_partitioned = len(partitions) > 0
-            
-            if partitions:
-                first_part = partitions[0]
-                partition_columns = ",".join(
-                    [p.split("=")[0] for p in first_part.split("/")]
-                )
+            registered_partition_count = len(partitions)
         except:
             pass
+
+        is_partitioned = partition_definition
+        unregistered_partitions = partition_definition and registered_partition_count == 0
         
         schema_df = spark.sql(
             "DESCRIBE {{0}}.{{1}}".format(src_db, tbl)
@@ -730,6 +744,7 @@ for tbl in table_list:
             "partition_count": len(partitions),
             "row_count": row_count,
             "is_partitioned": is_partitioned,
+            "unregistered_partitions": unregistered_partitions,
             "table_type": table_type,
             "source_total_size_bytes": source_total_size,
             "source_file_count": source_file_count
@@ -750,6 +765,7 @@ for tbl in table_list:
             "partition_count": 0,
             "row_count": 0,
             "is_partitioned": False,
+            "unregistered_partitions": False,
             "table_type": "UNKNOWN",
             "source_total_size_bytes": 0,
             "source_file_count": 0,
@@ -892,6 +908,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     source_total_size_bytes = {source_total_size},
                     source_file_count = {source_file_count},
                     source_partition_count = {t.get('partition_count', 0)}, 
+                    unregistered_partitions = {str(t.get('unregistered_partitions', False)).lower()},
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
                   AND source_database = '{t['source_database']}'
@@ -906,7 +923,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     partition_count, is_partitioned, schema_json, partitions_json,
                     partition_columns, table_type, source_row_count,
                     source_total_size_bytes, source_file_count,
-                    source_partition_count,
+                    source_partition_count, unregistered_partitions,
                     s3_total_size_bytes_before, s3_file_count_before,
                     s3_total_size_bytes_after, s3_file_count_after,
                     s3_bytes_transferred, s3_files_transferred,
@@ -930,7 +947,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     '{schema_json}', '{parts_json}', '{t.get('partition_columns', '')}',
                     '{table_type}', {row_count},
                     {source_total_size}, {source_file_count},
-                    {t.get('partition_count', 0)}, 
+                    {t.get('partition_count', 0)}, {str(t.get('unregistered_partitions', False)).lower()},
                     NULL, NULL, NULL, NULL, NULL, NULL,
                     NULL, NULL,
                     'COMPLETED', current_timestamp(), {discovery_duration},
@@ -2349,10 +2366,7 @@ def generate_html_report(run_id: str, spark) -> str:
     output_stream.write(html.encode('utf-8'))
     output_stream.close()
     
-    return {
-        'report_path': report_path,
-        'html_content': html
-    }
+    return {'report_path': report_path}
 
 
 @task.pyspark(conn_id='spark_default')
@@ -2430,14 +2444,30 @@ def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict
         return {'sent': False, 'reason': 'no_recipients'}
 
     recipients = [r.strip() for r in recipients_str.split(',') if r.strip()]
-
-    html_content = report_result.get('html_content', '')
     report_path = report_result.get('report_path', '')
 
     try:
         import tempfile
         import os
         from airflow.utils.email import send_email
+
+        logger.info(f"[Email] Reading HTML report from S3: {report_path}")
+        hadoop_conf = spark._jsc.hadoopConfiguration()
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark._jvm.java.net.URI(report_path),
+            hadoop_conf
+        )
+        s3_path_obj = spark._jvm.org.apache.hadoop.fs.Path(report_path)
+        reader = spark._jvm.java.io.BufferedReader(
+            spark._jvm.java.io.InputStreamReader(fs.open(s3_path_obj), "UTF-8")
+        )
+        lines = []
+        line = reader.readLine()
+        while line is not None:
+            lines.append(line)
+            line = reader.readLine()
+        reader.close()
+        html_content = "\n".join(lines)
 
         tmp = tempfile.NamedTemporaryFile(
             mode='w', suffix='.html',
@@ -3569,10 +3599,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
     output_stream.write(html.encode('utf-8'))
     output_stream.close()
     
-    return {
-        'report_path': report_path,
-        'html_content': html
-    }
+    return {'report_path': report_path}
 
 
 @task.pyspark(conn_id='spark_default')
@@ -3646,11 +3673,27 @@ def send_iceberg_report_email(report_result: dict, run_id: str, spark) -> dict:
         return {'sent': False, 'reason': 'no_recipients'}
 
     recipients = [r.strip() for r in recipients_str.split(',') if r.strip()]
-
-    html_content = report_result.get('html_content', '')
     report_path = report_result.get('report_path', '')
 
     try:
+        logger.info(f"[Email] Reading Iceberg HTML report from S3: {report_path}")
+        hadoop_conf = spark._jsc.hadoopConfiguration()
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark._jvm.java.net.URI(report_path),
+            hadoop_conf
+        )
+        s3_path_obj = spark._jvm.org.apache.hadoop.fs.Path(report_path)
+        reader = spark._jvm.java.io.BufferedReader(
+            spark._jvm.java.io.InputStreamReader(fs.open(s3_path_obj), "UTF-8")
+        )
+        lines = []
+        line = reader.readLine()
+        while line is not None:
+            lines.append(line)
+            line = reader.readLine()
+        reader.close()
+        html_content = "\n".join(lines)
+
         tmp = tempfile.NamedTemporaryFile(
             mode='w', suffix='.html',
             prefix=f'{run_id}_iceberg_report_',
