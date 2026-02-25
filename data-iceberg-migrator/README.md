@@ -328,7 +328,7 @@ cleanup_edge (SSH: Cleanup temp files)
   - **Schema** - Column names and data types
   - **Location** - Source filesystem path (MapR-FS or HDFS)
   - **Format** - Parquet, ORC, or Avro (detected from InputFormat)
-  - **Partitions** - Partition spec and count (via `SHOW PARTITIONS`)
+  - **Partitions** - Partition spec and count (via `DESCRIBE FORMATTED`)
   - **Partition columns** - Extracted from table metadata
 - Generates JSON output with all discovered metadata
 - Determines S3 destination path: `{bucket}/{dest_database}/{table_name}`
