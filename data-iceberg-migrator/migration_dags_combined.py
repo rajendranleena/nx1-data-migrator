@@ -2707,11 +2707,11 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                 src_partitions_df = spark.sql(f"SHOW PARTITIONS {src_db}.{tbl}")
                 all_partitions = src_partitions_df.collect()
 
-                if not inplace and all_partitions:
+                if all_partitions:
                     non_empty_count = 0
                     table_location = tbl_meta.get('location') or ''
                     for part_row in all_partitions:
-                        part_spec = part_row[0]   # e.g. "dt=2024-01-01/country=US"
+                        part_spec = part_row[0]   
                         part_path = f"{table_location}/{part_spec.replace('=', '=').rstrip('/')}"
                         try:
                             from py4j.java_gateway import java_import
@@ -2726,17 +2726,15 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                                 if int(summary.getLength()) > 0:
                                     non_empty_count += 1
                         except Exception:
-                            # If we can't check, count it conservatively
                             non_empty_count += 1
                     src_hive_partition_count = non_empty_count
                     logger.info(
                         f"[IcebergMigrate] {src_db}.{tbl} | "
+                        f"strategy={'INPLACE' if inplace else 'SNAPSHOT'} | "
                         f"total_hive_partitions={len(all_partitions)} | "
                         f"non_empty_partitions={non_empty_count} "
-                        f"(snapshot skips 0-byte partitions)"
+                        f"(0-byte partitions excluded from comparison)"
                     )
-                else:
-                    src_hive_partition_count = len(all_partitions)
             except:
                 pass 
 
