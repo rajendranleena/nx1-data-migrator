@@ -453,13 +453,13 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         src_db = str(row.get('database', '')).strip() if row.get('database') is not None else ''
         if not src_db:
             continue
-        
+
         tbl_pattern = str(row.get('table', '*')).strip() if row.get('table') is not None else '*'
         tbl_pattern = tbl_pattern or '*'
-        
+
         dest_db = str(row.get('dest_database', '')).strip() if row.get('dest_database') is not None else ''
         dest_db = dest_db or src_db
-        
+
         bucket_val = str(row.get('bucket', '')).strip() if row.get('bucket') is not None else ''
         bucket_val = bucket_val or config['default_s3_bucket']
         if bucket_val.startswith('s3n://'):
@@ -469,7 +469,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         elif not bucket_val.startswith('s3a://'):
             bucket_val = f"s3a://{bucket_val}"
         logger.info(f"[ParseExcel] Normalised bucket to: {bucket_val}")
-        
+
         configs.append({
             'source_database': src_db,
             'table_pattern': tbl_pattern,
@@ -584,26 +584,30 @@ echo "TEMP_DIR={temp_dir}"
 def discover_tables_via_spark_ssh(db_config: dict) -> dict:
     """Use Spark SQL via SSH on edge node to discover tables and metadata."""
     import json
-    
+    import uuid
+
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
-    
+
     run_id = db_config['run_id']
     src_db = db_config['source_database']
     pattern = db_config['table_pattern']
     dest_db = db_config['dest_database']
     dest_bucket = db_config['dest_bucket']
-    
+
+    unique_id = uuid.uuid4().hex[:8]
+    temp_dir = f"/tmp/discovery_{run_id}_{src_db}_{unique_id}"
+    script_path = f"{temp_dir}/discover_tables_{unique_id}.py"
+
     pyspark_script = '''
 import json
 import sys
 from pyspark.sql import SparkSession
 
-spark = SparkSession.builder \\
-    .appName("table_discovery_{run_id}_{src_db}") \\
-    .enableHiveSupport() \\
+spark = SparkSession.builder \
+    .appName("table_discovery_{run_id}_{src_db}_{unique_id}") \
+    .enableHiveSupport() \
     .getOrCreate()
-
 spark.sparkContext.setLogLevel("ERROR")
 
 src_db = "{src_db}"
@@ -611,15 +615,19 @@ pattern = "{pattern}"
 dest_db = "{dest_db}"
 dest_bucket = "{dest_bucket}"
 
+# Support comma-separated list of explicit table names
 if pattern == '*':
     tables_df = spark.sql("SHOW TABLES IN {{0}}".format(src_db))
+    table_list = [row.tableName for row in tables_df.collect()]
+elif ',' in pattern:
+    # Explicit list of table names
+    table_list = [t.strip() for t in pattern.split(',') if t.strip()]
 else:
     like_pattern = pattern.replace('*', '%')
     tables_df = spark.sql(
         "SHOW TABLES IN {{0}} LIKE '{{1}}'".format(src_db, like_pattern)
     )
-
-table_list = [row.tableName for row in tables_df.collect()]
+    table_list = [row.tableName for row in tables_df.collect()]
 
 metadata = []
 
@@ -785,36 +793,37 @@ spark.stop()
         src_db=src_db,
         pattern=pattern,
         dest_db=dest_db,
-        dest_bucket=dest_bucket
+        dest_bucket=dest_bucket,
+        unique_id=unique_id
     )
-        
+
     with ssh.get_conn() as client:
-        temp_dir = f"/tmp/discovery_{run_id}_{src_db}"
+        # Create unique temp dir
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
-        cmd_stdout.channel.recv_exit_status() 
-        
-        script_path = f"{temp_dir}/discover_tables.py"
+        cmd_stdout.channel.recv_exit_status()
+
+        # Write script to unique path
         sftp = client.open_sftp()
         with sftp.file(script_path, 'w') as f:
             f.write(pyspark_script)
         sftp.close()
 
         source_profile = "source ~/.profile 2>/dev/null || true\n"
-        
+
         # Use pyspark < script.py instead of spark-submit
         cmd = f"""
-{source_profile} cd {temp_dir}
-pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}.log
-"""
-        
+    {source_profile} cd {temp_dir}
+    pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{unique_id}.log
+    """
         _, stdout, stderr = client.exec_command(cmd, timeout=3600)
         exit_code = stdout.channel.recv_exit_status()
         output = stdout.read().decode()
         error_output = stderr.read().decode()
-        
+
         logger.info(f"=== Spark Discovery Output ===")
         logger.info(output[-1000:])
 
+        # Optionally clean up temp_dir after use
         # client.exec_command(f"rm -rf {temp_dir}", timeout=60)
 
         if exit_code != 0:
@@ -822,16 +831,16 @@ pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}.log
             logger.error(error_output)
             raise Exception(
                 f"Table discovery Spark job failed with exit code {exit_code}\n"
-                f"Error: {error_output[:1000]}\n" 
-                f"Output: {output[-500:]}" 
+                f"Error: {error_output[:1000]}\n"
+                f"Output: {output[-500:]}"
             )
-        
+
         json_start = output.find("===JSON_START===")
         json_end = output.find("===JSON_END===")
-        
+
         if json_start == -1 or json_end == -1:
             raise Exception(f"Could not find JSON markers in output: {output}")
-        
+
         json_str = output[
             json_start + len("===JSON_START==="):json_end
         ].strip()
