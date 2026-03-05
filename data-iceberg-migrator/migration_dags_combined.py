@@ -33,6 +33,9 @@ Excel columns: database | table | inplace_migration | destination_iceberg_databa
 
 from datetime import datetime, timedelta
 import json
+import random
+import time
+from collections import defaultdict
 from functools import wraps
 
 from airflow import DAG
@@ -205,7 +208,7 @@ def validate_prerequisites(run_id: str) -> dict:
                 validation_results['errors'].append(f"PySpark: {error_msg}")
                 logger.error(f"PySpark: FAILED - {error_msg}")
 
-            # Hive
+            # 3. Hive
             logger.info("[3/4] Testing Hive availability...")
             test_cmd = """
     source ~/.profile 2>/dev/null || true
@@ -225,7 +228,7 @@ def validate_prerequisites(run_id: str) -> dict:
                 validation_results['errors'].append(f"Hive: {error_msg}")
                 logger.error(f"Hive: FAILED - {error_msg}")
 
-            # Hadoop FS
+            # 4. Hadoop FS
             logger.info("[4/4] Testing Hadoop FS commands...")
             test_cmd = """
     source ~/.profile 2>/dev/null || true
@@ -367,6 +370,7 @@ def init_tracking_tables(spark) -> dict:
                 validation_duration_seconds DOUBLE,
                 dest_hive_row_count BIGINT,
                 source_partition_count INT,
+                unregistered_partitions BOOLEAN,
                 dest_partition_count INT,
                 row_count_match BOOLEAN,
                 partition_count_match BOOLEAN,
@@ -436,6 +440,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     """Read Excel config from S3 using pandas.read_excel."""
     import pandas as ps
     from io import BytesIO
+    from collections import defaultdict
 
     config = get_config()
     binary_df = spark.read.format("binaryFile").load(excel_file_path)
@@ -445,38 +450,62 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+
+    def normalize_bucket(raw: str) -> str:
+        val = raw.strip()
+        if val.startswith('s3n://'):
+            val = 's3a://' + val[6:]
+        elif val.startswith('s3://'):
+            val = 's3a://' + val[5:]
+        elif not val.startswith('s3a://'):
+            val = f"s3a://{val}"
+        return val
     
     # Convert to list of dicts
-    configs = []
+    grouped = {}
     for _, row in df.iterrows():
-        src_db = str(row.get('database', '')).strip() if row.get('database') is not None else ''
+        src_db = str(row.get('database', '') or '').strip()
         if not src_db:
             continue
+
+        raw_cell = str(row.get('table', '') or '').strip() or '*'
+        dest_db = str(row.get('dest_database', '') or '').strip() or src_db
+        raw_bucket = str(row.get('bucket', '') or '').strip()
+        bucket_val = normalize_bucket(raw_bucket) if raw_bucket else config['default_s3_bucket']
+
+        key = (src_db, dest_db)
+        if key not in grouped:
+            grouped[key] = {'bucket': bucket_val, 'tokens': []}
+
+        for tok in raw_cell.split(','):
+            tok = tok.strip()
+            if tok:
+                grouped[key]['tokens'].append(tok)
         
-        tbl_pattern = str(row.get('table', '*')).strip() if row.get('table') is not None else '*'
-        tbl_pattern = tbl_pattern or '*'
-        
-        dest_db = str(row.get('dest_database', '')).strip() if row.get('dest_database') is not None else ''
-        dest_db = dest_db or src_db
-        
-        bucket_val = str(row.get('bucket', '')).strip() if row.get('bucket') is not None else ''
-        bucket_val = bucket_val or config['default_s3_bucket']
-        if bucket_val.startswith('s3n://'):
-            bucket_val = 's3a://' + bucket_val[6:]
-        elif bucket_val.startswith('s3://'):
-            bucket_val = 's3a://' + bucket_val[5:]
-        elif not bucket_val.startswith('s3a://'):
-            bucket_val = f"s3a://{bucket_val}"
-        logger.info(f"[ParseExcel] Normalised bucket to: {bucket_val}")
-        
+    configs = []
+
+    for (src_db, dest_db), group in grouped.items():
+        unique_tokens = list(dict.fromkeys(group['tokens']))
+        if '*' in unique_tokens:
+            unique_tokens = ['*']
+
+        bucket_val = group['bucket']
+
+        logger.info(
+            f"[ParseExcel] {src_db} -> dest={dest_db} | bucket={bucket_val} | "
+            f"tokens={unique_tokens[:10]}"
+            + (" ..." if len(unique_tokens) > 10 else "")
+        )
+
         configs.append({
             'source_database': src_db,
-            'table_pattern': tbl_pattern,
+            'table_tokens': unique_tokens,
             'dest_database': dest_db,
             'dest_bucket': bucket_val,
             'run_id': run_id,
         })
-    
+
+    logger.info(f"[ParseExcel] Total database configs emitted: {len(configs)}")
     return configs
 
 
@@ -583,26 +612,30 @@ echo "TEMP_DIR={temp_dir}"
 def discover_tables_via_spark_ssh(db_config: dict) -> dict:
     """Use Spark SQL via SSH on edge node to discover tables and metadata."""
     import json
-    
+
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
-    
+
     run_id = db_config['run_id']
     src_db = db_config['source_database']
-    pattern = db_config['table_pattern']
+    raw_tokens = db_config.get('table_tokens') or []
+    if not raw_tokens:
+        pattern_str = db_config.get('table_pattern', '*')
+        raw_tokens = [t.strip() for t in pattern_str.split(',') if t.strip()] or ['*']
     dest_db = db_config['dest_database']
     dest_bucket = db_config['dest_bucket']
-    
+    tokens_json = json.dumps(raw_tokens)
+
     pyspark_script = '''
 import json
 import sys
+import fnmatch
 from pyspark.sql import SparkSession
 
 spark = SparkSession.builder \\
-    .appName("table_discovery_{run_id}_{src_db}") \\
+    .appName("table_discovery_{run_id}_{src_db}_{dest_db}") \\
     .enableHiveSupport() \\
     .getOrCreate()
-
 spark.sparkContext.setLogLevel("ERROR")
 
 src_db = "{src_db}"
@@ -610,15 +643,37 @@ pattern = "{pattern}"
 dest_db = "{dest_db}"
 dest_bucket = "{dest_bucket}"
 
-if pattern == '*':
-    tables_df = spark.sql("SHOW TABLES IN {{0}}".format(src_db))
-else:
-    like_pattern = pattern.replace('*', '%')
-    tables_df = spark.sql(
-        "SHOW TABLES IN {{0}} LIKE '{{1}}'".format(src_db, like_pattern)
-    )
+tokens = json.loads('{tokens_json_escaped}')
 
-table_list = [row.tableName for row in tables_df.collect()]
+def resolve_tokens(spark, db, tokens):
+    resolved = []
+    seen = set()
+
+    for tok in tokens:
+        if tok == '*':
+            rows = spark.sql("SHOW TABLES IN {{0}}".format(db)).collect()
+            for r in rows:
+                t = r.tableName
+                if t not in seen:
+                    seen.add(t)
+                    resolved.append(t)
+        elif '*' in tok:
+            rows = spark.sql(
+                "SHOW TABLES IN {{0}} LIKE '{{1}}'".format(db, tok)
+            ).collect()
+            for r in rows:
+                t = r.tableName
+                if t not in seen:
+                    seen.add(t)
+                    resolved.append(t)
+        else:
+            if tok not in seen:
+                seen.add(tok)
+                resolved.append(tok)
+
+    return resolved
+
+table_list = resolve_tokens(spark, src_db, tokens)
 
 metadata = []
 
@@ -641,7 +696,7 @@ for tbl in table_list:
                 loc = data_type
             elif col_name in ("type", "table type"):
                 table_type = data_type.replace("_TABLE", "")
-            elif col_name == "InputFormat:":
+            elif col_name == "inputformat:":
                 input_format = data_type
         
         source_total_size = 0
@@ -682,24 +737,37 @@ for tbl in table_list:
             ).collect()[0].c
         except:
             pass
+            
+        partition_cols_from_describe = []
+        in_partition_section = False
+        for row in desc_rows:
+            col_name = (row.col_name or "").strip()
+            if col_name == "# Partition Information":
+                in_partition_section = True
+                continue
+            if in_partition_section and col_name == "# col_name":
+                continue
+            if in_partition_section and col_name.startswith("#"):
+                break
+            if in_partition_section and col_name:
+                partition_cols_from_describe.append(col_name)
+
+        partition_definition = len(partition_cols_from_describe) > 0
+        partition_columns = ",".join(partition_cols_from_describe)
         
         partitions = []
-        partition_columns = ""
-        is_partitioned = False
+        registered_partition_count = 0
         try:
             parts_df = spark.sql(
                 "SHOW PARTITIONS {{0}}.{{1}}".format(src_db, tbl)
             )
             partitions = [row.partition for row in parts_df.collect()]
-            is_partitioned = len(partitions) > 0
-            
-            if partitions:
-                first_part = partitions[0]
-                partition_columns = ",".join(
-                    [p.split("=")[0] for p in first_part.split("/")]
-                )
+            registered_partition_count = len(partitions)
         except:
             pass
+
+        is_partitioned = partition_definition
+        unregistered_partitions = partition_definition and registered_partition_count == 0
         
         schema_df = spark.sql(
             "DESCRIBE {{0}}.{{1}}".format(src_db, tbl)
@@ -730,6 +798,7 @@ for tbl in table_list:
             "partition_count": len(partitions),
             "row_count": row_count,
             "is_partitioned": is_partitioned,
+            "unregistered_partitions": unregistered_partitions,
             "table_type": table_type,
             "source_total_size_bytes": source_total_size,
             "source_file_count": source_file_count
@@ -750,6 +819,7 @@ for tbl in table_list:
             "partition_count": 0,
             "row_count": 0,
             "is_partitioned": False,
+            "unregistered_partitions": False,
             "table_type": "UNKNOWN",
             "source_total_size_bytes": 0,
             "source_file_count": 0,
@@ -767,16 +837,16 @@ spark.stop()
 '''.format(
         run_id=run_id,
         src_db=src_db,
-        pattern=pattern,
+        tokens_json_escaped=tokens_json.replace("'", "\\'"),
         dest_db=dest_db,
-        dest_bucket=dest_bucket
+        dest_bucket=dest_bucket,
     )
-        
+
     with ssh.get_conn() as client:
-        temp_dir = f"/tmp/discovery_{run_id}_{src_db}"
+        temp_dir = f"/tmp/discovery_{run_id}_{src_db}_{dest_db}"
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
-        cmd_stdout.channel.recv_exit_status() 
-        
+        cmd_stdout.channel.recv_exit_status()
+
         script_path = f"{temp_dir}/discover_tables.py"
         sftp = client.open_sftp()
         with sftp.file(script_path, 'w') as f:
@@ -784,18 +854,17 @@ spark.stop()
         sftp.close()
 
         source_profile = "source ~/.profile 2>/dev/null || true\n"
-        
+
         # Use pyspark < script.py instead of spark-submit
         cmd = f"""
-{source_profile} cd {temp_dir}
-pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}.log
-"""
-        
+    {source_profile} cd {temp_dir}
+    pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}.log
+    """
         _, stdout, stderr = client.exec_command(cmd, timeout=3600)
         exit_code = stdout.channel.recv_exit_status()
         output = stdout.read().decode()
         error_output = stderr.read().decode()
-        
+
         logger.info(f"=== Spark Discovery Output ===")
         logger.info(output[-1000:])
 
@@ -806,16 +875,16 @@ pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}.log
             logger.error(error_output)
             raise Exception(
                 f"Table discovery Spark job failed with exit code {exit_code}\n"
-                f"Error: {error_output[:1000]}\n" 
-                f"Output: {output[-500:]}" 
+                f"Error: {error_output[:1000]}\n"
+                f"Output: {output[-500:]}"
             )
-        
+
         json_start = output.find("===JSON_START===")
         json_end = output.find("===JSON_END===")
-        
+
         if json_start == -1 or json_end == -1:
             raise Exception(f"Could not find JSON markers in output: {output}")
-        
+
         json_str = output[
             json_start + len("===JSON_START==="):json_end
         ].strip()
@@ -892,6 +961,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     source_total_size_bytes = {source_total_size},
                     source_file_count = {source_file_count},
                     source_partition_count = {t.get('partition_count', 0)}, 
+                    unregistered_partitions = {str(t.get('unregistered_partitions', False)).lower()},
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
                   AND source_database = '{t['source_database']}'
@@ -906,7 +976,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     partition_count, is_partitioned, schema_json, partitions_json,
                     partition_columns, table_type, source_row_count,
                     source_total_size_bytes, source_file_count,
-                    source_partition_count,
+                    source_partition_count, unregistered_partitions,
                     s3_total_size_bytes_before, s3_file_count_before,
                     s3_total_size_bytes_after, s3_file_count_after,
                     s3_bytes_transferred, s3_files_transferred,
@@ -930,7 +1000,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     '{schema_json}', '{parts_json}', '{t.get('partition_columns', '')}',
                     '{table_type}', {row_count},
                     {source_total_size}, {source_file_count},
-                    {t.get('partition_count', 0)}, 
+                    {t.get('partition_count', 0)}, {str(t.get('unregistered_partitions', False)).lower()},
                     NULL, NULL, NULL, NULL, NULL, NULL,
                     NULL, NULL,
                     'COMPLETED', current_timestamp(), {discovery_duration},
@@ -1208,6 +1278,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         overall = 'COPIED' if r['status'] == 'COMPLETED' else 'FAILED'
         error_msg = r.get('error', '').replace("'", "''") if r.get('error') else ''
         distcp_duration = r.get('distcp_duration_secs', 0.0)
+        started_at = r.get('distcp_started_at', '')
         completed_at = r.get('distcp_completed_at', '') 
 
         s3_size_before = r.get('s3_total_size_bytes_before', 0)
@@ -1216,7 +1287,6 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         s3_files_after = r.get('s3_file_count_after', 0)
         s3_bytes_transfer = r.get('s3_bytes_transferred', 0)
         s3_files_transfer = r.get('s3_files_transferred', 0)
-        started_at = r.get('distcp_started_at', '')
         
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.migration_table_status
@@ -1327,6 +1397,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
             if exists:
                 if is_part:
                     spark.sql(f"MSCK REPAIR TABLE {full_name}")
+                spark.sql(f"REFRESH TABLE {full_name}")
                 logger.info(f"[HiveTable] REPAIRED (already existed): {full_name}")
                 results.append({
                     'source_table': tbl,
@@ -1371,6 +1442,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                 
                 if is_part:
                     spark.sql(f"MSCK REPAIR TABLE {full_name}")
+                spark.sql(f"REFRESH TABLE {full_name}")
                 
                 logger.info(f"[HiveTable] CREATED: {full_name} | location={s3_loc}")
                 results.append({
@@ -1751,11 +1823,11 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 schema_match = {str(v.get('schema_match', False)).lower()},
                 schema_differences = '{schema_diffs}',
                 overall_status = CASE 
-                    WHEN overall_status = 'FAILED' THEN overall_status  -- only preserve genuine failures
+                    WHEN overall_status = 'FAILED' THEN overall_status
                     ELSE '{final_overall_status}'
                 END,
                 error_message = CASE 
-                    WHEN overall_status = 'FAILED' THEN error_message   -- only preserve genuine failure errors
+                    WHEN overall_status = 'FAILED' THEN error_message
                     ELSE {error_message_sql}
                 END,
                 updated_at = current_timestamp()
@@ -1869,7 +1941,7 @@ def generate_html_report(run_id: str, spark) -> str:
     
     # Calculate summary stats
     total_tables = len(table_status)
-    successful_tables = sum(1 for t in table_status if t.overall_status in ['VALIDATED', 'TABLE_CREATED'])
+    successful_tables = sum(1 for t in table_status if t.overall_status in ['VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED'])
     failed_tables = sum(1 for t in table_status if 'FAILED' in (t.overall_status or ''))
     total_data_gb = sum(t.s3_total_size_bytes_after or 0 for t in table_status) / (1024**3)
     total_files = sum(t.s3_file_count_after or 0 for t in table_status)
@@ -2160,7 +2232,7 @@ def generate_html_report(run_id: str, spark) -> str:
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
-                    <td>{table_name}</td>
+                    <td><strong>{t.source_table}</strong></td>
                     <td><span class="status-badge {status_class}">{t.overall_status}</span></td>
                     <td class="duration">{discovery_dur}</td>
                     <td class="duration">{distcp_dur}{distcp_detail}</td>
@@ -2349,10 +2421,7 @@ def generate_html_report(run_id: str, spark) -> str:
     output_stream.write(html.encode('utf-8'))
     output_stream.close()
     
-    return {
-        'report_path': report_path,
-        'html_content': html
-    }
+    return {'report_path': report_path}
 
 
 @task.pyspark(conn_id='spark_default')
@@ -2364,7 +2433,7 @@ def finalize_run(run_id: str, spark) -> dict:
     stats_result = spark.sql(f"""
         SELECT
             COUNT(*) as total,
-            SUM(CASE WHEN overall_status = 'VALIDATED' THEN 1 ELSE 0 END) as successful,
+            SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS') THEN 1 ELSE 0 END) as successful,
             SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed
 
         FROM {tracking_db}.migration_table_status
@@ -2430,14 +2499,30 @@ def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict
         return {'sent': False, 'reason': 'no_recipients'}
 
     recipients = [r.strip() for r in recipients_str.split(',') if r.strip()]
-
-    html_content = report_result.get('html_content', '')
     report_path = report_result.get('report_path', '')
 
     try:
         import tempfile
         import os
         from airflow.utils.email import send_email
+
+        logger.info(f"[Email] Reading HTML report from S3: {report_path}")
+        hadoop_conf = spark._jsc.hadoopConfiguration()
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark._jvm.java.net.URI(report_path),
+            hadoop_conf
+        )
+        s3_path_obj = spark._jvm.org.apache.hadoop.fs.Path(report_path)
+        reader = spark._jvm.java.io.BufferedReader(
+            spark._jvm.java.io.InputStreamReader(fs.open(s3_path_obj), "UTF-8")
+        )
+        lines = []
+        line = reader.readLine()
+        while line is not None:
+            lines.append(line)
+            line = reader.readLine()
+        reader.close()
+        html_content = "\n".join(lines)
 
         tmp = tempfile.NamedTemporaryFile(
             mode='w', suffix='.html',
@@ -2677,11 +2762,11 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                 src_partitions_df = spark.sql(f"SHOW PARTITIONS {src_db}.{tbl}")
                 all_partitions = src_partitions_df.collect()
 
-                if not inplace and all_partitions:
+                if all_partitions:
                     non_empty_count = 0
                     table_location = tbl_meta.get('location') or ''
                     for part_row in all_partitions:
-                        part_spec = part_row[0]   # e.g. "dt=2024-01-01/country=US"
+                        part_spec = part_row[0]   
                         part_path = f"{table_location}/{part_spec.replace('=', '=').rstrip('/')}"
                         try:
                             from py4j.java_gateway import java_import
@@ -2696,17 +2781,15 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                                 if int(summary.getLength()) > 0:
                                     non_empty_count += 1
                         except Exception:
-                            # If we can't check, count it conservatively
                             non_empty_count += 1
                     src_hive_partition_count = non_empty_count
                     logger.info(
                         f"[IcebergMigrate] {src_db}.{tbl} | "
+                        f"strategy={'INPLACE' if inplace else 'SNAPSHOT'} | "
                         f"total_hive_partitions={len(all_partitions)} | "
                         f"non_empty_partitions={non_empty_count} "
-                        f"(snapshot skips 0-byte partitions)"
+                        f"(0-byte partitions excluded from comparison)"
                     )
-                else:
-                    src_hive_partition_count = len(all_partitions)
             except:
                 pass 
 
@@ -3569,10 +3652,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
     output_stream.write(html.encode('utf-8'))
     output_stream.close()
     
-    return {
-        'report_path': report_path,
-        'html_content': html
-    }
+    return {'report_path': report_path}
 
 
 @task.pyspark(conn_id='spark_default')
@@ -3646,11 +3726,27 @@ def send_iceberg_report_email(report_result: dict, run_id: str, spark) -> dict:
         return {'sent': False, 'reason': 'no_recipients'}
 
     recipients = [r.strip() for r in recipients_str.split(',') if r.strip()]
-
-    html_content = report_result.get('html_content', '')
     report_path = report_result.get('report_path', '')
 
     try:
+        logger.info(f"[Email] Reading Iceberg HTML report from S3: {report_path}")
+        hadoop_conf = spark._jsc.hadoopConfiguration()
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark._jvm.java.net.URI(report_path),
+            hadoop_conf
+        )
+        s3_path_obj = spark._jvm.org.apache.hadoop.fs.Path(report_path)
+        reader = spark._jvm.java.io.BufferedReader(
+            spark._jvm.java.io.InputStreamReader(fs.open(s3_path_obj), "UTF-8")
+        )
+        lines = []
+        line = reader.readLine()
+        while line is not None:
+            lines.append(line)
+            line = reader.readLine()
+        reader.close()
+        html_content = "\n".join(lines)
+
         tmp = tempfile.NamedTemporaryFile(
             mode='w', suffix='.html',
             prefix=f'{run_id}_iceberg_report_',
