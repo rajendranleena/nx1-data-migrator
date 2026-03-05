@@ -198,15 +198,6 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 
 ---
 
-### Bucket Strategy for Multi-Tenant Migrations
-
-When tables in the same database require different target S3 buckets, use a two-phase approach:
-
-- **Run 1: Lift-and-Shift (default bucket):** Migrate the bulk of tables using the default bucket configured in `migration_default_s3_bucket`. Include all standard tables in a single Excel sheet without specifying a bucket column.
-- **Run 2: Customized (non-default buckets):** Create a separate Excel sheet containing only the tables that require a different target bucket, with the `bucket` column explicitly set. Run the DAG a second time pointing to this sheet.
-
----
-
 ### Task Flow
 
 ```

@@ -473,7 +473,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         raw_bucket = str(row.get('bucket', '') or '').strip()
         bucket_val = normalize_bucket(raw_bucket) if raw_bucket else config['default_s3_bucket']
 
-        key = (src_db, dest_db)
+        key = (src_db, dest_db, bucket_val)
         if key not in grouped:
             grouped[key] = {'bucket': bucket_val, 'tokens': []}
 
@@ -484,7 +484,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         
     configs = []
 
-    for (src_db, dest_db), group in grouped.items():
+    for (src_db, dest_db, bucket_val), group in grouped.items():
         unique_tokens = list(dict.fromkeys(group['tokens']))
         if '*' in unique_tokens:
             unique_tokens = ['*']
@@ -612,6 +612,7 @@ echo "TEMP_DIR={temp_dir}"
 def discover_tables_via_spark_ssh(db_config: dict) -> dict:
     """Use Spark SQL via SSH on edge node to discover tables and metadata."""
     import json
+    import re 
 
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
@@ -626,6 +627,8 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
     dest_bucket = db_config['dest_bucket']
     tokens_json = json.dumps(raw_tokens)
 
+    dest_bucket_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', dest_bucket)
+
     pyspark_script = '''
 import json
 import sys
@@ -633,13 +636,12 @@ import fnmatch
 from pyspark.sql import SparkSession
 
 spark = SparkSession.builder \\
-    .appName("table_discovery_{run_id}_{src_db}_{dest_db}") \\
+    .appName("table_discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}") \\
     .enableHiveSupport() \\
     .getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
 
 src_db = "{src_db}"
-pattern = "{pattern}"
 dest_db = "{dest_db}"
 dest_bucket = "{dest_bucket}"
 
@@ -840,10 +842,11 @@ spark.stop()
         tokens_json_escaped=tokens_json.replace("'", "\\'"),
         dest_db=dest_db,
         dest_bucket=dest_bucket,
+        dest_bucket_slug=dest_bucket_slug,
     )
 
     with ssh.get_conn() as client:
-        temp_dir = f"/tmp/discovery_{run_id}_{src_db}_{dest_db}"
+        temp_dir = f"/tmp/discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}"
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
         cmd_stdout.channel.recv_exit_status()
 
@@ -858,7 +861,7 @@ spark.stop()
         # Use pyspark < script.py instead of spark-submit
         cmd = f"""
     {source_profile} cd {temp_dir}
-    pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}.log
+    pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}.log
     """
         _, stdout, stderr = client.exec_command(cmd, timeout=3600)
         exit_code = stdout.channel.recv_exit_status()
