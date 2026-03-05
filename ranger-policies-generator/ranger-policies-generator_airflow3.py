@@ -224,6 +224,7 @@ with DAG(
             groups = str(row.get('groups', '')).strip()
             users = str(row.get('users', '')).strip()  
             rowfilter = str(row.get('rowfilter', '')).strip()  
+            policy_label_override = str(row.get('policy_label', '')).strip()
             if is_empty_like(rowfilter):
                 rowfilter = ''
                 logger.debug(f"Row {idx}: Rowfilter field was empty/null-like, treating as empty")
@@ -292,8 +293,9 @@ with DAG(
 
             if not is_empty_like(url) and url != '-' and url != '*':
                 policy_name = url
+                policy_label = policy_label_override if policy_label_override else None
                 if policy_name not in policies:
-                    policies[policy_name] = {'type': 'url', 'url': url, 'roles': []}
+                    policies[policy_name] = {'type': 'url', 'url': url, 'roles': [], 'label': policy_label}
                 for binding in effective_role_bindings:
                     effective_role = binding['role']
                     effective_users = binding['users']
@@ -325,6 +327,7 @@ with DAG(
                     for table in table_list:
                         for column in column_list:
                             policy_name = build_policy_name('iceberg', database, table, column)
+                            policy_label = policy_label_override if policy_label_override else None
                             if policy_name not in policies:
                                 policies[policy_name] = {
                                     'type': 'table',
@@ -332,7 +335,8 @@ with DAG(
                                     'schema': database,
                                     'table': table or '*',
                                     'column': column or '*',
-                                    'roles': []
+                                    'roles': [],
+                                    'label': policy_label
                                 }
                             for binding in effective_role_bindings:
                                 effective_role = binding['role']
@@ -635,24 +639,21 @@ with DAG(
                     )
                     continue
 
-                # Context-specific: check if at least one mapping for this role's users/groups in this policy succeeded
                 users = r.get('users', []) or []
                 groups = r.get('groups', []) or []
-                mapping_success = False
-                # Check group mappings
-                for g in groups:
-                    if {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('created_mappings', []) or \
-                       {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('existing_mappings', []):
-                        mapping_success = True
-                        break
-                # Check user mappings if not already successful
-                if not mapping_success:
-                    for u in users:
-                        if {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('created_mappings', []) or \
-                           {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('existing_mappings', []):
-                            mapping_success = True
-                            break
-                if not mapping_success:
+                # Find successfully mapped groups
+                mapped_groups = [
+                    g for g in groups
+                    if {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('created_mappings', [])
+                    or {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('existing_mappings', [])
+                ]
+                # Find successfully mapped users
+                mapped_users = [
+                    u for u in users
+                    if {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('created_mappings', [])
+                    or {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('existing_mappings', [])
+                ]
+                if not mapped_groups and not mapped_users:
                     logger.error(
                         "Excluding role principal %s from Ranger policy %s due to failed Keycloak principal mapping for all users/groups in this policy row",
                         role_name,
@@ -661,8 +662,9 @@ with DAG(
                     excluded_roles_in_policy.append(role_name)
                     continue
                 patched_role = dict(r)
-                patched_role['groups'] = [role_name]
-                patched_role['users'] = []
+                # Only include successfully mapped groups and users
+                patched_role['groups'] = mapped_groups if mapped_groups else []
+                patched_role['users'] = mapped_users if mapped_users else []
                 patched_role['rowfilter'] = r.get('rowfilter', '')
                 patched_policy['roles'].append(patched_role)
                 applied_roles_in_policy.append(role_name)
