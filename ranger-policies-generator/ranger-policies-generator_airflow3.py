@@ -16,9 +16,13 @@ from datetime import datetime, timedelta, timezone
 from airflow import DAG
 from airflow.decorators import task
 from airflow.models import Variable
-from airflow.utils.trigger_rule import TriggerRule 
+from airflow.utils.trigger_rule import TriggerRule
+from dotenv import load_dotenv
 from typing import Dict, List, Any
 import logging
+import os
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 sys.path.append('/opt/airflow/utils/migrations') 
 
@@ -82,22 +86,22 @@ def validate_rowfilter(rowfilter: str) -> str:
 
 def get_config() -> dict:
     return {
-        'ranger_url': Variable.get('ranger_url', default_var='http://ranger:6080'),
-        'ranger_username': Variable.get('ranger_username'),
-        'ranger_password': Variable.get('ranger_password', deserialize_json=False),
-        'service_name': Variable.get('nx1_repo_name', default_var='nx1-unifiedsql'),
-        'keycloak_url': Variable.get('keycloak_url'),
-        'keycloak_realm': Variable.get('keycloak_realm'),
-        'keycloak_client_id': Variable.get('keycloak_admin_client_id'),
-        'keycloak_client_secret': Variable.get('keycloak_admin_client_secret', deserialize_json=False),
-        'keycloak_verify_ssl': parse_bool_config(Variable.get('keycloak_verify_ssl', default_var='false'), default=False),
-        'keycloak_cacert': Variable.get('keycloak_cacert', default_var=''),
-        'smtp_conn_id': Variable.get('policy_smtp_conn_id', default_var='smtp_default'),
-        'email_recipients': Variable.get('policy_email_recipients', default_var=''),
-        'spark_conn_id': Variable.get('spark_conn_id', default_var='spark_default'),
-        'tracking_database': Variable.get('policy_tracking_database', default_var='policy_tracking'),
-        'tracking_location': Variable.get('policy_tracking_location', default_var='s3a://data-lake/policy_tracking'),
-        'report_output_location': Variable.get('policy_report_location', default_var='s3a://data-lake/policy_reports')
+        'ranger_url': Variable.get('ranger_url', default_var=os.getenv('RANGER_URL', 'http://ranger:6080')),
+        'ranger_username': Variable.get('ranger_username', default_var=os.getenv('RANGER_USERNAME')),
+        'ranger_password': Variable.get('ranger_password', default_var=os.getenv('RANGER_PASSWORD'), deserialize_json=False),
+        'service_name': Variable.get('nx1_repo_name', default_var=os.getenv('NX1_REPO_NAME', 'nx1-unifiedsql')),
+        'keycloak_url': Variable.get('keycloak_url', default_var=os.getenv('KEYCLOAK_URL')),
+        'keycloak_realm': Variable.get('keycloak_realm', default_var=os.getenv('KEYCLOAK_REALM')),
+        'keycloak_client_id': Variable.get('keycloak_admin_client_id', default_var=os.getenv('KEYCLOAK_ADMIN_CLIENT_ID')),
+        'keycloak_client_secret': Variable.get('keycloak_admin_client_secret', default_var=os.getenv('KEYCLOAK_ADMIN_CLIENT_SECRET'), deserialize_json=False),
+        'keycloak_verify_ssl': parse_bool_config(Variable.get('keycloak_verify_ssl', default_var=os.getenv('KEYCLOAK_VERIFY_SSL', 'false')), default=False),
+        'keycloak_cacert': Variable.get('keycloak_cacert', default_var=os.getenv('KEYCLOAK_CACERT', '')),
+        'smtp_conn_id': Variable.get('policy_smtp_conn_id', default_var=os.getenv('POLICY_SMTP_CONN_ID', 'smtp_default')),
+        'email_recipients': Variable.get('policy_email_recipients', default_var=os.getenv('POLICY_EMAIL_RECIPIENTS', '')),
+        'spark_conn_id': Variable.get('spark_conn_id', default_var=os.getenv('SPARK_CONN_ID', 'spark_default')),
+        'tracking_database': Variable.get('policy_tracking_database', default_var=os.getenv('POLICY_TRACKING_DATABASE', 'policy_tracking')),
+        'tracking_location': Variable.get('policy_tracking_location', default_var=os.getenv('POLICY_TRACKING_LOCATION', 's3a://data-lake/policy_tracking')),
+        'report_output_location': Variable.get('policy_report_location', default_var=os.getenv('POLICY_REPORT_LOCATION', 's3a://data-lake/policy_reports'))
     }
 
 def parse_permission_string(permissions: str) -> List[str]:

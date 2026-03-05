@@ -12,6 +12,7 @@ data-iceberg-migrator = [
     "pyspark>=3.4",
     "pandas>=2.0",
     "openpyxl>=3.1",
+    "python-dotenv>=1.0",
 ]
 ranger-policies-generator = [
     "apache-airflow>=2.7",
@@ -19,6 +20,7 @@ ranger-policies-generator = [
     "python-keycloak>=3.0",
     "pandas>=2.0",
     "openpyxl>=3.1",
+    "python-dotenv>=1.0",
 ]
 dev = [
     "ruff>=0.4",
