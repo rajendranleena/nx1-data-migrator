@@ -8,7 +8,7 @@ An automated **Airflow TaskFlow-based migration pipeline** consisting of two ind
 
 This implementation provides two independent but complementary migration DAGs:
 
-1. **`mapr_to_s3_migration`** - Migrates Hive tables from MapR-FS/HDFS to Amazon S3
+1. **`mapr_to_s3_migration`** - Migrates Hive tables from MapR-FS/HDFS to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
 
 ---
@@ -189,12 +189,21 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 
 **Required Columns:**
 
-| Column          | Required | Description                                                                    | Example                 |
-| --------------- | -------- | ------------------------------------------------------------------------------ | ----------------------- |
-| `database`      | **Yes**  | Source database name                                                           | `sales_data`            |
-| `table`         | No       | Table pattern (supports `*` wildcards, doesn't support comma-seperated values) | `transactions_*` or `*` |
-| `dest database` | No       | Destination database (defaults to source)                                      | `sales_data_s3`         |
-| `bucket`        | No       | S3 bucket (defaults to variable)                                               | `s3a://data-lake`       |
+| Column          | Required | Description                                                                                                                                                   | Example                 |
+| --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| `database`      | **Yes**  | Source database name                                                                                                                                          | `sales_data`            |
+| `table`         | No       | Table pattern: supports \* wildcards, comma-separated table names (e.g. table1,table2), or one table per row for same database (rows are combined internally) | `transactions_*` or `*` |
+| `dest database` | No       | Destination database (defaults to source)                                                                                                                     | `sales_data_s3`         |
+| `bucket`        | No       | S3 bucket (defaults to variable)                                                                                                                              | `s3a://data-lake`       |
+
+---
+
+### Bucket Strategy for Multi-Tenant Migrations
+
+When tables in the same database require different target S3 buckets, use a two-phase approach:
+
+- **Run 1: Lift-and-Shift (default bucket):** Migrate the bulk of tables using the default bucket configured in `migration_default_s3_bucket`. Include all standard tables in a single Excel sheet without specifying a bucket column.
+- **Run 2: Customized (non-default buckets):** Create a separate Excel sheet containing only the tables that require a different target bucket, with the `bucket` column explicitly set. Run the DAG a second time pointing to this sheet.
 
 ---
 
@@ -296,7 +305,7 @@ cleanup_edge (SSH: Cleanup temp files)
 - Validates and defaults configuration values:
   - `dest_database` defaults to source database name
   - `bucket` defaults to `migration_default_s3_bucket` variable
-  - `table` pattern defaults to `*` (all tables)
+  - `table` pattern defaults to `*` (all tables); supports comma-separated table names and multi-row input for the same database (rows are combined into a single database record internally)
 - Expands to list of database configurations for dynamic task mapping
 - Filters out rows with empty database names
 
@@ -372,7 +381,7 @@ cleanup_edge (SSH: Cleanup temp files)
     - `file_size_match`: True if within 1% tolerance
     - `file_count_match`: True if exact match
   - These metrics help detect incomplete copies even when DistCp reports success
-- Logs written to `{temp_dir}/distcp_{table}.log`
+- Logs written to `{temp_dir}/distcp_{run_id}_{src_db}.log`
 - **Timeout:** 24 hours per table (configurable via `SSH_COMMAND_TIMEOUT`)
 
 ---

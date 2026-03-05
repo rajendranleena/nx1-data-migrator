@@ -33,6 +33,9 @@ Excel columns: database | table | inplace_migration | destination_iceberg_databa
 
 from datetime import datetime, timedelta
 import json
+import random
+import time
+from collections import defaultdict
 from functools import wraps
 
 from airflow import DAG
@@ -205,7 +208,7 @@ def validate_prerequisites(run_id: str) -> dict:
                 validation_results['errors'].append(f"PySpark: {error_msg}")
                 logger.error(f"PySpark: FAILED - {error_msg}")
 
-            # Hive
+            # 3. Hive
             logger.info("[3/4] Testing Hive availability...")
             test_cmd = """
     source ~/.profile 2>/dev/null || true
@@ -225,7 +228,7 @@ def validate_prerequisites(run_id: str) -> dict:
                 validation_results['errors'].append(f"Hive: {error_msg}")
                 logger.error(f"Hive: FAILED - {error_msg}")
 
-            # Hadoop FS
+            # 4. Hadoop FS
             logger.info("[4/4] Testing Hadoop FS commands...")
             test_cmd = """
     source ~/.profile 2>/dev/null || true
@@ -437,6 +440,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     """Read Excel config from S3 using pandas.read_excel."""
     import pandas as ps
     from io import BytesIO
+    from collections import defaultdict
 
     config = get_config()
     binary_df = spark.read.format("binaryFile").load(excel_file_path)
@@ -446,38 +450,62 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+
+    def normalize_bucket(raw: str) -> str:
+        val = raw.strip()
+        if val.startswith('s3n://'):
+            val = 's3a://' + val[6:]
+        elif val.startswith('s3://'):
+            val = 's3a://' + val[5:]
+        elif not val.startswith('s3a://'):
+            val = f"s3a://{val}"
+        return val
     
     # Convert to list of dicts
-    configs = []
+    grouped = {}
     for _, row in df.iterrows():
-        src_db = str(row.get('database', '')).strip() if row.get('database') is not None else ''
+        src_db = str(row.get('database', '') or '').strip()
         if not src_db:
             continue
 
-        tbl_pattern = str(row.get('table', '*')).strip() if row.get('table') is not None else '*'
-        tbl_pattern = tbl_pattern or '*'
+        raw_cell = str(row.get('table', '') or '').strip() or '*'
+        dest_db = str(row.get('dest_database', '') or '').strip() or src_db
+        raw_bucket = str(row.get('bucket', '') or '').strip()
+        bucket_val = normalize_bucket(raw_bucket) if raw_bucket else config['default_s3_bucket']
 
-        dest_db = str(row.get('dest_database', '')).strip() if row.get('dest_database') is not None else ''
-        dest_db = dest_db or src_db
+        key = (src_db, dest_db)
+        if key not in grouped:
+            grouped[key] = {'bucket': bucket_val, 'tokens': []}
 
-        bucket_val = str(row.get('bucket', '')).strip() if row.get('bucket') is not None else ''
-        bucket_val = bucket_val or config['default_s3_bucket']
-        if bucket_val.startswith('s3n://'):
-            bucket_val = 's3a://' + bucket_val[6:]
-        elif bucket_val.startswith('s3://'):
-            bucket_val = 's3a://' + bucket_val[5:]
-        elif not bucket_val.startswith('s3a://'):
-            bucket_val = f"s3a://{bucket_val}"
-        logger.info(f"[ParseExcel] Normalised bucket to: {bucket_val}")
+        for tok in raw_cell.split(','):
+            tok = tok.strip()
+            if tok:
+                grouped[key]['tokens'].append(tok)
+        
+    configs = []
+
+    for (src_db, dest_db), group in grouped.items():
+        unique_tokens = list(dict.fromkeys(group['tokens']))
+        if '*' in unique_tokens:
+            unique_tokens = ['*']
+
+        bucket_val = group['bucket']
+
+        logger.info(
+            f"[ParseExcel] {src_db} -> dest={dest_db} | bucket={bucket_val} | "
+            f"tokens={unique_tokens[:10]}"
+            + (" ..." if len(unique_tokens) > 10 else "")
+        )
 
         configs.append({
             'source_database': src_db,
-            'table_pattern': tbl_pattern,
+            'table_tokens': unique_tokens,
             'dest_database': dest_db,
             'dest_bucket': bucket_val,
             'run_id': run_id,
         })
-    
+
+    logger.info(f"[ParseExcel] Total database configs emitted: {len(configs)}")
     return configs
 
 
@@ -584,29 +612,29 @@ echo "TEMP_DIR={temp_dir}"
 def discover_tables_via_spark_ssh(db_config: dict) -> dict:
     """Use Spark SQL via SSH on edge node to discover tables and metadata."""
     import json
-    import uuid
 
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
 
     run_id = db_config['run_id']
     src_db = db_config['source_database']
-    pattern = db_config['table_pattern']
+    raw_tokens = db_config.get('table_tokens') or []
+    if not raw_tokens:
+        pattern_str = db_config.get('table_pattern', '*')
+        raw_tokens = [t.strip() for t in pattern_str.split(',') if t.strip()] or ['*']
     dest_db = db_config['dest_database']
     dest_bucket = db_config['dest_bucket']
-
-    unique_id = uuid.uuid4().hex[:8]
-    temp_dir = f"/tmp/discovery_{run_id}_{src_db}_{unique_id}"
-    script_path = f"{temp_dir}/discover_tables_{unique_id}.py"
+    tokens_json = json.dumps(raw_tokens)
 
     pyspark_script = '''
 import json
 import sys
+import fnmatch
 from pyspark.sql import SparkSession
 
-spark = SparkSession.builder \
-    .appName("table_discovery_{run_id}_{src_db}_{unique_id}") \
-    .enableHiveSupport() \
+spark = SparkSession.builder \\
+    .appName("table_discovery_{run_id}_{src_db}_{dest_db}") \\
+    .enableHiveSupport() \\
     .getOrCreate()
 spark.sparkContext.setLogLevel("ERROR")
 
@@ -615,19 +643,37 @@ pattern = "{pattern}"
 dest_db = "{dest_db}"
 dest_bucket = "{dest_bucket}"
 
-# Support comma-separated list of explicit table names
-if pattern == '*':
-    tables_df = spark.sql("SHOW TABLES IN {{0}}".format(src_db))
-    table_list = [row.tableName for row in tables_df.collect()]
-elif ',' in pattern:
-    # Explicit list of table names
-    table_list = [t.strip() for t in pattern.split(',') if t.strip()]
-else:
-    like_pattern = pattern.replace('*', '%')
-    tables_df = spark.sql(
-        "SHOW TABLES IN {{0}} LIKE '{{1}}'".format(src_db, like_pattern)
-    )
-    table_list = [row.tableName for row in tables_df.collect()]
+tokens = json.loads('{tokens_json_escaped}')
+
+def resolve_tokens(spark, db, tokens):
+    resolved = []
+    seen = set()
+
+    for tok in tokens:
+        if tok == '*':
+            rows = spark.sql("SHOW TABLES IN {{0}}".format(db)).collect()
+            for r in rows:
+                t = r.tableName
+                if t not in seen:
+                    seen.add(t)
+                    resolved.append(t)
+        elif '*' in tok:
+            rows = spark.sql(
+                "SHOW TABLES IN {{0}} LIKE '{{1}}'".format(db, tok)
+            ).collect()
+            for r in rows:
+                t = r.tableName
+                if t not in seen:
+                    seen.add(t)
+                    resolved.append(t)
+        else:
+            if tok not in seen:
+                seen.add(tok)
+                resolved.append(tok)
+
+    return resolved
+
+table_list = resolve_tokens(spark, src_db, tokens)
 
 metadata = []
 
@@ -650,7 +696,7 @@ for tbl in table_list:
                 loc = data_type
             elif col_name in ("type", "table type"):
                 table_type = data_type.replace("_TABLE", "")
-            elif col_name == "InputFormat:":
+            elif col_name == "inputformat:":
                 input_format = data_type
         
         source_total_size = 0
@@ -791,18 +837,17 @@ spark.stop()
 '''.format(
         run_id=run_id,
         src_db=src_db,
-        pattern=pattern,
+        tokens_json_escaped=tokens_json.replace("'", "\\'"),
         dest_db=dest_db,
         dest_bucket=dest_bucket,
-        unique_id=unique_id
     )
 
     with ssh.get_conn() as client:
-        # Create unique temp dir
+        temp_dir = f"/tmp/discovery_{run_id}_{src_db}_{dest_db}"
         _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
         cmd_stdout.channel.recv_exit_status()
 
-        # Write script to unique path
+        script_path = f"{temp_dir}/discover_tables.py"
         sftp = client.open_sftp()
         with sftp.file(script_path, 'w') as f:
             f.write(pyspark_script)
@@ -813,7 +858,7 @@ spark.stop()
         # Use pyspark < script.py instead of spark-submit
         cmd = f"""
     {source_profile} cd {temp_dir}
-    pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{unique_id}.log
+    pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}.log
     """
         _, stdout, stderr = client.exec_command(cmd, timeout=3600)
         exit_code = stdout.channel.recv_exit_status()
@@ -823,7 +868,6 @@ spark.stop()
         logger.info(f"=== Spark Discovery Output ===")
         logger.info(output[-1000:])
 
-        # Optionally clean up temp_dir after use
         # client.exec_command(f"rm -rf {temp_dir}", timeout=60)
 
         if exit_code != 0:
@@ -1234,6 +1278,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         overall = 'COPIED' if r['status'] == 'COMPLETED' else 'FAILED'
         error_msg = r.get('error', '').replace("'", "''") if r.get('error') else ''
         distcp_duration = r.get('distcp_duration_secs', 0.0)
+        started_at = r.get('distcp_started_at', '')
         completed_at = r.get('distcp_completed_at', '') 
 
         s3_size_before = r.get('s3_total_size_bytes_before', 0)
@@ -1242,7 +1287,6 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         s3_files_after = r.get('s3_file_count_after', 0)
         s3_bytes_transfer = r.get('s3_bytes_transferred', 0)
         s3_files_transfer = r.get('s3_files_transferred', 0)
-        started_at = r.get('distcp_started_at', '')
         
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.migration_table_status
@@ -1353,6 +1397,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
             if exists:
                 if is_part:
                     spark.sql(f"MSCK REPAIR TABLE {full_name}")
+                spark.sql(f"REFRESH TABLE {full_name}")
                 logger.info(f"[HiveTable] REPAIRED (already existed): {full_name}")
                 results.append({
                     'source_table': tbl,
@@ -1397,6 +1442,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                 
                 if is_part:
                     spark.sql(f"MSCK REPAIR TABLE {full_name}")
+                spark.sql(f"REFRESH TABLE {full_name}")
                 
                 logger.info(f"[HiveTable] CREATED: {full_name} | location={s3_loc}")
                 results.append({
@@ -1777,11 +1823,11 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 schema_match = {str(v.get('schema_match', False)).lower()},
                 schema_differences = '{schema_diffs}',
                 overall_status = CASE 
-                    WHEN overall_status = 'FAILED' THEN overall_status  -- only preserve genuine failures
+                    WHEN overall_status = 'FAILED' THEN overall_status
                     ELSE '{final_overall_status}'
                 END,
                 error_message = CASE 
-                    WHEN overall_status = 'FAILED' THEN error_message   -- only preserve genuine failure errors
+                    WHEN overall_status = 'FAILED' THEN error_message
                     ELSE {error_message_sql}
                 END,
                 updated_at = current_timestamp()
@@ -1895,7 +1941,7 @@ def generate_html_report(run_id: str, spark) -> str:
     
     # Calculate summary stats
     total_tables = len(table_status)
-    successful_tables = sum(1 for t in table_status if t.overall_status in ['VALIDATED', 'TABLE_CREATED'])
+    successful_tables = sum(1 for t in table_status if t.overall_status in ['VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED'])
     failed_tables = sum(1 for t in table_status if 'FAILED' in (t.overall_status or ''))
     total_data_gb = sum(t.s3_total_size_bytes_after or 0 for t in table_status) / (1024**3)
     total_files = sum(t.s3_file_count_after or 0 for t in table_status)
@@ -2186,7 +2232,7 @@ def generate_html_report(run_id: str, spark) -> str:
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
-                    <td>{table_name}</td>
+                    <td><strong>{t.source_table}</strong></td>
                     <td><span class="status-badge {status_class}">{t.overall_status}</span></td>
                     <td class="duration">{discovery_dur}</td>
                     <td class="duration">{distcp_dur}{distcp_detail}</td>
@@ -2387,7 +2433,7 @@ def finalize_run(run_id: str, spark) -> dict:
     stats_result = spark.sql(f"""
         SELECT
             COUNT(*) as total,
-            SUM(CASE WHEN overall_status = 'VALIDATED' THEN 1 ELSE 0 END) as successful,
+            SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS') THEN 1 ELSE 0 END) as successful,
             SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed
 
         FROM {tracking_db}.migration_table_status
