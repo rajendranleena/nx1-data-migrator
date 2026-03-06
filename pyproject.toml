@@ -1,0 +1,35 @@
+[project]
+name = "nx1-data-migrator"
+version = "0.1.0"
+description = "Data platform migration tools (MapR/HDFS to S3/Iceberg) and access control automation"
+requires-python = ">=3.12"
+
+# Documentation only.
+# Each component gets its dependencies from the Airflow host environment.
+[project.optional-dependencies]
+data-iceberg-migrator = [
+    "apache-airflow>=2.7",
+    "pyspark>=3.4",
+    "pandas>=2.0",
+    "openpyxl>=3.1",
+    "python-dotenv>=1.0",
+]
+ranger-policies-generator = [
+    "apache-airflow>=2.7",
+    "apache-ranger>=0.0.11",
+    "python-keycloak>=3.0",
+    "pandas>=2.0",
+    "openpyxl>=3.1",
+    "python-dotenv>=1.0",
+]
+dev = [
+    "ruff>=0.4",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "SIM"]
+ignore = ["E501"]

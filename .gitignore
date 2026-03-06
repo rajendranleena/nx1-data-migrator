@@ -1,1 +1,19 @@
+# Virtual environments
 .venv/
+
+# Bytecode
+__pycache__/
+*.py[cod]
+
+# IDE
+.idea/
+.vscode/
+
+# Environment
+.env
+env.shared
+env.*
+!*.example
+
+# OS
+.DS_Store
