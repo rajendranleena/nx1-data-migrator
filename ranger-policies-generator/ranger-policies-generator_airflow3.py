@@ -25,8 +25,8 @@ import os
 
 _dag_dir = os.path.dirname(__file__)
 _dag_stem = Path(__file__).stem
-load_dotenv(os.path.join(_dag_dir, '.env.shared'))
-load_dotenv(os.path.join(_dag_dir, f'.env.{_dag_stem}'), override=True)
+load_dotenv(os.path.join(_dag_dir, 'env.shared'))
+load_dotenv(os.path.join(_dag_dir, f'env.{_dag_stem}'), override=True)
 
 sys.path.append('/opt/airflow/utils/migrations') 
 
