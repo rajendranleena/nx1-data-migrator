@@ -44,10 +44,14 @@ from airflow.models import Variable
 from airflow.models.param import Param
 from airflow.providers.ssh.hooks.ssh import SSHHook
 from dotenv import load_dotenv
+from pathlib import Path
 import logging
 import os
 
-load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+_dag_dir = os.path.dirname(__file__)
+_dag_stem = Path(__file__).stem
+load_dotenv(os.path.join(_dag_dir, '.env.shared'))
+load_dotenv(os.path.join(_dag_dir, f'.env.{_dag_stem}'), override=True)
 
 logger = logging.getLogger(__name__)
 

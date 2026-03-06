@@ -18,11 +18,15 @@ from airflow.decorators import task
 from airflow.models import Variable
 from airflow.utils.trigger_rule import TriggerRule
 from dotenv import load_dotenv
+from pathlib import Path
 from typing import Dict, List, Any
 import logging
 import os
 
-load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+_dag_dir = os.path.dirname(__file__)
+_dag_stem = Path(__file__).stem
+load_dotenv(os.path.join(_dag_dir, '.env.shared'))
+load_dotenv(os.path.join(_dag_dir, f'.env.{_dag_stem}'), override=True)
 
 sys.path.append('/opt/airflow/utils/migrations') 
 
