@@ -476,9 +476,12 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         if not src_db:
             continue
 
-        raw_cell = str(row.get('table', '') or '').strip() or '*'
-        dest_db = str(row.get('dest_database', '') or '').strip() or src_db
-        raw_bucket = str(row.get('bucket', '') or '').strip()
+        raw_cell_val = row.get('table', '')
+        raw_cell = '*' if (raw_cell_val is None or (isinstance(raw_cell_val, float) and __import__('math').isnan(raw_cell_val)) or str(raw_cell_val).strip().lower() in ('', 'nan')) else str(raw_cell_val).strip() or '*'
+        dest_db_val = row.get('dest_database', '')
+        dest_db = src_db if (dest_db_val is None or (isinstance(dest_db_val, float) and __import__('math').isnan(dest_db_val)) or str(dest_db_val).strip().lower() in ('', 'nan')) else str(dest_db_val).strip() or src_db
+        raw_bucket_val = row.get('bucket', '')
+        raw_bucket = '' if (raw_bucket_val is None or (isinstance(raw_bucket_val, float) and __import__('math').isnan(raw_bucket_val)) or str(raw_bucket_val).strip().lower() == 'nan') else str(raw_bucket_val).strip()
         bucket_val = normalize_bucket(raw_bucket) if raw_bucket else config['default_s3_bucket']
 
         key = (src_db, dest_db, bucket_val)
@@ -2690,11 +2693,11 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
         if not src_db:
             continue
         
-        tbl_pattern = str(row.get('table', '*')).strip() if row.get('table') is not None else '*'
-        tbl_pattern = tbl_pattern or '*'
+        tbl_val = row.get('table', None)
+        tbl_pattern = '*' if (tbl_val is None or (isinstance(tbl_val, float) and __import__('math').isnan(tbl_val)) or str(tbl_val).strip().lower() in ('', 'nan')) else str(tbl_val).strip() or '*'
         
-        inplace_val = row.get('inplace_migration', 'F')
-        if inplace_val is None or (hasattr(inplace_val, '__len__') and len(str(inplace_val).strip()) == 0):
+        inplace_val = row.get('inplace_migration', None)
+        if inplace_val is None or (isinstance(inplace_val, float) and __import__('math').isnan(inplace_val)) or str(inplace_val).strip().lower() in ('', 'nan', 'f', 'false', 'no', '0'):
             inplace_migration = False
         else:
             inplace_migration = str(inplace_val).strip().upper() in ('T', 'TRUE', 'YES', '1')
