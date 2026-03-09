@@ -259,4 +259,15 @@ When you specify a rowfilter expression in the Excel sheet, the system automatic
 1. **Access Policy**: Grants the full set of requested permissions (read/write/all) expanded to their appropriate Ranger access types (e.g., read → select, use, execute, show, etc.)
 2. **Row Filter Policy**: Applies the SQL filter expression to limit which rows are visible (restricted to SELECT access for row visibility filtering)
 
-Both policies work together to provide secure, filtered access. You specify a rowfilter once in Excel, but they are tracked as separate policies in Ranger and appear as separate entries in the tracking tables and HTML report. 
+Both policies work together to provide secure, filtered access. You specify a rowfilter once in Excel, but they are tracked as separate policies in Ranger and appear as separate entries in the tracking tables and HTML report.
+
+## Notes for Dev
+
+Env files are loaded from `/opt/airflow/utils/migration_configs/`:
+
+- `env.shared` — shared config (S3, SSH, Spark, Ranger, Keycloak credentials, etc.)
+- `env.<dag_stem>` — per-developer overrides (e.g. `env.ranger-policies-generator_airflow3`)
+
+Copy the `env.*.example` files there, drop the `.example` suffix, and fill in your values. If the directory doesn't exist the DAG logs a warning and falls back to Airflow Variables / defaults.
+
+Config resolution: Airflow Variable → `os.getenv()` → hardcoded default in `get_config()`.

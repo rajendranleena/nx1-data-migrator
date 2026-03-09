@@ -925,4 +925,17 @@ VALIDATION_FAILED
 
 ---
 
+## Notes for Dev
+
+Env files are loaded from `/opt/airflow/utils/migration_configs/`:
+
+- `env.shared` — shared config (S3, SSH, Spark credentials, etc.)
+- `env.<dag_stem>` — per-developer overrides (e.g. `env.migration_dags_combined`)
+
+Copy the `env.*.example` files there, drop the `.example` suffix, and fill in your values. If the directory doesn't exist the DAG logs a warning and falls back to Airflow Variables / defaults.
+
+Config resolution: Airflow Variable → `os.getenv()` → hardcoded default in `get_config()`.
+
+---
+
 End of Document

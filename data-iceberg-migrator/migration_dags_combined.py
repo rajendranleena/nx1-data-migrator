@@ -48,12 +48,15 @@ from pathlib import Path
 import logging
 import os
 
-_dag_dir = os.path.dirname(__file__)
 _dag_stem = Path(__file__).stem
-load_dotenv(os.path.join(_dag_dir, 'env.shared'))
-load_dotenv(os.path.join(_dag_dir, f'env.{_dag_stem}'), override=True)
-
 logger = logging.getLogger(__name__)
+
+_config_dir = '/opt/airflow/utils/migration_configs'
+if os.path.isdir(_config_dir):
+    load_dotenv(os.path.join(_config_dir, 'env.shared'))
+    load_dotenv(os.path.join(_config_dir, f'env.{_dag_stem}'), override=True)
+else:
+    logger.warning(f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults")
 
 # =============================================================================
 # Duration tracking decorator using XCom
