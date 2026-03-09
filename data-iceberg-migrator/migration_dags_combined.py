@@ -2440,35 +2440,57 @@ def finalize_run(run_id: str, spark) -> dict:
     """Finalize migration run - update stats in Iceberg tracking."""
     config = get_config()
     tracking_db = config['tracking_database']
-    
-    stats_result = spark.sql(f"""
-        SELECT
-            COUNT(*) as total,
-            SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS') THEN 1 ELSE 0 END) as successful,
-            SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed
 
-        FROM {tracking_db}.migration_table_status
-        WHERE run_id = '{run_id}'
-    """).collect()
-    if not stats_result:
-        logger.error(f"No stats found for run_id: {run_id}")
-        stats = {'total': 0, 'successful': 0, 'failed': 0}
-    else:
-        stats = stats_result[0]
-    
-    spark.sql(f"""
-        UPDATE {tracking_db}.migration_runs
-        SET status = 'COMPLETED',
-            completed_at = current_timestamp(),
-            total_tables = {stats['total']},
-            successful_tables = {stats['successful']},
-            failed_tables = {stats['failed']}
-        WHERE run_id = '{run_id}'
-    """)
-    
+    stats = {'total': 0, 'successful': 0, 'failed': 0} 
+    final_status = 'FAILED'
+
+    try:
+        stats_result = spark.sql(f"""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS') THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed
+            FROM {tracking_db}.migration_table_status
+            WHERE run_id = '{run_id}'
+        """).collect()
+
+        if not stats_result or stats_result[0]['total'] == 0:
+            logger.warning(f"[finalize_run] No table records found for run_id '{run_id}'. "
+                           f"Upstream tasks (discover/distcp) likely failed before writing any records.")
+            final_status = 'FAILED'
+        else:
+            stats = {
+                'total': stats_result[0]['total'] or 0,
+                'successful': stats_result[0]['successful'] or 0,
+                'failed': stats_result[0]['failed'] or 0,
+            }
+            final_status = 'COMPLETED' if stats['failed'] == 0 else 'COMPLETED_WITH_FAILURES'
+
+    except Exception as e:
+        logger.error(f"[finalize_run] Failed to query migration_table_status: {str(e)}")
+        final_status = 'FAILED'
+
+    try:
+        execute_with_iceberg_retry(spark, f"""
+            UPDATE {tracking_db}.migration_runs
+            SET status = '{final_status}',
+                completed_at = current_timestamp(),
+                total_tables = {stats['total']},
+                successful_tables = {stats['successful']},
+                failed_tables = {stats['failed']}
+            WHERE run_id = '{run_id}'
+        """, task_label="finalize_run:update_migration_runs")
+
+        logger.info(f"[finalize_run] Run '{run_id}' finalized with status '{final_status}'. "
+                    f"total={stats['total']}, successful={stats['successful']}, failed={stats['failed']}")
+
+    except Exception as e:
+        logger.error(f"[finalize_run] Failed to update migration_runs for run_id '{run_id}': {str(e)}")
+        raise
+
     return {
         'run_id': run_id,
-        'status': 'COMPLETED',
+        'status': final_status,
         'total': stats['total'],
         'successful': stats['successful'],
         'failed': stats['failed']
@@ -3671,48 +3693,75 @@ def finalize_iceberg_run(run_id: str, spark) -> dict:
     """Finalize Iceberg migration run - aggregate statistics."""
     config = get_config()
     tracking_db = config['tracking_database']
-    
-    stats_result = spark.sql(f"""
-        SELECT
-            COUNT(*) as total,
-            SUM(CASE WHEN status IN ('VALIDATED', 'COMPLETED') THEN 1 ELSE 0 END) as successful,
-            SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed,
-            SUM(CASE WHEN status = 'SKIPPED' THEN 1 ELSE 0 END) as skipped,
-            SUM(CASE WHEN row_count_match = false THEN 1 ELSE 0 END) as count_mismatches
-        FROM {tracking_db}.iceberg_migration_table_status
-        WHERE run_id = '{run_id}'
-    """).collect()
-    if not stats_result:
-        logger.error(f"No stats found for run_id: {run_id}")
-        stats = {'total': 0, 'successful': 0, 'failed': 0, 'skipped': 0, 'count_mismatches': 0}
-    else:
-        stats = stats_result[0]
 
-    migration_type_result = spark.sql(f"""
-        SELECT migration_type, COUNT(*) as cnt
-        FROM {tracking_db}.iceberg_migration_table_status
-        WHERE run_id = '{run_id}'
-        GROUP BY migration_type
-        ORDER BY cnt DESC
-        LIMIT 1
-    """).collect()
-    
-    overall_migration_type = migration_type_result[0]['migration_type'] if migration_type_result else 'UNKNOWN'
+    stats = {'total': 0, 'successful': 0, 'failed': 0, 'skipped': 0, 'count_mismatches': 0}
+    final_status = 'FAILED'
+    overall_migration_type = 'UNKNOWN'
 
-    spark.sql(f"""
-        UPDATE {tracking_db}.iceberg_migration_runs
-        SET status = 'COMPLETED',
-            completed_at = current_timestamp(),
-            migration_type = '{overall_migration_type}',
-            total_tables = {stats['total']},
-            successful_tables = {stats['successful']},
-            failed_tables = {stats['failed']}
-        WHERE run_id = '{run_id}'
-    """)
-    
+    try:
+        stats_result = spark.sql(f"""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN status IN ('VALIDATED', 'COMPLETED') THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN status = 'SKIPPED' THEN 1 ELSE 0 END) as skipped,
+                SUM(CASE WHEN row_count_match = false THEN 1 ELSE 0 END) as count_mismatches
+            FROM {tracking_db}.iceberg_migration_table_status
+            WHERE run_id = '{run_id}'
+        """).collect()
+
+        if not stats_result or stats_result[0]['total'] == 0:
+            logger.warning(f"[finalize_iceberg_run] No table records found for run_id '{run_id}'.")
+            final_status = 'FAILED'
+        else:
+            stats = {
+                'total': stats_result[0]['total'] or 0,
+                'successful': stats_result[0]['successful'] or 0,
+                'failed': stats_result[0]['failed'] or 0,
+                'skipped': stats_result[0]['skipped'] or 0,
+                'count_mismatches': stats_result[0]['count_mismatches'] or 0,
+            }
+            final_status = 'COMPLETED' if stats['failed'] == 0 else 'COMPLETED_WITH_FAILURES'
+
+    except Exception as e:
+        logger.error(f"[finalize_iceberg_run] Failed to query iceberg_migration_table_status: {str(e)}")
+        final_status = 'FAILED'
+
+    try:
+        migration_type_result = spark.sql(f"""
+            SELECT migration_type, COUNT(*) as cnt
+            FROM {tracking_db}.iceberg_migration_table_status
+            WHERE run_id = '{run_id}'
+            GROUP BY migration_type
+            ORDER BY cnt DESC
+            LIMIT 1
+        """).collect()
+        overall_migration_type = migration_type_result[0]['migration_type'] if migration_type_result else 'UNKNOWN'
+    except Exception as e:
+        logger.warning(f"[finalize_iceberg_run] Could not determine migration_type: {str(e)}")
+
+    try:
+        execute_with_iceberg_retry(spark, f"""
+            UPDATE {tracking_db}.iceberg_migration_runs
+            SET status = '{final_status}',
+                completed_at = current_timestamp(),
+                migration_type = '{overall_migration_type}',
+                total_tables = {stats['total']},
+                successful_tables = {stats['successful']},
+                failed_tables = {stats['failed']}
+            WHERE run_id = '{run_id}'
+        """, task_label="finalize_iceberg_run:update_iceberg_migration_runs")
+
+        logger.info(f"[finalize_iceberg_run] Run '{run_id}' finalized with status '{final_status}'. "
+                    f"total={stats['total']}, successful={stats['successful']}, failed={stats['failed']}")
+
+    except Exception as e:
+        logger.error(f"[finalize_iceberg_run] Failed to update iceberg_migration_runs: {str(e)}")
+        raise
+
     return {
         'run_id': run_id,
-        'status': 'COMPLETED',
+        'status': final_status,
         'total': stats['total'],
         'successful': stats['successful'],
         'failed': stats['failed'],
