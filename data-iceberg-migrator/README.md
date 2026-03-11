@@ -6,10 +6,11 @@ An automated **Airflow TaskFlow-based migration pipeline** consisting of two ind
 
 ## Overview
 
-This implementation provides two independent but complementary migration DAGs:
+This implementation provides three independent but complementary migration DAGs:
 
 1. **`mapr_to_s3_migration`** - Migrates Hive tables from MapR-FS/HDFS to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
+3. **`folder_only_data_copy`** - Copies raw folders from MapR/HDFS to S3 via DistCp — no Hive metadata
 
 ---
 
@@ -61,6 +62,7 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | ----- | ----------------- | -------- | ------------------------- | -------------------------------------------- |
 | DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config   | `s3a://config-bucket/migration.xlsx`         |
 | DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config | `s3a://config-bucket/iceberg_migration.xlsx` |
+| DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config | `s3a://config-bucket/folder_copy.xlsx`   |
 
 ---
 
@@ -922,6 +924,228 @@ VALIDATION_FAILED
 
 1. **migration_tracking.iceberg_migration_runs**: Run-level metadata for Iceberg migrations.
 2. **migration_tracking.iceberg_migration_table_status**: Table-level tracking for Iceberg migrations.
+
+---
+
+### Folder Data Copy Tracking
+
+1. **migration_tracking.data_copy_runs**: Run-level metadata for folder-only data copy runs.
+2. **migration_tracking.data_copy_status**: Folder-level tracking — one row per source/destination pair per run.
+
+---
+
+## DAG 3: Folder-Only Data Copy
+
+### Purpose
+
+Copies raw folders from MapR-FS/HDFS to S3 using Hadoop DistCp via SSH, with no Hive metadata operations. Supports incremental re-runs and produces per-folder validation and an HTML report.
+
+---
+
+### Key Features
+
+- **No Hive dependency** — pure filesystem copy, works for any data format
+- **Files and folders** — works for both individual files and directories; `hadoop distcp` accepts any path. For a single file with no `dest_folder` specified, the destination key defaults to `basename(filename)`, so set `dest_folder` explicitly in the Excel if you need a precise S3 key.
+- **Incremental support** — DistCp `-update` flag ensures only new/changed files are copied on re-runs
+- **Per-folder tracking** — Iceberg tables record file counts, sizes, and match status for each folder
+- **S3 validation** — re-verifies destination file count and size after copy
+- **HTML report** — per-folder copy details with match indicators written to S3
+- **Email delivery** — optional report email via SMTP
+
+---
+
+### Excel Configuration Format
+
+**Required Columns:**
+
+| Column          | Required | Description                                             | Example                        |
+| --------------- | -------- | ------------------------------------------------------- | ------------------------------ |
+| `source_path`   | **Yes**  | Full MapR/HDFS source path                              | `/mapr/cluster1/data/raw/sales` |
+| `target_bucket` | **Yes**  | S3 bucket — normalised to `s3a://`                      | `s3a://data-lake`              |
+| `dest_folder`   | No       | Destination folder inside the bucket; defaults to the basename of `source_path` if not specified | `sales` |
+
+**Default Behaviour:**
+
+- If `dest_folder` is empty, the folder name defaults to the basename of `source_path`.
+  - Example: `source_path = /mapr/cluster1/data/raw/sales` → `dest_folder = sales`
+- `target_bucket` is normalised: `s3://` and `s3n://` are rewritten to `s3a://`.
+- Rows with a missing `source_path` or `target_bucket` are skipped with a warning.
+
+**Excel Sample:**
+
+```
+| source_path                                        | target_bucket          | dest_folder         |
+|----------------------------------------------------|------------------------|---------------------|
+| /mapr/cluster1/data/raw/sales                      | s3a://data-lake        | raw/sales           |
+| /mapr/cluster1/data/raw/marketing                  | s3a://data-lake        | raw/marketing       |
+| /mapr/cluster1/data/processed/finance              | s3a://data-lake        |                     |
+| hdfs://namenode:8020/warehouse/logs/app_events     | s3://archive-bucket    | logs/app_events     |
+| hdfs://namenode:8020/user/hive/warehouse/features  | s3a://ml-data-lake     |                     |
+```
+
+> Row 3: `dest_folder` is empty → defaults to `finance` (basename of source path)  
+> Row 4: HDFS path uses `hdfs://namenode:8020/` prefix; `s3://` bucket is automatically normalised to `s3a://`  
+> Row 5: `dest_folder` is empty → defaults to `features`
+
+---
+
+### Task Flow
+
+```
+init_folder_copy_tracking_tables
+    ↓
+create_data_copy_run
+    ↓
+parse_folder_copy_excel
+    ↓
+┌──────────────────────────────────────────────────────────────┐
+│  Dynamic Task Mapping (one instance per Excel row)           │
+│                                                              │
+│  run_folder_distcp_ssh (SSH: DistCp -update, 24h timeout)   │
+│      ↓                          ↓                           │
+│  record_data_copy_status   validate_data_copy (SSH)          │
+│                                 ↓                           │
+│                        update_data_copy_validation           │
+└──────────────────────────────────────────────────────────────┘
+    ↓ (all mapped tasks done)
+finalize_data_copy_run
+    ↓
+generate_data_copy_html_report
+    ↓
+send_data_copy_report_email
+```
+
+---
+
+### Task Summaries
+
+#### Step 0 - `init_folder_copy_tracking_tables`
+
+**Type:** PySpark  
+**Purpose:** Create `data_copy_runs` and `data_copy_status` Iceberg tables if they do not exist
+
+---
+
+#### Step 1 - `create_data_copy_run`
+
+**Type:** PySpark  
+**Purpose:** Insert a `RUNNING` record into `data_copy_runs` and return the `run_id`
+
+- Run ID format: `folder_run_{YYYYMMDD_HHMMSS}_{uuid8}`
+
+---
+
+#### Step 2 - `parse_folder_copy_excel`
+
+**Type:** PySpark  
+**Purpose:** Read and parse the Excel config file from S3
+
+- Reads `source_path`, `target_bucket`, `dest_folder` columns
+- Normalises `target_bucket` to `s3a://`
+- Defaults `dest_folder` to `basename(source_path)` if not specified
+- Returns a list of folder config dicts for dynamic task mapping
+- Raises if no valid rows are found
+
+---
+
+#### Step 3 - `run_folder_distcp_ssh`
+
+**Type:** SSH (mapped per folder)  
+**Purpose:** Copy a single source folder to S3 via Hadoop DistCp
+
+- Always uses `-update` flag — safe for both full and incremental runs
+- Captures source file count and size before copy
+- Captures S3 file count and size before and after copy
+- Computes `files_copied` and `bytes_copied` as before/after deltas
+- Sets `file_count_match` (exact) and `size_match` (within 1% tolerance)
+- On failure returns a FAILED result dict — does not raise — so tracking can record it
+- **Timeout:** 24 hours (`SSH_COMMAND_TIMEOUT`)
+
+---
+
+#### Step 4 - `record_data_copy_status`
+
+**Type:** PySpark (mapped per folder)  
+**Purpose:** Insert one row into `data_copy_status` with DistCp metrics
+
+---
+
+#### Step 5 - `validate_data_copy`
+
+**Type:** SSH (mapped per folder)  
+**Purpose:** Re-verify the S3 destination after copy
+
+- Skips (marks `VALIDATION_SKIPPED`) if the copy step already failed
+- Re-runs `hadoop fs -ls -R` and `hadoop fs -du -s` on the S3 destination
+- Sets `VALIDATED` only if destination exists, file count matches, and size is within 1%
+- Otherwise sets `VALIDATION_FAILED` with a descriptive error
+
+---
+
+#### Step 6 - `update_data_copy_validation`
+
+**Type:** PySpark (mapped per folder)  
+**Purpose:** Update `data_copy_status` with final validation metrics and status
+
+---
+
+#### Step 7 - `finalize_data_copy_run`
+
+**Type:** PySpark  
+**Purpose:** Aggregate folder counts and mark the run as complete
+
+- Queries `data_copy_status` for authoritative counts
+- Sets run status to `COMPLETED` (zero failures) or `COMPLETED_WITH_ERRORS`
+- Updates `data_copy_runs` with totals and `completed_at`
+
+---
+
+#### Step 8 - `generate_data_copy_html_report`
+
+**Type:** PySpark  
+**Purpose:** Generate an HTML report and write it to S3
+
+- Summary cards: run status, total/validated/failed folders, incremental count, total GB, files, bytes copied
+- Per-folder details table with source path, destination, copy status badge, file/size match indicators, and error snippets
+- Writes to `{report_location}/{run_id}_data_copy_report.html`
+- Returns both `report_path` and `html_content`
+
+---
+
+#### Step 9 - `send_data_copy_report_email`
+
+**Type:** PySpark  
+**Purpose:** Email the HTML report via SMTP
+
+- Subject: `Folder Data Copy Report - {run_id}`
+- Skips silently if `migration_email_recipients` variable is empty
+- Uses same SMTP connection (`migration_smtp_conn_id`) as DAG 1 and DAG 2
+
+---
+
+### Status Progression
+
+```
+RUNNING  (data_copy_runs while DAG is executing)
+    ↓
+    │ [Per folder: DistCp completes]
+    ↓
+COMPLETED / VALIDATED  (all folders copied and validated)
+    │
+    │ (OR, if any folder failed)
+    ↓
+COMPLETED_WITH_ERRORS
+```
+
+**Per-folder statuses (data_copy_status):**
+
+| Status               | Meaning                                              |
+| -------------------- | ---------------------------------------------------- |
+| `COMPLETED`          | DistCp succeeded (before validation)                 |
+| `VALIDATED`          | Destination verified — file count and size match     |
+| `VALIDATION_FAILED`  | Destination exists but file count or size mismatch   |
+| `VALIDATION_SKIPPED` | Copy step failed — validation not attempted          |
+| `FAILED`             | DistCp failed                                        |
 
 ---
 
