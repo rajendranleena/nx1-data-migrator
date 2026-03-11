@@ -15,5 +15,8 @@ env.shared
 env.*
 !*.example
 
+# Coverage
+.coverage
+
 # OS
 .DS_Store

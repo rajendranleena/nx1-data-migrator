@@ -148,6 +148,736 @@ def build_policy_name(catalog: str, database: str, table: str, column: str) -> s
     return '.'.join(parts)
 
 
+def parse_excel_rows(df) -> Dict[str, Any]:
+    """Parse Excel DataFrame rows into policies, role_principals, and skipped_rows."""
+    policies = {}
+    role_principals = {}
+    skipped_rows = []
+
+    for idx, row in df.iterrows():
+        role = str(row.get('role', '')).strip()
+        if is_empty_like(role):
+            role = ''
+            logger.debug(f"Row {idx}: Role field was empty/null-like, treating as empty")
+        databases = str(row.get('database', '')).strip()
+        tables = str(row.get('tables', '*')).strip() or '*'
+        columns = str(row.get('columns', '*')).strip() or '*'
+        url = str(row.get('url', '')).strip()
+        permissions = str(row.get('permissions', 'read')).strip()
+        groups = str(row.get('groups', '')).strip()
+        users = str(row.get('users', '')).strip()
+        rowfilter = str(row.get('rowfilter', '')).strip()
+        policy_label_override = str(row.get('policy_label', '')).strip()
+        if is_empty_like(rowfilter):
+            rowfilter = ''
+            logger.debug(f"Row {idx}: Rowfilter field was empty/null-like, treating as empty")
+        # Enforce: Either database or url must be provided, not both or neither
+        has_db = not is_empty_like(databases)
+        has_url = bool(not is_empty_like(url) and url != '-' and url != '*')
+        if (has_db and has_url) or (not has_db and not has_url):
+            reason = f"Row must have either database or url (but not both/neither). Skipped. role={role}, database={databases}, url={url}"
+            logger.error(reason)
+            skipped_rows.append({'row_index': idx, 'role': role, 'database': databases, 'url': url, 'reason': reason})
+            continue
+        # Validate: Rowfilters are only valid for database policies, not URL policies
+        if has_url and rowfilter:
+            reason = f"Rowfilters are not supported for URL-based policies. Skipped. url={url}, rowfilter={rowfilter}"
+            logger.error(reason)
+            skipped_rows.append({'row_index': idx, 'role': role, 'database': databases, 'url': url, 'reason': reason})
+            continue
+        group_list = parse_csv_field(groups)
+        user_list = parse_csv_field(users)
+        if role:
+            role_principals.setdefault(role, {'groups': [], 'users': []})
+        if group_list:
+            if not role: # If group input is present, role is mandatory
+                reason = f"Row with groups {group_list} must have a role. Skipping row."
+                logger.error(reason)
+                skipped_rows.append({'row_index': idx, 'role': role, 'database': databases, 'url': url, 'reason': reason})
+                continue
+            for g in group_list:
+                if g not in role_principals[role]['groups']:
+                    role_principals[role]['groups'].append(g)
+        if user_list and role:
+            for u in user_list:
+                if u not in role_principals[role]['users']:
+                    role_principals[role]['users'].append(u)
+        # If only users are present and no group, and no role is specified, create role_<username> for each user
+        if user_list and not group_list and is_empty_like(role):
+            for u in user_list:
+                user_role = f"role_{u}"
+                role_principals.setdefault(user_role, {'groups': [], 'users': []})
+                if u not in role_principals[user_role]['users']:
+                    role_principals[user_role]['users'].append(u)
+
+        # Build effective role bindings for policy assignment (normalized).
+        # - explicit role: one role bound to all row users
+        # - users-only row: one synthetic role per user (role_<user>)
+        if role:
+            effective_role_bindings = [{'role': role, 'users': user_list}]
+        elif user_list and not group_list:
+            effective_role_bindings = [{'role': f"role_{u}", 'users': [u]} for u in user_list]
+        else:
+            reason = (
+                f"Row does not define a valid role binding. Skipped. "
+                f"role={role}, groups={group_list}, users={user_list}"
+            )
+            logger.error(reason)
+            skipped_rows.append({
+                'row_index': idx,
+                'role': role,
+                'database': databases,
+                'url': url,
+                'reason': reason,
+            })
+            continue
+
+        perm_list = parse_permission_string(permissions)
+
+        if not is_empty_like(url) and url != '-' and url != '*':
+            policy_name = url
+            policy_label = policy_label_override if policy_label_override else None
+            if policy_name not in policies:
+                policies[policy_name] = {'type': 'url', 'url': url, 'roles': [], 'label': policy_label}
+            for binding in effective_role_bindings:
+                effective_role = binding['role']
+                effective_users = binding['users']
+                existing_roles = [r['role'] for r in policies[policy_name]['roles']]
+                if effective_role not in existing_roles:
+                    policies[policy_name]['roles'].append({'role': effective_role, 'permissions': perm_list, 'groups': group_list, 'users': effective_users, 'rowfilter': rowfilter})
+                else:
+                    for r in policies[policy_name]['roles']:
+                        if r['role'] == effective_role:
+                            for p in perm_list:
+                                if p not in r['permissions']:
+                                    r['permissions'].append(p)
+                            # Merge groups, users, rowfilter
+                            r['groups'] = list(set(r.get('groups', []) + group_list))
+                            r['users'] = list(set(r.get('users', []) + effective_users))
+                            if rowfilter:
+                                if r.get('rowfilter') and r['rowfilter'] != rowfilter:
+                                    raise ValueError(
+                                        f"Conflicting rowfilters for role {effective_role} in policy {policy_name}: "
+                                        f"{r['rowfilter']} vs {rowfilter}")
+                                r['rowfilter'] = rowfilter
+        else:
+            db_list = parse_csv_field(databases)
+            table_list = parse_csv_field(tables) or ['*']
+            column_list = parse_csv_field(columns) or ['*']
+            for database in db_list:
+                if is_empty_like(database):
+                    continue
+                for table in table_list:
+                    for column in column_list:
+                        policy_name = build_policy_name('iceberg', database, table, column)
+                        policy_label = policy_label_override if policy_label_override else None
+                        if policy_name not in policies:
+                            policies[policy_name] = {
+                                'type': 'table',
+                                'catalog': 'iceberg',
+                                'schema': database,
+                                'table': table or '*',
+                                'column': column or '*',
+                                'roles': [],
+                                'label': policy_label
+                            }
+                        for binding in effective_role_bindings:
+                            effective_role = binding['role']
+                            effective_users = binding['users']
+                            existing_roles = [r['role'] for r in policies[policy_name]['roles']]
+                            if effective_role not in existing_roles:
+                                policies[policy_name]['roles'].append({'role': effective_role, 'permissions': perm_list, 'groups': group_list, 'users': effective_users, 'rowfilter': rowfilter})
+                            else:
+                                for r in policies[policy_name]['roles']:
+                                    if r['role'] == effective_role:
+                                        for p in perm_list:
+                                            if p not in r['permissions']:
+                                                r['permissions'].append(p)
+                                        # Merge groups, users, rowfilter
+                                        r['groups'] = list(set(r.get('groups', []) + group_list))
+                                        r['users'] = list(set(r.get('users', []) + effective_users))
+                                        if rowfilter:
+                                            r['rowfilter'] = rowfilter
+
+    logger.info(f"Parsed {len(policies)} policies and {len(role_principals)} role-principal mappings, {len(skipped_rows)} rows skipped")
+    return {'policies': policies, 'role_principals': role_principals, 'skipped_rows': skipped_rows}
+
+
+def patch_policies_with_keycloak(
+    policies: Dict[str, Any],
+    keycloak_result: Dict[str, Any],
+    tracking_run_id: str
+) -> Dict[str, Any]:
+    """
+    Filter policy roles to only include principals that were successfully mapped in Keycloak.
+    Returns patched policies and failure tracking info.
+    """
+    from datetime import datetime as dt
+
+    patched_policies = {}
+    prevalidated_policy_failures = []
+    failure_statuses = []
+    applied_policy_roles = {}
+    excluded_policy_roles = {}
+
+    for policy_name, policy_data in policies.items():
+        patched_policy = dict(policy_data)
+        patched_policy['roles'] = []
+        excluded_roles_in_policy = []
+        applied_roles_in_policy = []
+        for r in policy_data.get('roles', []):
+            role_name = r.get('role')
+            if is_empty_like(role_name):
+                logger.error(
+                    "Skipping Ranger policy assignment for invalid role in policy %s: %s",
+                    policy_name,
+                    role_name,
+                )
+                continue
+
+            users = r.get('users', []) or []
+            groups = r.get('groups', []) or []
+            # Find successfully mapped groups
+            mapped_groups = [
+                g for g in groups
+                if {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('created_mappings', [])
+                or {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('existing_mappings', [])
+            ]
+            # Find successfully mapped users
+            mapped_users = [
+                u for u in users
+                if {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('created_mappings', [])
+                or {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('existing_mappings', [])
+            ]
+            if not mapped_groups and not mapped_users:
+                logger.error(
+                    "Excluding role principal %s from Ranger policy %s due to failed Keycloak principal mapping for all users/groups in this policy row",
+                    role_name,
+                    policy_name,
+                )
+                excluded_roles_in_policy.append(role_name)
+                continue
+            patched_role = dict(r)
+            # Only include successfully mapped groups and users
+            patched_role['groups'] = mapped_groups if mapped_groups else []
+            patched_role['users'] = mapped_users if mapped_users else []
+            patched_role['rowfilter'] = r.get('rowfilter', '')
+            patched_policy['roles'].append(patched_role)
+            applied_roles_in_policy.append(role_name)
+        if applied_roles_in_policy:
+            applied_policy_roles[policy_name] = sorted(set(applied_roles_in_policy))
+        if excluded_roles_in_policy:
+            excluded_policy_roles[policy_name] = sorted(set(excluded_roles_in_policy))
+        # Only create the Ranger policy if there is at least one applied role
+        if not patched_policy['roles']:
+            if excluded_roles_in_policy:
+                failure_reason = (
+                    "Ranger policy was not created because required Keycloak principal mapping failed for "
+                    f"role principal(s): {', '.join(sorted(set(excluded_roles_in_policy)))}."
+                )
+            else:
+                failure_reason = (
+                    "Ranger policy was not created because no valid role principal could be built from the input rows. "
+                    "The role value is empty/invalid, and no users-only fallback was available."
+                )
+            prevalidated_policy_failures.append({'name': policy_name, 'error': failure_reason})
+            failure_statuses.append({
+                "run_id": tracking_run_id,
+                "object_type": "policy",
+                "object_name": policy_name,
+                "status": "FAILED",
+                "error_message": failure_reason,
+                "attempt": 1,
+                "started_at": dt.now(timezone.utc),
+                "completed_at": dt.now(timezone.utc)
+            })
+            continue
+        patched_policies[policy_name] = patched_policy
+
+    return {
+        'patched_policies': patched_policies,
+        'prevalidated_failures': prevalidated_policy_failures,
+        'failure_statuses': failure_statuses,
+        'applied_roles': applied_policy_roles,
+        'excluded_roles': excluded_policy_roles,
+    }
+
+
+def build_keycloak_failure_response(
+    role_principals: Dict[str, Any],
+    tracking_run_id: str,
+    error_msg: str,
+    attempt_num: int
+) -> Dict[str, Any]:
+    """Build full failure response when Keycloak connection fails."""
+    from datetime import datetime as dt
+
+    statuses = []
+
+    # All roles that were supposed to be created failed
+    for role_name in role_principals.keys():
+        statuses.append({
+            "run_id": tracking_run_id,
+            "object_type": "role",
+            "object_name": role_name,
+            "status": "FAILED",
+            "error_message": f"Keycloak connection failed: {error_msg}",
+            "attempt": attempt_num,
+            "started_at": dt.now(timezone.utc),
+            "completed_at": dt.now(timezone.utc)
+        })
+
+    # All groups that would have been assigned also failed
+    all_groups = set()
+    for role_info in role_principals.values():
+        all_groups.update(role_info.get('groups', []))
+
+    for group_name in sorted(all_groups):
+        statuses.append({
+            "run_id": tracking_run_id,
+            "object_type": "keycloak_group",
+            "object_name": group_name,
+            "status": "FAILED",
+            "error_message": f"Keycloak connection failed: {error_msg}",
+            "attempt": attempt_num,
+            "started_at": dt.now(timezone.utc),
+            "completed_at": dt.now(timezone.utc)
+        })
+
+    # All mappings that would have been created also failed
+    for role_name, role_info in role_principals.items():
+        for group_name in role_info.get('groups', []):
+            statuses.append({
+                "run_id": tracking_run_id,
+                "object_type": "mapping",
+                "object_name": f"{role_name}->{group_name} (group)",
+                "status": "FAILED",
+                "error_message": f"Keycloak connection failed: {error_msg}",
+                "attempt": attempt_num,
+                "started_at": dt.now(timezone.utc),
+                "completed_at": dt.now(timezone.utc)
+            })
+        for user_name in role_info.get('users', []):
+            statuses.append({
+                "run_id": tracking_run_id,
+                "object_type": "mapping",
+                "object_name": f"{role_name}->{user_name} (user)",
+                "status": "FAILED",
+                "error_message": f"Keycloak connection failed: {error_msg}",
+                "attempt": attempt_num,
+                "started_at": dt.now(timezone.utc),
+                "completed_at": dt.now(timezone.utc)
+            })
+
+    return {
+        "summary": {
+            "created_roles": [],
+            "existing_roles": [],
+            "created_groups": [],
+            "existing_groups": [],
+            "created_mappings": [],
+            "existing_mappings": [],
+            "failed": list(role_principals.keys())
+        },
+        "statuses": statuses,
+        "connection_error": True
+    }
+
+
+def build_keycloak_success_statuses(result: Dict[str, Any], tracking_run_id: str) -> List[Dict]:
+    """Build status tracking entries from a successful Keycloak sync result."""
+    from datetime import datetime as dt
+
+    statuses = []
+
+    # Process roles - differentiate between created and existing
+    for entry in result.get('created_roles', []):
+        name = entry if isinstance(entry, str) else str(entry)
+        statuses.append({
+            "run_id": tracking_run_id,
+            "object_type": "role",
+            "object_name": name,
+            "status": "CREATED",
+            "error_message": "",
+            "attempt": 1,
+            "started_at": dt.now(timezone.utc),
+            "completed_at": dt.now(timezone.utc)
+        })
+
+    for entry in result.get('existing_roles', []):
+        name = entry if isinstance(entry, str) else str(entry)
+        statuses.append({
+            "run_id": tracking_run_id,
+            "object_type": "role",
+            "object_name": name,
+            "status": "ALREADY_EXISTS",
+            "error_message": "",
+            "attempt": 1,
+            "started_at": dt.now(timezone.utc),
+            "completed_at": dt.now(timezone.utc)
+        })
+
+    # Process Keycloak groups - track separately from Ranger groups
+    for group_name in result.get('created_groups', []):
+        statuses.append({
+            "run_id": tracking_run_id,
+            "object_type": "keycloak_group",
+            "object_name": group_name,
+            "status": "CREATED",
+            "error_message": "",
+            "attempt": 1,
+            "started_at": dt.now(timezone.utc),
+            "completed_at": dt.now(timezone.utc)
+        })
+
+    for group_name in result.get('existing_groups', []):
+        statuses.append({
+            "run_id": tracking_run_id,
+            "object_type": "keycloak_group",
+            "object_name": group_name,
+            "status": "ALREADY_EXISTS",
+            "error_message": "",
+            "attempt": 1,
+            "started_at": dt.now(timezone.utc),
+            "completed_at": dt.now(timezone.utc)
+        })
+
+    # Process mappings - differentiate between created and existing
+    for entry in result.get('created_mappings', []):
+        if isinstance(entry, dict):
+            principal = entry.get('principal', entry.get('group', entry.get('user', '')))
+            mtype = entry.get('type', 'group' if 'group' in entry else 'user')
+            name = f"{entry.get('role', '')}->{principal} ({mtype})"
+        else:
+            name = str(entry)
+        statuses.append({
+            "run_id": tracking_run_id,
+            "object_type": "mapping",
+            "object_name": name,
+            "status": "CREATED",
+            "error_message": "",
+            "attempt": 1,
+            "started_at": dt.now(timezone.utc),
+            "completed_at": dt.now(timezone.utc)
+        })
+
+    for entry in result.get('existing_mappings', []):
+        if isinstance(entry, dict):
+            principal = entry.get('principal', entry.get('group', entry.get('user', '')))
+            mtype = entry.get('type', 'group' if 'group' in entry else 'user')
+            name = f"{entry.get('role', '')}->{principal} ({mtype})"
+        else:
+            name = str(entry)
+        statuses.append({
+            "run_id": tracking_run_id,
+            "object_type": "mapping",
+            "object_name": name,
+            "status": "ALREADY_EXISTS",
+            "error_message": "",
+            "attempt": 1,
+            "started_at": dt.now(timezone.utc),
+            "completed_at": dt.now(timezone.utc)
+        })
+
+    # Process failures
+    for entry in result.get('failed', []):
+        if isinstance(entry, dict):
+            principal = entry.get('principal', entry.get('group', entry.get('user', '')))
+            mtype = entry.get('type', 'group' if 'group' in entry else 'user')
+            name = f"{entry.get('role', '')}->{principal} ({mtype})"
+            error = entry.get('error', '')
+        else:
+            name = str(entry)
+            error = ''
+        statuses.append({
+            "run_id": tracking_run_id,
+            "object_type": "mapping",
+            "object_name": name,
+            "status": "FAILED",
+            "error_message": error,
+            "attempt": 1,
+            "started_at": dt.now(timezone.utc),
+            "completed_at": dt.now(timezone.utc)
+        })
+
+    return statuses
+
+
+def compute_run_metrics(
+    parsed_data: Dict[str, Any],
+    ranger_result: Dict[str, Any],
+    keycloak_result: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Compute run-level metrics from parsed data and task results."""
+    ranger_summary = ranger_result.get("summary", {})
+    keycloak_summary = keycloak_result.get("summary", {})
+
+    groups_created = len(ranger_summary.get('groups', {}).get('created', []))
+    groups_existing = len(ranger_summary.get('groups', {}).get('existing', []))
+    policies_created = len(ranger_summary.get('policies', {}).get('created', []))
+    policies_updated = len(ranger_summary.get('policies', {}).get('updated', []))
+    policies_failed = len(ranger_summary.get('policies', {}).get('failed', []))
+
+    roles_created = len(keycloak_summary.get('created_roles', []))
+    roles_existing = len(keycloak_summary.get('existing_roles', []))
+    mappings_created = len(keycloak_summary.get('created_mappings', []))
+    mappings_existing = len(keycloak_summary.get('existing_mappings', []))
+
+    all_statuses = []
+    all_statuses.extend(ranger_result.get("statuses", []))
+    all_statuses.extend(keycloak_result.get("statuses", []))
+
+    total_objects = len(all_statuses)
+    successful_objects = sum(
+        1 for s in all_statuses if s.get("status") in ("CREATED", "UPDATED", "ALREADY_EXISTS")
+    )
+    failed_objects = sum(1 for s in all_statuses if s.get("status") == "FAILED")
+
+    overall_status = "COMPLETED" if failed_objects == 0 else "PARTIAL_FAILURE"
+
+    return {
+        "groups_created": groups_created,
+        "groups_existing": groups_existing,
+        "policies_created": policies_created,
+        "policies_updated": policies_updated,
+        "policies_failed": policies_failed,
+        "roles_created": roles_created,
+        "roles_existing": roles_existing,
+        "mappings_created": mappings_created,
+        "mappings_existing": mappings_existing,
+        "total_objects": total_objects,
+        "successful_objects": successful_objects,
+        "failed_objects": failed_objects,
+        "overall_status": overall_status,
+        "ranger_summary": ranger_summary,
+        "keycloak_summary": keycloak_summary,
+    }
+
+
+def build_report_html(run_info, objects, policy_statuses, skipped_rows, tracking_run_id: str) -> str:
+    """Build HTML report string from query results."""
+    from collections import Counter
+
+    total_objects = len(objects)
+    successful_objects = sum(1 for o in objects if o.status in ["CREATED", "UPDATED", "ALREADY_EXISTS"])
+    failed_objects = sum(1 for o in objects if o.status == "FAILED")
+    type_counts = Counter(o.object_type for o in objects)
+
+    # Determine status class for run
+    run_status_class = 'status-success' if run_info.status == 'COMPLETED' else 'status-failed'
+
+    # Build HTML
+    html = f"""
+    <!DOCTYPE html>
+    <html lang=\"en\">
+    <head>
+        <meta charset=\"UTF-8\">
+        <title>Ranger Policy Run Report - {tracking_run_id}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; background: #f5f5f5; padding: 20px; }}
+            .container {{ background: #fff; padding: 20px; border-radius: 8px; max-width: 1400px; margin: 0 auto; }}
+            h1 {{ color: #2c3e50; }}
+            h2 {{ color: #34495e; margin-top: 30px; }}
+            .summary-cards {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0; }}
+            .summary-card {{ padding: 15px 20px; border-radius: 6px; color: #fff; min-width: 150px; text-align: center; }}
+            .success {{ background-color: #28a745; }}
+            .failed {{ background-color: #dc3545; }}
+            .info {{ background-color: #17a2b8; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+            th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
+            th {{ background-color: #343a40; color: white; }}
+            tr:nth-child(even) {{ background-color: #f8f9fa; }}
+            tr:hover {{ background-color: #e9ecef; }}
+            .status-badge {{ padding: 4px 10px; border-radius: 12px; font-weight: bold; color: white; font-size: 12px; }}
+            .status-success {{ background-color: #28a745; }}
+            .status-failed {{ background-color: #dc3545; }}
+            .status-partial {{ background-color: #ffc107; color: #212529; }}
+            .error-cell {{ color: #dc3545; font-size: 12px; max-width: 300px; word-wrap: break-word; }}
+            .run-info {{ background: #f8f9fa; padding: 15px; border-radius: 6px; margin-bottom: 20px; }}
+            .run-info p {{ margin: 5px 0; }}
+        </style>
+    </head>
+    <body>
+        <div class=\"container\">
+            <h1>Ranger Policy Run Report</h1>
+
+            <div class=\"run-info\">
+                <p><strong>Run ID:</strong> {tracking_run_id}</p>
+                <p><strong>DAG Run:</strong> {run_info.dag_run_id}</p>
+                <p><strong>Excel Path:</strong> {run_info.excel_file_path}</p>
+                <p><strong>Started At:</strong> {run_info.started_at}</p>
+                <p><strong>Completed At:</strong> {run_info.completed_at}</p>
+                <p><strong>Status:</strong> <span class=\"status-badge {run_status_class}\">{run_info.status}</span></p>
+            </div>
+
+            <h2>Summary</h2>
+            <div class=\"summary-cards\">
+                <div class=\"summary-card info\">Total Objects<br><strong>{total_objects}</strong></div>
+                <div class=\"summary-card success\">Successful<br><strong>{successful_objects}</strong></div>
+                <div class=\"summary-card failed\">Failed<br><strong>{failed_objects}</strong></div>
+            </div>
+
+            <div class=\"summary-cards\">
+                <div class=\"summary-card info\">Policies Parsed<br><strong>{run_info.total_policies_parsed or 0}</strong></div>
+                <div class=\"summary-card info\">Role Mappings Parsed<br><strong>{run_info.total_role_mappings_parsed or 0}</strong></div>
+            </div>
+
+            <div class=\"summary-cards\">
+                <div class=\"summary-card success\">Groups Created<br><strong>{run_info.groups_created or 0}</strong></div>
+                <div class=\"summary-card info\">Groups Existing<br><strong>{run_info.groups_existing or 0}</strong></div>
+                <div class=\"summary-card success\">Policies Created<br><strong>{run_info.policies_created or 0}</strong></div>
+                <div class=\"summary-card info\">Policies Updated<br><strong>{run_info.policies_updated or 0}</strong></div>
+                <div class=\"summary-card failed\">Policies Failed<br><strong>{run_info.policies_failed or 0}</strong></div>
+            </div>
+
+            <div class=\"summary-cards\">
+                <div class=\"summary-card success\">Roles Created<br><strong>{run_info.roles_created or 0}</strong></div>
+                <div class=\"summary-card info\">Roles Existing<br><strong>{run_info.roles_existing or 0}</strong></div>
+                <div class=\"summary-card success\">Mappings Created<br><strong>{run_info.mappings_created or 0}</strong></div>
+                <div class=\"summary-card info\">Mappings Existing<br><strong>{run_info.mappings_existing or 0}</strong></div>
+                <div class=\"summary-card failed\">Failed Operations<br><strong>{run_info.failed_operations or 0}</strong></div>
+            </div>
+
+            <h2>Object Counts By Type</h2>
+            <ul>
+    """
+    for obj_type, count in type_counts.items():
+        html += f"<li><strong>{obj_type}:</strong> {count}</li>"
+
+    html += """
+            </ul>
+
+            <h2>Policy Status Details</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Policy Name</th>
+                        <th>Users</th>
+                        <th>Groups</th>
+                        <th>Permissions</th>
+                        <th>Rowfilter</th>
+                        <th>Status</th>
+                        <th>Error Message</th>
+                        <th>Created At</th>
+                        <th>Updated At</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+    for p in policy_statuses:
+        status_class = (
+            "status-success" if getattr(p, 'status', None) in ["CREATED", "UPDATED", "ALREADY_EXISTS"]
+            else "status-failed" if getattr(p, 'status', None) == "FAILED"
+            else "status-partial"
+        )
+        users = ', '.join(getattr(p, 'users', []) or [])
+        groups = ', '.join(getattr(p, 'groups', []) or [])
+        permissions = ', '.join(getattr(p, 'permissions', []) or [])
+        rowfilter = getattr(p, 'rowfilter', '') or ''
+        error_display = getattr(p, 'error_message', '') or ''
+        html += f"""
+                    <tr>
+                        <td>{getattr(p, 'policy_name', '')}</td>
+                        <td>{users}</td>
+                        <td>{groups}</td>
+                        <td>{permissions}</td>
+                        <td>{rowfilter}</td>
+                        <td><span class=\"status-badge {status_class}\">{getattr(p, 'status', '')}</span></td>
+                        <td class=\"error-cell\">{error_display}</td>
+                        <td>{getattr(p, 'created_at', '')}</td>
+                        <td>{getattr(p, 'updated_at', '')}</td>
+                    </tr>
+        """
+
+    html += """
+            </tbody>
+            </table>
+            <h2>Skipped Excel Rows (Validation Errors)</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Row Index</th>
+                        <th>Role</th>
+                        <th>Database</th>
+                        <th>URL</th>
+                        <th>Reason</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+    for row in skipped_rows:
+        row_index = row['row_index'] if row['row_index'] is not None else ''
+        role = row['role'] or ''
+        database = row['database'] or ''
+        url = row['url'] or ''
+        reason = row['reason'] or ''
+        html += f"""
+                            <tr>
+                                <td>{row_index}</td>
+                                <td>{role}</td>
+                                <td>{database}</td>
+                                <td>{url}</td>
+                                <td>{reason}</td>
+                            </tr>
+                """
+    html += """
+                </tbody>
+                </table>
+                <h2>Object Details</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Object Type</th>
+                            <th>Object Name</th>
+                            <th>Policy Name</th>
+                            <th>Policy ID</th>
+                            <th>Status</th>
+                            <th>Error Message</th>
+                            <th>Attempt</th>
+                            <th>Started At</th>
+                            <th>Completed At</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+    """
+
+    for o in objects:
+        status_class = (
+            "status-success" if o.status in ["CREATED", "UPDATED", "ALREADY_EXISTS"]
+            else "status-failed" if o.status == "FAILED"
+            else "status-partial"
+        )
+        error_display = o.error_message or ''
+        policy_name_display = getattr(o, 'policy_name', '') or ''
+        policy_id_display = getattr(o, 'policy_id', '') or ''
+        html += f"""
+                    <tr>
+                        <td>{o.object_type}</td>
+                        <td>{o.object_name}</td>
+                        <td>{policy_name_display}</td>
+                        <td>{policy_id_display}</td>
+                        <td><span class=\"status-badge {status_class}\">{o.status}</span></td>
+                        <td class=\"error-cell\">{error_display}</td>
+                        <td>{o.attempt}</td>
+                        <td>{o.started_at}</td>
+                        <td>{o.completed_at or ''}</td>
+                    </tr>
+        """
+
+    html += f"""
+                </tbody>
+                </table>
+
+                <p style=\"margin-top:30px; font-size:12px; color:#6c757d; text-align: center;\">
+                    Report generated automatically by the Ranger Policy DAG on {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC.
+                </p>
+            </div>
+        </body>
+        </html>
+    """
+    return html
+
+
 with DAG(
     dag_id='ranger_policy_automation',
     default_args=default_args,
@@ -207,7 +937,7 @@ with DAG(
     def parse_excel_to_dicts(excel_file_path: str, spark) -> Dict[str, Any]:
         import pandas as pd
         from io import BytesIO
-        
+
         # Read Excel from S3
         binary_df = spark.read.format("binaryFile").load(excel_file_path)
         row = binary_df.select("content").first()
@@ -215,157 +945,7 @@ with DAG(
         df = pd.read_excel(BytesIO(excel_bytes), engine='openpyxl')
         df.columns = df.columns.str.lower().str.strip()
 
-        policies = {}
-        role_principals = {}
-        skipped_rows = []
-
-        for idx, row in df.iterrows():
-            role = str(row.get('role', '')).strip()
-            if is_empty_like(role):
-                role = ''
-                logger.debug(f"Row {idx}: Role field was empty/null-like, treating as empty")
-            databases = str(row.get('database', '')).strip()
-            tables = str(row.get('tables', '*')).strip() or '*'
-            columns = str(row.get('columns', '*')).strip() or '*'
-            url = str(row.get('url', '')).strip()
-            permissions = str(row.get('permissions', 'read')).strip()
-            groups = str(row.get('groups', '')).strip()
-            users = str(row.get('users', '')).strip()  
-            rowfilter = str(row.get('rowfilter', '')).strip()  
-            policy_label_override = str(row.get('policy_label', '')).strip()
-            if is_empty_like(rowfilter):
-                rowfilter = ''
-                logger.debug(f"Row {idx}: Rowfilter field was empty/null-like, treating as empty")
-            # Enforce: Either database or url must be provided, not both or neither
-            has_db = not is_empty_like(databases)
-            has_url = bool(not is_empty_like(url) and url != '-' and url != '*')
-            if (has_db and has_url) or (not has_db and not has_url):
-                reason = f"Row must have either database or url (but not both/neither). Skipped. role={role}, database={databases}, url={url}"
-                logger.error(reason)
-                skipped_rows.append({'row_index': idx, 'role': role, 'database': databases, 'url': url, 'reason': reason})
-                continue
-            # Validate: Rowfilters are only valid for database policies, not URL policies
-            if has_url and rowfilter:
-                reason = f"Rowfilters are not supported for URL-based policies. Skipped. url={url}, rowfilter={rowfilter}"
-                logger.error(reason)
-                skipped_rows.append({'row_index': idx, 'role': role, 'database': databases, 'url': url, 'reason': reason})
-                continue
-            group_list = parse_csv_field(groups)
-            user_list = parse_csv_field(users)
-            if role:
-                role_principals.setdefault(role, {'groups': [], 'users': []}) 
-            if group_list:
-                if not role: # If group input is present, role is mandatory
-                    reason = f"Row with groups {group_list} must have a role. Skipping row."
-                    logger.error(reason)
-                    skipped_rows.append({'row_index': idx, 'role': role, 'database': databases, 'url': url, 'reason': reason})
-                    continue
-                for g in group_list:
-                    if g not in role_principals[role]['groups']:
-                        role_principals[role]['groups'].append(g)
-            if user_list and role:
-                for u in user_list:
-                    if u not in role_principals[role]['users']:
-                        role_principals[role]['users'].append(u)
-            # If only users are present and no group, and no role is specified, create role_<username> for each user
-            if user_list and not group_list and is_empty_like(role):
-                for u in user_list:
-                    user_role = f"role_{u}"
-                    role_principals.setdefault(user_role, {'groups': [], 'users': []})
-                    if u not in role_principals[user_role]['users']:
-                        role_principals[user_role]['users'].append(u)
-
-            # Build effective role bindings for policy assignment (normalized).
-            # - explicit role: one role bound to all row users
-            # - users-only row: one synthetic role per user (role_<user>)
-            if role:
-                effective_role_bindings = [{'role': role, 'users': user_list}]
-            elif user_list and not group_list:
-                effective_role_bindings = [{'role': f"role_{u}", 'users': [u]} for u in user_list]
-            else:
-                reason = (
-                    f"Row does not define a valid role binding. Skipped. "
-                    f"role={role}, groups={group_list}, users={user_list}"
-                )
-                logger.error(reason)
-                skipped_rows.append({
-                    'row_index': idx,
-                    'role': role,
-                    'database': databases,
-                    'url': url,
-                    'reason': reason,
-                })
-                continue
-
-            perm_list = parse_permission_string(permissions)
-
-            if not is_empty_like(url) and url != '-' and url != '*':
-                policy_name = url
-                policy_label = policy_label_override if policy_label_override else None
-                if policy_name not in policies:
-                    policies[policy_name] = {'type': 'url', 'url': url, 'roles': [], 'label': policy_label}
-                for binding in effective_role_bindings:
-                    effective_role = binding['role']
-                    effective_users = binding['users']
-                    existing_roles = [r['role'] for r in policies[policy_name]['roles']]
-                    if effective_role not in existing_roles:
-                        policies[policy_name]['roles'].append({'role': effective_role, 'permissions': perm_list, 'groups': group_list, 'users': effective_users, 'rowfilter': rowfilter})
-                    else:
-                        for r in policies[policy_name]['roles']:
-                            if r['role'] == effective_role:
-                                for p in perm_list:
-                                    if p not in r['permissions']:
-                                        r['permissions'].append(p)
-                                # Merge groups, users, rowfilter
-                                r['groups'] = list(set(r.get('groups', []) + group_list))
-                                r['users'] = list(set(r.get('users', []) + effective_users))
-                                if rowfilter:
-                                    if r.get('rowfilter') and r['rowfilter'] != rowfilter:
-                                        raise ValueError(
-                                            f"Conflicting rowfilters for role {effective_role} in policy {policy_name}: "
-                                            f"{r['rowfilter']} vs {rowfilter}")
-                                    r['rowfilter'] = rowfilter
-            else:
-                db_list = parse_csv_field(databases)
-                table_list = parse_csv_field(tables) or ['*']
-                column_list = parse_csv_field(columns) or ['*']
-                for database in db_list:
-                    if is_empty_like(database):
-                        continue
-                    for table in table_list:
-                        for column in column_list:
-                            policy_name = build_policy_name('iceberg', database, table, column)
-                            policy_label = policy_label_override if policy_label_override else None
-                            if policy_name not in policies:
-                                policies[policy_name] = {
-                                    'type': 'table',
-                                    'catalog': 'iceberg',
-                                    'schema': database,
-                                    'table': table or '*',
-                                    'column': column or '*',
-                                    'roles': [],
-                                    'label': policy_label
-                                }
-                            for binding in effective_role_bindings:
-                                effective_role = binding['role']
-                                effective_users = binding['users']
-                                existing_roles = [r['role'] for r in policies[policy_name]['roles']]
-                                if effective_role not in existing_roles:
-                                    policies[policy_name]['roles'].append({'role': effective_role, 'permissions': perm_list, 'groups': group_list, 'users': effective_users, 'rowfilter': rowfilter})
-                                else:
-                                    for r in policies[policy_name]['roles']:
-                                        if r['role'] == effective_role:
-                                            for p in perm_list:
-                                                if p not in r['permissions']:
-                                                    r['permissions'].append(p)
-                                            # Merge groups, users, rowfilter
-                                            r['groups'] = list(set(r.get('groups', []) + group_list))
-                                            r['users'] = list(set(r.get('users', []) + effective_users))
-                                            if rowfilter:
-                                                r['rowfilter'] = rowfilter
-
-        logger.info(f"Parsed {len(policies)} policies and {len(role_principals)} role-principal mappings, {len(skipped_rows)} rows skipped")
-        return {'policies': policies, 'role_principals': role_principals, 'skipped_rows': skipped_rows}
+        return parse_excel_rows(df)
 
     @task.pyspark(conn_id="spark_default")
     def write_skipped_rows(tracking_run_id: str, skipped_rows: list, spark) -> int:
@@ -593,17 +1173,14 @@ with DAG(
         groups_created = []
         groups_existing = []
 
-
         # Ensure Ranger role-groups exist (strict RBAC model)
         all_roles = set(role_principals.keys())
         for policy_data in policies.values():
             for r in policy_data.get('roles', []):
                 role = r.get('role')
-                # Only add valid roles (not empty, None, or 'nan')
                 if not is_empty_like(role):
                     all_roles.add(role)
 
-        # Ensure role groups exist in Ranger (Keycloak groups/users are handled on Keycloak side)
         groups_result = manager.ensure_groups_exist(list(all_roles))
 
         for g, created in groups_result.items():
@@ -615,7 +1192,7 @@ with DAG(
                 status = "ALREADY_EXISTS"
             statuses.append({
                 "run_id": tracking_run_id,
-                "object_type": "ranger_group",  # Explicitly track as Ranger group
+                "object_type": "ranger_group",
                 "object_name": g,
                 "status": status,
                 "error_message": "",
@@ -623,88 +1200,14 @@ with DAG(
                 "started_at": dt.now(timezone.utc),
                 "completed_at": dt.now(timezone.utc)
             })
-        
-        # Users are not tracked in object_status as they are external (AD/Keycloak) users
-        # Policy creation will validate user existence at runtime
 
-        patched_policies = {}
-        prevalidated_policy_failures = []
-        applied_policy_roles = {}
-        excluded_policy_roles = {}
-
-        for policy_name, policy_data in policies.items():
-            patched_policy = dict(policy_data)
-            patched_policy['roles'] = []
-            excluded_roles_in_policy = []
-            applied_roles_in_policy = []
-            for r in policy_data.get('roles', []):
-                role_name = r.get('role')
-                if is_empty_like(role_name):
-                    logger.error(
-                        "Skipping Ranger policy assignment for invalid role in policy %s: %s",
-                        policy_name,
-                        role_name,
-                    )
-                    continue
-
-                users = r.get('users', []) or []
-                groups = r.get('groups', []) or []
-                # Find successfully mapped groups
-                mapped_groups = [
-                    g for g in groups
-                    if {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('created_mappings', [])
-                    or {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('existing_mappings', [])
-                ]
-                # Find successfully mapped users
-                mapped_users = [
-                    u for u in users
-                    if {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('created_mappings', [])
-                    or {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('existing_mappings', [])
-                ]
-                if not mapped_groups and not mapped_users:
-                    logger.error(
-                        "Excluding role principal %s from Ranger policy %s due to failed Keycloak principal mapping for all users/groups in this policy row",
-                        role_name,
-                        policy_name,
-                    )
-                    excluded_roles_in_policy.append(role_name)
-                    continue
-                patched_role = dict(r)
-                # Only include successfully mapped groups and users
-                patched_role['groups'] = mapped_groups if mapped_groups else []
-                patched_role['users'] = mapped_users if mapped_users else []
-                patched_role['rowfilter'] = r.get('rowfilter', '')
-                patched_policy['roles'].append(patched_role)
-                applied_roles_in_policy.append(role_name)
-            if applied_roles_in_policy:
-                applied_policy_roles[policy_name] = sorted(set(applied_roles_in_policy))
-            if excluded_roles_in_policy:
-                excluded_policy_roles[policy_name] = sorted(set(excluded_roles_in_policy))
-            # Only create the Ranger policy if there is at least one applied role
-            if not patched_policy['roles']:
-                if excluded_roles_in_policy:
-                    failure_reason = (
-                        "Ranger policy was not created because required Keycloak principal mapping failed for "
-                        f"role principal(s): {', '.join(sorted(set(excluded_roles_in_policy)))}."
-                    )
-                else:
-                    failure_reason = (
-                        "Ranger policy was not created because no valid role principal could be built from the input rows. "
-                        "The role value is empty/invalid, and no users-only fallback was available."
-                    )
-                prevalidated_policy_failures.append({'name': policy_name, 'error': failure_reason})
-                statuses.append({
-                    "run_id": tracking_run_id,
-                    "object_type": "policy",
-                    "object_name": policy_name,
-                    "status": "FAILED",
-                    "error_message": failure_reason,
-                    "attempt": 1,
-                    "started_at": dt.now(timezone.utc),
-                    "completed_at": dt.now(timezone.utc)
-                })
-                continue
-            patched_policies[policy_name] = patched_policy
+        # Patch policies with Keycloak results
+        patch_result = patch_policies_with_keycloak(policies, keycloak_result, tracking_run_id)
+        patched_policies = patch_result['patched_policies']
+        prevalidated_policy_failures = patch_result['prevalidated_failures']
+        statuses.extend(patch_result['failure_statuses'])
+        applied_policy_roles = patch_result['applied_roles']
+        excluded_policy_roles = patch_result['excluded_roles']
 
         policies_result = manager.sync_policies_from_dict(patched_policies)
 
@@ -715,71 +1218,69 @@ with DAG(
         # Process created policies - now contains policy_id and optional rowfilter_policy_id
         for p in policies_result.get('created', []):
             policy_name = p.get('policy_name', 'UNKNOWN')
-            policy_id = p.get('policy_id')  # Actual Ranger policy ID
+            policy_id = p.get('policy_id')
             policies_created.append(policy_name)
             statuses.append({
                 "run_id": tracking_run_id,
                 "object_type": "policy",
                 "object_name": policy_name,
-                "policy_id": str(policy_id) if policy_id else "",  # Track policy ID for association
-                "policy_name": policy_name,  # Track policy name for association
+                "policy_id": str(policy_id) if policy_id else "",
+                "policy_name": policy_name,
                 "status": "CREATED",
                 "error_message": "",
                 "attempt": 1,
                 "started_at": dt.now(timezone.utc),
                 "completed_at": dt.now(timezone.utc)
             })
-            
-            # Track rowfilter policy if it was created separately
+
             if p.get('rowfilter_policy_id'):
                 rowfilter_policy_name = p.get('rowfilter_policy_name', 'UNKNOWN')
                 statuses.append({
                     "run_id": tracking_run_id,
                     "object_type": "policy",
                     "object_name": rowfilter_policy_name,
-                    "policy_id": str(policy_id) if policy_id else "",  # Reference parent access policy ID
-                    "policy_name": policy_name,  # Reference parent base policy name
+                    "policy_id": str(policy_id) if policy_id else "",
+                    "policy_name": policy_name,
                     "status": "CREATED",
                     "error_message": "",
                     "attempt": 1,
                     "started_at": dt.now(timezone.utc),
                     "completed_at": dt.now(timezone.utc)
                 })
-        
-        # Process updated policies - now contains policy_id and optional rowfilter_policy_id
+
+        # Process updated policies
         for p in policies_result.get('updated', []):
             policy_name = p.get('policy_name', 'UNKNOWN')
-            policy_id = p.get('policy_id')  # Actual Ranger policy ID
+            policy_id = p.get('policy_id')
             policies_updated.append(policy_name)
             statuses.append({
                 "run_id": tracking_run_id,
                 "object_type": "policy",
                 "object_name": policy_name,
-                "policy_id": str(policy_id) if policy_id else "",  # Track policy ID for association
-                "policy_name": policy_name,  # Track policy name for association
+                "policy_id": str(policy_id) if policy_id else "",
+                "policy_name": policy_name,
                 "status": "UPDATED",
                 "error_message": "",
                 "attempt": 1,
                 "started_at": dt.now(timezone.utc),
                 "completed_at": dt.now(timezone.utc)
             })
-            
-            # Track rowfilter policy if it exists
+
             if p.get('rowfilter_policy_id'):
                 rowfilter_policy_name = p.get('rowfilter_policy_name', 'UNKNOWN')
                 statuses.append({
                     "run_id": tracking_run_id,
                     "object_type": "policy",
                     "object_name": rowfilter_policy_name,
-                    "policy_id": str(policy_id) if policy_id else "",  # Reference parent access policy ID
-                    "policy_name": policy_name,  # Reference parent base policy name
+                    "policy_id": str(policy_id) if policy_id else "",
+                    "policy_name": policy_name,
                     "status": "UPDATED",
                     "error_message": "",
                     "attempt": 1,
                     "started_at": dt.now(timezone.utc),
                     "completed_at": dt.now(timezone.utc)
                 })
-        
+
         # Process failed policies
         for p in policies_result.get('failed', []):
             policy_name = p.get('name', 'UNKNOWN')
@@ -798,7 +1299,6 @@ with DAG(
 
         policies_failed.extend(prevalidated_policy_failures)
 
-        # Return only summary and statuses; policy_statuses is not used downstream
         return {
             "summary": {
                 "groups": {"created": groups_created, "existing": groups_existing},
@@ -851,18 +1351,17 @@ with DAG(
         Returns both summary (for finalize) and statuses (for tracking).
         """
         from ranger_utils import KeycloakRoleManager
-        from datetime import datetime as dt
 
         cfg = get_config()
-        
+
         # Get current attempt number from Airflow context for tracking retries
         attempt_num = 1
         if context and 'ti' in context:
             attempt_num = context['ti'].try_number
-        
+
         # Extract role principals BEFORE attempting connection so we can track failed attempts
         filtered_role_principals = {k: v for k, v in parsed_data['role_principals'].items()}
-        
+
         try:
             manager = KeycloakRoleManager(
                 server_url=cfg["keycloak_url"],
@@ -873,205 +1372,23 @@ with DAG(
                 ca_cert_path=(cfg.get("keycloak_cacert") or None)
             )
         except ConnectionError as e:
-            # Connection failed - record all roles and mappings as FAILED for audit trail
-            error_msg = str(e)[:500]  # Limit error message length
+            error_msg = str(e)[:500]
             logger.error(f"Failed to connect to Keycloak: {e}")
-            
-            # Build failure response with all intended roles marked as FAILED
-            statuses = []
-            
-            # All roles that were supposed to be created failed
-            for role_name in filtered_role_principals.keys():
-                statuses.append({
-                    "run_id": tracking_run_id,
-                    "object_type": "role",
-                    "object_name": role_name,
-                    "status": "FAILED",
-                    "error_message": f"Keycloak connection failed: {error_msg}",
-                    "attempt": attempt_num,
-                    "started_at": dt.now(timezone.utc),
-                    "completed_at": dt.now(timezone.utc)
-                })
-            
-            # All groups that would have been assigned also failed
-            all_groups = set()
-            for role_info in filtered_role_principals.values():
-                all_groups.update(role_info.get('groups', []))
-            
-            for group_name in sorted(all_groups):
-                statuses.append({
-                    "run_id": tracking_run_id,
-                    "object_type": "keycloak_group",
-                    "object_name": group_name,
-                    "status": "FAILED",
-                    "error_message": f"Keycloak connection failed: {error_msg}",
-                    "attempt": attempt_num,
-                    "started_at": dt.now(timezone.utc),
-                    "completed_at": dt.now(timezone.utc)
-                })
-            
-            # All mappings that would have been created also failed
-            for role_name, role_info in filtered_role_principals.items():
-                for group_name in role_info.get('groups', []):
-                    statuses.append({
-                        "run_id": tracking_run_id,
-                        "object_type": "mapping",
-                        "object_name": f"{role_name}->{group_name} (group)",
-                        "status": "FAILED",
-                        "error_message": f"Keycloak connection failed: {error_msg}",
-                        "attempt": attempt_num,
-                        "started_at": dt.now(timezone.utc),
-                        "completed_at": dt.now(timezone.utc)
-                    })
-                for user_name in role_info.get('users', []):
-                    statuses.append({
-                        "run_id": tracking_run_id,
-                        "object_type": "mapping",
-                        "object_name": f"{role_name}->{user_name} (user)",
-                        "status": "FAILED",
-                        "error_message": f"Keycloak connection failed: {error_msg}",
-                        "attempt": attempt_num,
-                        "started_at": dt.now(timezone.utc),
-                        "completed_at": dt.now(timezone.utc)
-                    })
-            
-            # Return failure response with audit trail
-            return {
-                "summary": {
-                    "created_roles": [],
-                    "existing_roles": [],
-                    "created_groups": [],
-                    "existing_groups": [],
-                    "created_mappings": [],
-                    "existing_mappings": [],
-                    "failed": list(filtered_role_principals.keys())
-                },
-                "statuses": statuses,
-                "connection_error": True
-            }
-
-
+            return build_keycloak_failure_response(
+                filtered_role_principals, tracking_run_id, error_msg, attempt_num
+            )
+        
         # Map roles to principals (groups and users) based on parsed data
         result = manager.sync_roles_and_principals(filtered_role_principals)
 
-        statuses = []
-        
-        # Process roles - differentiate between created and existing
-        for entry in result.get('created_roles', []):
-            name = entry if isinstance(entry, str) else str(entry)
-            statuses.append({
-                "run_id": tracking_run_id,
-                "object_type": "role",
-                "object_name": name,
-                "status": "CREATED",
-                "error_message": "",
-                "attempt": 1,
-                "started_at": dt.now(timezone.utc),
-                "completed_at": dt.now(timezone.utc)
-            })
-        
-        for entry in result.get('existing_roles', []):
-            name = entry if isinstance(entry, str) else str(entry)
-            statuses.append({
-                "run_id": tracking_run_id,
-                "object_type": "role",
-                "object_name": name,
-                "status": "ALREADY_EXISTS",
-                "error_message": "",
-                "attempt": 1,
-                "started_at": dt.now(timezone.utc),
-                "completed_at": dt.now(timezone.utc)
-            })
-        
-        # Process Keycloak groups - track separately from Ranger groups
-        for group_name in result.get('created_groups', []):
-            statuses.append({
-                "run_id": tracking_run_id,
-                "object_type": "keycloak_group",  # Explicitly track as Keycloak group
-                "object_name": group_name,
-                "status": "CREATED",
-                "error_message": "",
-                "attempt": 1,
-                "started_at": dt.now(timezone.utc),
-                "completed_at": dt.now(timezone.utc)
-            })
-        
-        for group_name in result.get('existing_groups', []):
-            statuses.append({
-                "run_id": tracking_run_id,
-                "object_type": "keycloak_group",  # Explicitly track as Keycloak group
-                "object_name": group_name,
-                "status": "ALREADY_EXISTS",
-                "error_message": "",
-                "attempt": 1,
-                "started_at": dt.now(timezone.utc),
-                "completed_at": dt.now(timezone.utc)
-            })
-        
-        # Process mappings - differentiate between created and existing
-        for entry in result.get('created_mappings', []):
-            if isinstance(entry, dict):
-                principal = entry.get('principal', entry.get('group', entry.get('user', '')))
-                mtype = entry.get('type', 'group' if 'group' in entry else 'user')
-                name = f"{entry.get('role', '')}->{principal} ({mtype})"
-            else:
-                name = str(entry)
-            statuses.append({
-                "run_id": tracking_run_id,
-                "object_type": "mapping",
-                "object_name": name,
-                "status": "CREATED",
-                "error_message": "",
-                "attempt": 1,
-                "started_at": dt.now(timezone.utc),
-                "completed_at": dt.now(timezone.utc)
-            })
-        
-        for entry in result.get('existing_mappings', []):
-            if isinstance(entry, dict):
-                principal = entry.get('principal', entry.get('group', entry.get('user', '')))
-                mtype = entry.get('type', 'group' if 'group' in entry else 'user')
-                name = f"{entry.get('role', '')}->{principal} ({mtype})"
-            else:
-                name = str(entry)
-            statuses.append({
-                "run_id": tracking_run_id,
-                "object_type": "mapping",
-                "object_name": name,
-                "status": "ALREADY_EXISTS",
-                "error_message": "",
-                "attempt": 1,
-                "started_at": dt.now(timezone.utc),
-                "completed_at": dt.now(timezone.utc)
-            })
-        
-        # Process failures
-        for entry in result.get('failed', []):
-            if isinstance(entry, dict):
-                principal = entry.get('principal', entry.get('group', entry.get('user', '')))
-                mtype = entry.get('type', 'group' if 'group' in entry else 'user')
-                name = f"{entry.get('role', '')}->{principal} ({mtype})"
-                error = entry.get('error', '')
-            else:
-                name = str(entry)
-                error = ''
-            statuses.append({
-                "run_id": tracking_run_id,
-                "object_type": "mapping",
-                "object_name": name,
-                "status": "FAILED",
-                "error_message": error,
-                "attempt": 1,
-                "started_at": dt.now(timezone.utc),
-                "completed_at": dt.now(timezone.utc)
-            })
+        statuses = build_keycloak_success_statuses(result, tracking_run_id)
 
         return {
             "summary": {
                 "created_roles": result.get('created_roles', []),
                 "existing_roles": result.get('existing_roles', []),
-                "created_groups": result.get('created_groups', []),  # Keycloak groups
-                "existing_groups": result.get('existing_groups', []),  # Keycloak groups
+                "created_groups": result.get('created_groups', []),
+                "existing_groups": result.get('existing_groups', []),
                 "created_mappings": result.get('created_mappings', []),
                 "existing_mappings": result.get('existing_mappings', []),
                 "failed": result.get('failed', [])
@@ -1144,33 +1461,23 @@ with DAG(
         cfg = get_config()
         db = cfg["tracking_database"]
 
-        # Extract summaries
-        ranger_summary = ranger_result.get("summary", {})
-        keycloak_summary = keycloak_result.get("summary", {})
+        metrics = compute_run_metrics(parsed_data, ranger_result, keycloak_result)
+        groups_created = metrics["groups_created"]
+        groups_existing = metrics["groups_existing"]
+        policies_created = metrics["policies_created"]
+        policies_updated = metrics["policies_updated"]
+        policies_failed = metrics["policies_failed"]
+        roles_created = metrics["roles_created"]
+        roles_existing = metrics["roles_existing"]
+        mappings_created = metrics["mappings_created"]
+        mappings_existing = metrics["mappings_existing"]
+        total_objects = metrics["total_objects"]
+        successful_objects = metrics["successful_objects"]
+        failed_objects = metrics["failed_objects"]
+        overall_status = metrics["overall_status"]
+        ranger_summary = metrics["ranger_summary"]
+        keycloak_summary = metrics["keycloak_summary"]
 
-        # Compute run-level totals
-        groups_created = len(ranger_summary.get('groups', {}).get('created', []))
-        groups_existing = len(ranger_summary.get('groups', {}).get('existing', []))
-        policies_created = len(ranger_summary.get('policies', {}).get('created', []))
-        policies_updated = len(ranger_summary.get('policies', {}).get('updated', []))
-        policies_failed = len(ranger_summary.get('policies', {}).get('failed', []))
-        
-        roles_created = len(keycloak_summary.get('created_roles', []))
-        roles_existing = len(keycloak_summary.get('existing_roles', []))
-        mappings_created = len(keycloak_summary.get('created_mappings', []))
-        mappings_existing = len(keycloak_summary.get('existing_mappings', []))
-
-        all_statuses = []
-        all_statuses.extend(ranger_result.get("statuses", []))
-        all_statuses.extend(keycloak_result.get("statuses", []))
-
-        total_objects = len(all_statuses)
-        successful_objects = sum(
-            1 for s in all_statuses if s.get("status") in ("CREATED", "UPDATED", "ALREADY_EXISTS")
-        )
-        failed_objects = sum(1 for s in all_statuses if s.get("status") == "FAILED")
-
-        overall_status = "COMPLETED" if failed_objects == 0 else "PARTIAL_FAILURE"
         safe_overall_status = sql_str(overall_status)
         safe_tracking_run_id = sql_str(tracking_run_id)
         # Update the tracking_ranger_policy_runs table with all metrics
@@ -1412,9 +1719,6 @@ with DAG(
         Includes object counts, status badges, and error messages.
         Saves report to S3.
         """
-        from datetime import datetime as dt
-        from collections import Counter
-
         config = get_config()
         tracking_db = config["tracking_database"]
         report_location = config["report_output_location"]
@@ -1442,7 +1746,6 @@ with DAG(
             ORDER BY policy_name
         """).collect()
 
-
         # Fetch skipped rows from tracking table
         skipped_rows = spark.sql(f"""
             SELECT row_index, role, database, url, reason
@@ -1451,223 +1754,7 @@ with DAG(
             ORDER BY row_index
         """).collect()
 
-        total_objects = len(objects)
-        successful_objects = sum(1 for o in objects if o.status in ["CREATED", "UPDATED", "ALREADY_EXISTS"])
-        failed_objects = sum(1 for o in objects if o.status == "FAILED")
-        type_counts = Counter(o.object_type for o in objects)
-
-        # Determine status class for run
-        run_status_class = 'status-success' if run_info.status == 'COMPLETED' else 'status-failed'
-
-        # Build HTML
-        html = f"""
-        <!DOCTYPE html>
-        <html lang=\"en\">
-        <head>
-            <meta charset=\"UTF-8\">
-            <title>Ranger Policy Run Report - {tracking_run_id}</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; background: #f5f5f5; padding: 20px; }}
-                .container {{ background: #fff; padding: 20px; border-radius: 8px; max-width: 1400px; margin: 0 auto; }}
-                h1 {{ color: #2c3e50; }}
-                h2 {{ color: #34495e; margin-top: 30px; }}
-                .summary-cards {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0; }}
-                .summary-card {{ padding: 15px 20px; border-radius: 6px; color: #fff; min-width: 150px; text-align: center; }}
-                .success {{ background-color: #28a745; }}
-                .failed {{ background-color: #dc3545; }}
-                .info {{ background-color: #17a2b8; }}
-                table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-                th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
-                th {{ background-color: #343a40; color: white; }}
-                tr:nth-child(even) {{ background-color: #f8f9fa; }}
-                tr:hover {{ background-color: #e9ecef; }}
-                .status-badge {{ padding: 4px 10px; border-radius: 12px; font-weight: bold; color: white; font-size: 12px; }}
-                .status-success {{ background-color: #28a745; }}
-                .status-failed {{ background-color: #dc3545; }}
-                .status-partial {{ background-color: #ffc107; color: #212529; }}
-                .error-cell {{ color: #dc3545; font-size: 12px; max-width: 300px; word-wrap: break-word; }}
-                .run-info {{ background: #f8f9fa; padding: 15px; border-radius: 6px; margin-bottom: 20px; }}
-                .run-info p {{ margin: 5px 0; }}
-            </style>
-        </head>
-        <body>
-            <div class=\"container\">
-                <h1>Ranger Policy Run Report</h1>
-                
-                <div class=\"run-info\">
-                    <p><strong>Run ID:</strong> {tracking_run_id}</p>
-                    <p><strong>DAG Run:</strong> {run_info.dag_run_id}</p>
-                    <p><strong>Excel Path:</strong> {run_info.excel_file_path}</p>
-                    <p><strong>Started At:</strong> {run_info.started_at}</p>
-                    <p><strong>Completed At:</strong> {run_info.completed_at}</p>
-                    <p><strong>Status:</strong> <span class=\"status-badge {run_status_class}\">{run_info.status}</span></p>
-                </div>
-
-                <h2>Summary</h2>
-                <div class=\"summary-cards\">
-                    <div class=\"summary-card info\">Total Objects<br><strong>{total_objects}</strong></div>
-                    <div class=\"summary-card success\">Successful<br><strong>{successful_objects}</strong></div>
-                    <div class=\"summary-card failed\">Failed<br><strong>{failed_objects}</strong></div>
-                </div>
-                
-                <div class=\"summary-cards\">
-                    <div class=\"summary-card info\">Policies Parsed<br><strong>{run_info.total_policies_parsed or 0}</strong></div>
-                    <div class=\"summary-card info\">Role Mappings Parsed<br><strong>{run_info.total_role_mappings_parsed or 0}</strong></div>
-                </div>
-                
-                <div class=\"summary-cards\">
-                    <div class=\"summary-card success\">Groups Created<br><strong>{run_info.groups_created or 0}</strong></div>
-                    <div class=\"summary-card info\">Groups Existing<br><strong>{run_info.groups_existing or 0}</strong></div>
-                    <div class=\"summary-card success\">Policies Created<br><strong>{run_info.policies_created or 0}</strong></div>
-                    <div class=\"summary-card info\">Policies Updated<br><strong>{run_info.policies_updated or 0}</strong></div>
-                    <div class=\"summary-card failed\">Policies Failed<br><strong>{run_info.policies_failed or 0}</strong></div>
-                </div>
-                
-                <div class=\"summary-cards\">
-                    <div class=\"summary-card success\">Roles Created<br><strong>{run_info.roles_created or 0}</strong></div>
-                    <div class=\"summary-card info\">Roles Existing<br><strong>{run_info.roles_existing or 0}</strong></div>
-                    <div class=\"summary-card success\">Mappings Created<br><strong>{run_info.mappings_created or 0}</strong></div>
-                    <div class=\"summary-card info\">Mappings Existing<br><strong>{run_info.mappings_existing or 0}</strong></div>
-                    <div class=\"summary-card failed\">Failed Operations<br><strong>{run_info.failed_operations or 0}</strong></div>
-                </div>
-
-                <h2>Object Counts By Type</h2>
-                <ul>
-        """
-        for obj_type, count in type_counts.items():
-            html += f"<li><strong>{obj_type}:</strong> {count}</li>"
-
-        html += """
-                </ul>
-
-                <h2>Policy Status Details</h2>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Policy Name</th>
-                            <th>Users</th>
-                            <th>Groups</th>
-                            <th>Permissions</th>
-                            <th>Rowfilter</th>
-                            <th>Status</th>
-                            <th>Error Message</th>
-                            <th>Created At</th>
-                            <th>Updated At</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-        """
-        for p in policy_statuses:
-            status_class = (
-                "status-success" if getattr(p, 'status', None) in ["CREATED", "UPDATED", "ALREADY_EXISTS"]
-                else "status-failed" if getattr(p, 'status', None) == "FAILED"
-                else "status-partial"
-            )
-            users = ', '.join(getattr(p, 'users', []) or [])
-            groups = ', '.join(getattr(p, 'groups', []) or [])
-            permissions = ', '.join(getattr(p, 'permissions', []) or [])
-            rowfilter = getattr(p, 'rowfilter', '') or ''
-            error_display = getattr(p, 'error_message', '') or ''
-            html += f"""
-                        <tr>
-                            <td>{getattr(p, 'policy_name', '')}</td>
-                            <td>{users}</td>
-                            <td>{groups}</td>
-                            <td>{permissions}</td>
-                            <td>{rowfilter}</td>
-                            <td><span class=\"status-badge {status_class}\">{getattr(p, 'status', '')}</span></td>
-                            <td class=\"error-cell\">{error_display}</td>
-                            <td>{getattr(p, 'created_at', '')}</td>
-                            <td>{getattr(p, 'updated_at', '')}</td>
-                        </tr>
-            """
-
-        html += """
-                </tbody>
-                </table>
-                <h2>Skipped Excel Rows (Validation Errors)</h2>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Row Index</th>
-                            <th>Role</th>
-                            <th>Database</th>
-                            <th>URL</th>
-                            <th>Reason</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-        """
-        for row in skipped_rows:
-            row_index = row['row_index'] if row['row_index'] is not None else ''
-            role = row['role'] or ''
-            database = row['database'] or ''
-            url = row['url'] or ''
-            reason = row['reason'] or ''
-            html += f"""
-                                <tr>
-                                    <td>{row_index}</td>
-                                    <td>{role}</td>
-                                    <td>{database}</td>
-                                    <td>{url}</td>
-                                    <td>{reason}</td>
-                                </tr>
-                    """
-        html += """
-                    </tbody>
-                </table>
-                <h2>Object Details</h2>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Object Type</th>
-                            <th>Object Name</th>
-                            <th>Policy Name</th>
-                            <th>Policy ID</th>
-                            <th>Status</th>
-                            <th>Error Message</th>
-                            <th>Attempt</th>
-                            <th>Started At</th>
-                            <th>Completed At</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-        """
-
-        for o in objects:
-            status_class = (
-                "status-success" if o.status in ["CREATED", "UPDATED", "ALREADY_EXISTS"]
-                else "status-failed" if o.status == "FAILED"
-                else "status-partial"
-            )
-            error_display = o.error_message or ''
-            policy_name_display = getattr(o, 'policy_name', '') or ''
-            policy_id_display = getattr(o, 'policy_id', '') or ''
-            html += f"""
-                        <tr>
-                            <td>{o.object_type}</td>
-                            <td>{o.object_name}</td>
-                            <td>{policy_name_display}</td>
-                            <td>{policy_id_display}</td>
-                            <td><span class=\"status-badge {status_class}\">{o.status}</span></td>
-                            <td class=\"error-cell\">{error_display}</td>
-                            <td>{o.attempt}</td>
-                            <td>{o.started_at}</td>
-                            <td>{o.completed_at or ''}</td>
-                        </tr>
-            """
-
-        html += f"""
-                    </tbody>
-                </table>
-
-                <p style=\"margin-top:30px; font-size:12px; color:#6c757d; text-align: center;\">
-                    Report generated automatically by the Ranger Policy DAG on {dt.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC.
-                </p>
-            </div>
-        </body>
-        </html>
-        """
+        html = build_report_html(run_info, objects, policy_statuses, skipped_rows, tracking_run_id)
 
         report_filename = f"{tracking_run_id}_policy_report.html"
         report_path = f"{report_location}/{report_filename}"

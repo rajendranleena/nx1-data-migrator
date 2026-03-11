@@ -259,4 +259,15 @@ When you specify a rowfilter expression in the Excel sheet, the system automatic
 1. **Access Policy**: Grants the full set of requested permissions (read/write/all) expanded to their appropriate Ranger access types (e.g., read → select, use, execute, show, etc.)
 2. **Row Filter Policy**: Applies the SQL filter expression to limit which rows are visible (restricted to SELECT access for row visibility filtering)
 
-Both policies work together to provide secure, filtered access. You specify a rowfilter once in Excel, but they are tracked as separate policies in Ranger and appear as separate entries in the tracking tables and HTML report. 
+Both policies work together to provide secure, filtered access. You specify a rowfilter once in Excel, but they are tracked as separate policies in Ranger and appear as separate entries in the tracking tables and HTML report.
+
+## Running Tests
+
+From the repo root, install dev dependencies and run the test suite with coverage:
+
+```bash
+pip install pytest pytest-cov
+pytest ranger-policies-generator/tests/ --cov --cov-report=term-missing
+```
+
+Coverage settings (source, omits, 80% threshold) are configured in `pyproject.toml`.
