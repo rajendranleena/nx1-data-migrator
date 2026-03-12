@@ -3983,6 +3983,94 @@ with DAG(
 # DAG 3: FOLDER-ONLY DATA COPY TASKS
 # =============================================================================
 
+@task
+def validate_prerequisites_folder_copy() -> dict:
+    """Validate SSH connectivity and Hadoop DistCp availability before starting the folder copy."""
+    config = get_config()
+    ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
+
+    checks = {
+        'ssh_connectivity': False,
+        'hadoop_distcp_available': False,
+        'hadoop_fs_available': False,
+    }
+    errors = []
+
+    logger.info("=" * 60)
+    logger.info("[FolderCopy] STARTING PRE-DAG VALIDATION")
+    logger.info("=" * 60)
+
+    try:
+        with ssh.get_conn() as client:
+
+            # 1. SSH connectivity
+            logger.info("[1/3] Testing SSH connectivity...")
+            _, stdout, stderr = client.exec_command('echo "SSH_TEST_OK"', timeout=30)
+            exit_code = stdout.channel.recv_exit_status()
+            output = stdout.read().decode()
+            stderr.read()
+            if exit_code == 0 and "SSH_TEST_OK" in output:
+                checks['ssh_connectivity'] = True
+                logger.info("SSH connectivity: PASSED")
+            else:
+                msg = f"SSH command failed with exit code {exit_code}"
+                errors.append(f"SSH: {msg}")
+                logger.error(f"SSH connectivity: FAILED - {msg}")
+
+            # 2. Hadoop DistCp
+            logger.info("[2/3] Testing hadoop distcp availability...")
+            test_cmd = "source ~/.profile 2>/dev/null || true\nhadoop distcp --help > /dev/null 2>&1 && echo DISTCP_OK || echo DISTCP_FAIL"
+            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
+            exit_code = stdout.channel.recv_exit_status()
+            output = stdout.read().decode()
+            stderr.read()
+            if "DISTCP_OK" in output:
+                checks['hadoop_distcp_available'] = True
+                logger.info("Hadoop DistCp: PASSED")
+            else:
+                msg = "hadoop distcp not found or not executable"
+                errors.append(f"DistCp: {msg}")
+                logger.error(f"Hadoop DistCp: FAILED - {msg}")
+
+            # 3. Hadoop FS
+            logger.info("[3/3] Testing Hadoop FS commands...")
+            test_cmd = "source ~/.profile 2>/dev/null || true\nhadoop fs -ls / > /dev/null 2>&1 && echo HADOOP_FS_OK || echo HADOOP_FS_FAIL"
+            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
+            exit_code = stdout.channel.recv_exit_status()
+            output = stdout.read().decode()
+            stderr.read()
+            if "HADOOP_FS_OK" in output:
+                checks['hadoop_fs_available'] = True
+                logger.info("Hadoop FS: PASSED")
+            else:
+                msg = "hadoop fs -ls / failed"
+                errors.append(f"Hadoop FS: {msg}")
+                logger.error(f"Hadoop FS: FAILED - {msg}")
+
+    except Exception as e:
+        msg = f"SSH connection failed: {str(e)}"
+        errors.append(f"SSH: {msg}")
+        errors.append("DistCp: Skipped due to SSH failure")
+        errors.append("Hadoop FS: Skipped due to SSH failure")
+        logger.error(f"SSH connectivity: FAILED - {msg}")
+
+    logger.info("=" * 60)
+    logger.info("[FolderCopy] VALIDATION SUMMARY")
+    logger.info("=" * 60)
+
+    if errors:
+        logger.error("SOME PRE-DAG CHECKS FAILED:")
+        for e in errors:
+            logger.warning(f"  - {e}")
+        raise Exception(
+            f"Pre-DAG validation failed — {len(errors)} check(s) failed:\n"
+            + "\n".join(f"  - {e}" for e in errors)
+        )
+
+    logger.info("ALL PRE-DAG CHECKS PASSED")
+    return checks
+
+
 @task.pyspark(conn_id='spark_default')
 def init_folder_copy_tracking_tables(spark) -> dict:
     """Create tracking tables for folder-only data copy if they don't exist."""
@@ -4137,7 +4225,7 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
 
 
 @task
-def run_folder_distcp_ssh(folder_config: dict) -> dict:
+def run_folder_distcp_ssh(folder_config: dict, **context) -> dict:
     """Copy a single source folder to S3 via SSH DistCp with -update for incremental runs."""
     from datetime import datetime as _dt
 
@@ -4303,7 +4391,7 @@ exit 0
         completed_at = _dt.utcnow()
         error_msg = str(e)[:2000]
         logger.error(f"[FolderDistCp] ERROR: {source_path} -> {s3_dest}: {error_msg}")
-        return {
+        result = {
             'run_id': run_id,
             'source_path': source_path,
             'dest_bucket': dest_bucket,
@@ -4322,6 +4410,8 @@ exit 0
             'size_match': False,
             'error': error_msg,
         }
+        context['ti'].xcom_push(key='return_value', value=result)
+        raise Exception(f"DistCp failed for {source_path} -> {s3_dest}: {error_msg}")
 
 
 @task.pyspark(conn_id='spark_default')
@@ -4387,7 +4477,7 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
 
 
 @task
-def validate_data_copy(copy_status: dict) -> dict:
+def validate_data_copy(copy_status: dict, **context) -> dict:
     """Re-verify the S3 destination after copy: recount files/bytes and update data_copy_status."""
     from datetime import datetime as _dt
 
@@ -4415,7 +4505,9 @@ def validate_data_copy(copy_status: dict) -> dict:
     # If the copy itself failed, skip SSH validation and mark as VALIDATION_SKIPPED
     if copy_status.get('status') == 'FAILED':
         logger.warning(f"[FolderValidate] Skipping validation — copy FAILED for {source_path}")
-        return {**copy_status, 'validation_status': 'VALIDATION_SKIPPED'}
+        result = {**copy_status, 'validation_status': 'VALIDATION_SKIPPED'}
+        context['ti'].xcom_push(key='return_value', value=result)
+        raise Exception(f"Validation skipped — upstream copy FAILED for {source_path}")
 
     cmd = f"""source ~/.profile 2>/dev/null || true
 
@@ -4486,6 +4578,12 @@ fi
         'validation_status': validation_status,
         'validation_error': validation_error,
     }
+    if validation_status != 'VALIDATED':
+        context['ti'].xcom_push(key='return_value', value=result)
+        raise Exception(
+            f"Validation {validation_status} for {source_path} -> {s3_dest}: "
+            f"{validation_error or 'file count or size mismatch'}"
+        )
     return result
 
 
@@ -4530,7 +4628,7 @@ def update_data_copy_validation(validation_result: dict, spark) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def finalize_data_copy_run(run_id: str, validation_results: list, spark) -> dict:
+def finalize_data_copy_run(run_id: str, spark) -> dict:
     """Aggregate folder-level counts and mark the data_copy_runs record as COMPLETED."""
     config = get_config()
     tracking_db = config['tracking_database']
@@ -4791,51 +4889,67 @@ def generate_data_copy_html_report(run_id: str, finalize_result: dict, spark) ->
     stream.close()
 
     logger.info(f"[FolderCopy] HTML report written to {report_path}")
-    return {'report_path': report_path, 'html_content': html}
+    return {'report_path': report_path}
 
 
 @task.pyspark(conn_id='spark_default')
 def send_data_copy_report_email(report_result: dict, run_id: str, spark) -> dict:
-    """Send the data copy HTML report via SMTP."""
-    import smtplib
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
+    """Send the folder data copy HTML report via SMTP."""
+    import tempfile
+    import os
+    from airflow.utils.email import send_email
 
     config = get_config()
     smtp_conn_id   = config.get('smtp_conn_id', 'smtp_default')
     recipients_raw = config.get('email_recipients', '')
 
     if not recipients_raw or not recipients_raw.strip():
-        logger.info("[FolderCopy] No email recipients configured — skipping email.")
-        return {'sent': False, 'reason': 'no_recipients', 'report_path': report_result.get('report_path')}
+        logger.warning("[FolderCopy] No recipients configured in 'migration_email_recipients' variable. Skipping email.")
+        return {'sent': False, 'reason': 'no_recipients'}
 
-    recipients = [r.strip() for r in recipients_raw.split(',') if r.strip()]
-    html_content = report_result.get('html_content', '')
-    report_path  = report_result.get('report_path', '')
+    recipients  = [r.strip() for r in recipients_raw.split(',') if r.strip()]
+    report_path = report_result.get('report_path', '')
 
-    from airflow.hooks.base import BaseHook
-    conn = BaseHook.get_connection(smtp_conn_id)
-    smtp_host = conn.host
-    smtp_port = conn.port or 587
-    smtp_user = conn.login
-    smtp_pass = conn.password
+    try:
+        logger.info(f"[FolderCopy] Reading HTML report from S3: {report_path}")
+        hadoop_conf = spark._jsc.hadoopConfiguration()
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark._jvm.java.net.URI(report_path),
+            hadoop_conf
+        )
+        s3_path_obj = spark._jvm.org.apache.hadoop.fs.Path(report_path)
+        reader = spark._jvm.java.io.BufferedReader(
+            spark._jvm.java.io.InputStreamReader(fs.open(s3_path_obj), "UTF-8")
+        )
+        lines = []
+        line = reader.readLine()
+        while line is not None:
+            lines.append(line)
+            line = reader.readLine()
+        reader.close()
+        html_content = "\n".join(lines)
 
-    msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"Folder Data Copy Report - {run_id}"
-    msg['From']    = smtp_user
-    msg['To']      = ', '.join(recipients)
-    msg.attach(MIMEText(html_content, 'html'))
+        tmp = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.html',
+            prefix=f'{run_id}_data_copy_report_',
+            delete=False
+        )
+        tmp.write(html_content)
+        tmp.close()
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.ehlo()
-        if smtp_port in (587, 465):
-            server.starttls()
-        if smtp_user and smtp_pass:
-            server.login(smtp_user, smtp_pass)
-        server.sendmail(smtp_user, recipients, msg.as_string())
-
-    logger.info(f"[FolderCopy] Report email sent to {recipients}")
-    return {'sent': True, 'recipients': recipients, 'report_path': report_path}
+        send_email(
+            to=recipients,
+            subject=f"Folder Data Copy Report - {run_id}",
+            html_content=f"<p>Please find the Folder Data Copy report for run <strong>{run_id}</strong> attached.</p>",
+            files=[tmp.name],
+            conn_id=smtp_conn_id,
+        )
+        os.unlink(tmp.name)
+        logger.info(f"[FolderCopy] Report email sent to: {recipients}")
+        return {'sent': True, 'recipients': recipients, 'report_path': report_path}
+    except Exception as e:
+        logger.error(f"[FolderCopy] Failed to send report email: {str(e)}")
+        raise Exception(f"Failed to send Folder Data Copy report email: {str(e)}") from e
 
 
 # =============================================================================
@@ -4861,11 +4975,17 @@ with DAG(
     render_template_as_native_obj=True,
 ) as dag_folder_copy:
 
+    # Pre-flight checks
+    t_fc_prereq  = validate_prerequisites_folder_copy()
+
     # Initialize tracking tables and create a run record
     t_fc_init   = init_folder_copy_tracking_tables()
     t_fc_run_id = create_data_copy_run(
         excel_file_path="{{ params.excel_file_path }}"
     )
+
+    # Cluster authentication — receives tracking run_id 
+    t_fc_cluster = cluster_login_setup(run_id=t_fc_run_id)
 
     # Parse Excel — one dict per folder row
     t_fc_excel = parse_folder_copy_excel(
@@ -4874,40 +4994,41 @@ with DAG(
     )
 
     # Per-folder: copy → record → validate → update validation (dynamically mapped)
-    t_fc_distcp = run_folder_distcp_ssh.expand(folder_config=t_fc_excel)
-    t_fc_distcp.operator.trigger_rule = 'all_done'
+    # max_active_tis_per_dagrun=3 caps concurrent DistCp YARN jobs
+    t_fc_distcp = run_folder_distcp_ssh.override(
+        trigger_rule='all_done', max_active_tis_per_dagrun=3
+    ).expand(folder_config=t_fc_excel)
 
-    t_fc_record = record_data_copy_status.expand(distcp_result=t_fc_distcp)
-    t_fc_record.operator.trigger_rule = 'all_done'
+    t_fc_record = record_data_copy_status.override(
+        trigger_rule='all_done'
+    ).expand(distcp_result=t_fc_distcp)
 
-    t_fc_validate = validate_data_copy.expand(copy_status=t_fc_distcp)
-    t_fc_validate.operator.trigger_rule = 'all_done'
+    t_fc_copy_validate = validate_data_copy.override(
+        trigger_rule='all_done'
+    ).expand(copy_status=t_fc_record)
 
-    t_fc_val_status = update_data_copy_validation.expand(validation_result=t_fc_validate)
-    t_fc_val_status.operator.trigger_rule = 'all_done'
+    t_fc_val_status = update_data_copy_validation.override(
+        trigger_rule='all_done'
+    ).expand(validation_result=t_fc_copy_validate)
 
-    # Finalize run — waits for all per-folder validation to finish
-    t_fc_final = finalize_data_copy_run(
-        run_id=t_fc_run_id,
-        validation_results=t_fc_val_status
+    # Finalize run — waits for all per-folder validation to finish (via dependency chain)
+    t_fc_final = finalize_data_copy_run.override(trigger_rule='all_done')(
+        run_id=t_fc_run_id
     )
-    t_fc_final.operator.trigger_rule = 'all_done'
 
     # Report and email
-    t_fc_report = generate_data_copy_html_report(
+    t_fc_report = generate_data_copy_html_report.override(trigger_rule='all_done')(
         run_id=t_fc_run_id,
         finalize_result=t_fc_final
     )
-    t_fc_report.operator.trigger_rule = 'all_done'
 
-    t_fc_email = send_data_copy_report_email(
+    t_fc_email = send_data_copy_report_email.override(trigger_rule='all_done')(
         report_result=t_fc_report,
         run_id=t_fc_run_id
     )
-    t_fc_email.operator.trigger_rule = 'all_done'
 
-    # Dependency chain
-    t_fc_init >> t_fc_run_id >> t_fc_excel
-    t_fc_excel >> t_fc_distcp >> t_fc_record
-    t_fc_distcp >> t_fc_validate >> t_fc_val_status
+    # Dependency chain — prereqs → init → run_id → excel → cluster → work
+    # Per-folder chain is linear: distcp → record_status → validate → update_validation
+    t_fc_prereq >> t_fc_init >> t_fc_run_id >> t_fc_excel >> t_fc_cluster
+    t_fc_cluster >> t_fc_distcp >> t_fc_record >> t_fc_copy_validate >> t_fc_val_status
     t_fc_val_status >> t_fc_final >> t_fc_report >> t_fc_email
