@@ -983,8 +983,8 @@ Copies raw folders from MapR-FS/HDFS to S3 using Hadoop DistCp via SSH, with no 
 | hdfs://namenode:8020/user/hive/warehouse/features  | s3a://ml-data-lake     |                     |
 ```
 
-> Row 3: `dest_folder` is empty → defaults to `finance` (basename of source path)  
-> Row 4: HDFS path uses `hdfs://namenode:8020/` prefix; `s3://` bucket is automatically normalised to `s3a://`  
+> Row 3: `dest_folder` is empty → defaults to `finance` (basename of source path)
+> Row 4: HDFS path uses `hdfs://namenode:8020/` prefix; `s3://` bucket is automatically normalised to `s3a://`
 > Row 5: `dest_folder` is empty → defaults to `features`
 
 ---
@@ -1021,14 +1021,14 @@ send_data_copy_report_email
 
 #### Step 0 - `init_folder_copy_tracking_tables`
 
-**Type:** PySpark  
+**Type:** PySpark
 **Purpose:** Create `data_copy_runs` and `data_copy_status` Iceberg tables if they do not exist
 
 ---
 
 #### Step 1 - `create_data_copy_run`
 
-**Type:** PySpark  
+**Type:** PySpark
 **Purpose:** Insert a `RUNNING` record into `data_copy_runs` and return the `run_id`
 
 - Run ID format: `folder_run_{YYYYMMDD_HHMMSS}_{uuid8}`
@@ -1037,7 +1037,7 @@ send_data_copy_report_email
 
 #### Step 2 - `parse_folder_copy_excel`
 
-**Type:** PySpark  
+**Type:** PySpark
 **Purpose:** Read and parse the Excel config file from S3
 
 - Reads `source_path`, `target_bucket`, `dest_folder` columns
@@ -1050,7 +1050,7 @@ send_data_copy_report_email
 
 #### Step 3 - `run_folder_distcp_ssh`
 
-**Type:** SSH (mapped per folder)  
+**Type:** SSH (mapped per folder)
 **Purpose:** Copy a single source folder to S3 via Hadoop DistCp
 
 - Always uses `-update` flag — safe for both full and incremental runs
@@ -1065,14 +1065,14 @@ send_data_copy_report_email
 
 #### Step 4 - `record_data_copy_status`
 
-**Type:** PySpark (mapped per folder)  
+**Type:** PySpark (mapped per folder)
 **Purpose:** Insert one row into `data_copy_status` with DistCp metrics
 
 ---
 
 #### Step 5 - `validate_data_copy`
 
-**Type:** SSH (mapped per folder)  
+**Type:** SSH (mapped per folder)
 **Purpose:** Re-verify the S3 destination after copy
 
 - Skips (marks `VALIDATION_SKIPPED`) if the copy step already failed
@@ -1084,14 +1084,14 @@ send_data_copy_report_email
 
 #### Step 6 - `update_data_copy_validation`
 
-**Type:** PySpark (mapped per folder)  
+**Type:** PySpark (mapped per folder)
 **Purpose:** Update `data_copy_status` with final validation metrics and status
 
 ---
 
 #### Step 7 - `finalize_data_copy_run`
 
-**Type:** PySpark  
+**Type:** PySpark
 **Purpose:** Aggregate folder counts and mark the run as complete
 
 - Queries `data_copy_status` for authoritative counts
@@ -1102,7 +1102,7 @@ send_data_copy_report_email
 
 #### Step 8 - `generate_data_copy_html_report`
 
-**Type:** PySpark  
+**Type:** PySpark
 **Purpose:** Generate an HTML report and write it to S3
 
 - Summary cards: run status, total/validated/failed folders, incremental count, total GB, files, bytes copied
@@ -1114,7 +1114,7 @@ send_data_copy_report_email
 
 #### Step 9 - `send_data_copy_report_email`
 
-**Type:** PySpark  
+**Type:** PySpark
 **Purpose:** Email the HTML report via SMTP
 
 - Subject: `Folder Data Copy Report - {run_id}`
@@ -1146,6 +1146,19 @@ COMPLETED_WITH_ERRORS
 | `VALIDATION_FAILED`  | Destination exists but file count or size mismatch   |
 | `VALIDATION_SKIPPED` | Copy step failed — validation not attempted          |
 | `FAILED`             | DistCp failed                                        |
+
+---
+
+## Notes for Dev
+
+Env files are loaded from `/opt/airflow/utils/migration_configs/`:
+
+- `env.shared` — shared config (S3, SSH, Spark credentials, etc.)
+- `env.<dag_stem>` — per-developer overrides (e.g. `env.migration_dags_combined`)
+
+Copy the `env.*.example` files there, drop the `.example` suffix, and fill in your values. If the directory doesn't exist the DAG logs a warning and falls back to Airflow Variables / defaults.
+
+Config resolution: Airflow Variable → `os.getenv()` → hardcoded default in `get_config()`.
 
 ---
 
