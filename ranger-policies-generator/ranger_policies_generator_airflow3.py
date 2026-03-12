@@ -23,14 +23,18 @@ from typing import Dict, List, Any
 import logging
 import os
 
-_dag_dir = os.path.dirname(__file__)
 _dag_stem = Path(__file__).stem
-load_dotenv(os.path.join(_dag_dir, 'env.shared'))
-load_dotenv(os.path.join(_dag_dir, f'env.{_dag_stem}'), override=True)
-
-sys.path.append('/opt/airflow/utils/migrations') 
-
 logger = logging.getLogger(__name__)
+
+_dag_dir = Path(__file__).resolve().parent
+_config_dir = str(_dag_dir / 'utils' / 'migration_configs')
+if os.path.isdir(_config_dir):
+    load_dotenv(os.path.join(_config_dir, 'env.shared'))
+    load_dotenv(os.path.join(_config_dir, f'env.{_dag_stem}'), override=True)
+else:
+    logger.warning(f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults")
+
+sys.path.append(str(_dag_dir / 'utils' / 'migrations'))
 
 # Default args for DAG
 default_args = {
