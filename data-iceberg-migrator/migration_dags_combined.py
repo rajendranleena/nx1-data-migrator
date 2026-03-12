@@ -51,7 +51,8 @@ import os
 _dag_stem = Path(__file__).stem
 logger = logging.getLogger(__name__)
 
-_config_dir = '/opt/airflow/utils/migration_configs'
+_dag_dir = Path(__file__).resolve().parent
+_config_dir = str(_dag_dir / 'utils' / 'migration_configs')
 if os.path.isdir(_config_dir):
     load_dotenv(os.path.join(_config_dir, 'env.shared'))
     load_dotenv(os.path.join(_config_dir, f'env.{_dag_stem}'), override=True)
