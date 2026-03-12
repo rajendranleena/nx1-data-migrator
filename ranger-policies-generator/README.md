@@ -261,6 +261,18 @@ When you specify a rowfilter expression in the Excel sheet, the system automatic
 
 Both policies work together to provide secure, filtered access. You specify a rowfilter once in Excel, but they are tracked as separate policies in Ranger and appear as separate entries in the tracking tables and HTML report.
 
+## Running Tests
+
+From the repo root, install dev dependencies and run the test suite with coverage:
+
+```bash
+pip install pytest pytest-cov
+pytest ranger-policies-generator/tests/ --cov --cov-report=term-missing
+```
+
+Coverage settings (source, omits, 80% threshold) are configured in `pyproject.toml`.
+
+
 ## Notes for Dev
 
 Env files are loaded from `/opt/airflow/utils/migration_configs/`:

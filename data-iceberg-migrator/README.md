@@ -1027,7 +1027,7 @@ send_data_copy_report_email
 
 #### Step 1 - `validate_prerequisites_folder_copy`
 
-**Type:** SSH  
+**Type:** SSH
 **Purpose:** Validate SSH connectivity and Hadoop tooling before starting the folder copy
 
 - Connects to the cluster edge node via SSH
@@ -1072,7 +1072,7 @@ send_data_copy_report_email
 
 #### Step 5 - `cluster_login_setup`
 
-**Type:** SSH  
+**Type:** SSH
 **Purpose:** Authenticate with the cluster edge node and set up the session environment
 
 - Receives the tracking `run_id` (same pattern as DAG 1 and DAG 2)
