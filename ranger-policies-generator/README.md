@@ -296,3 +296,15 @@ pytest ranger-policies-generator/tests/ --cov --cov-report=term-missing
 ```
 
 Coverage settings (source, omits, 80% threshold) are configured in `pyproject.toml`.
+
+
+## Notes for Dev
+
+Env files are loaded from `/opt/airflow/utils/migration_configs/`:
+
+- `env.shared` — shared config (S3, SSH, Spark, Ranger, Keycloak credentials, etc.)
+- `env.<dag_stem>` — per-developer overrides (e.g. `env.ranger-policies-generator_airflow3`)
+
+Copy the `env.*.example` files there, drop the `.example` suffix, and fill in your values. If the directory doesn't exist the DAG logs a warning and falls back to Airflow Variables / defaults.
+
+Config resolution: Airflow Variable → `os.getenv()` → hardcoded default in `get_config()`.
