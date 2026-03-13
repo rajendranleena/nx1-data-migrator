@@ -112,7 +112,7 @@ class RangerPolicyManager:
             ranger_password: Ranger admin password
             service_name: Name of the Ranger service
         """
-        self.ranger_url = ranger_url
+        self.ranger_url = ranger_url.strip().strip("'\"")
         self.service_name = service_name
         
         ranger_auth = (ranger_username, ranger_password)
@@ -277,6 +277,14 @@ class RangerPolicyManager:
                 'policyName': policy_name
             })
             logger.debug(f"find_policies response for '{policy_name}': {policies}")
+            if policies is None:
+                logger.warning(
+                    "find_policies returned None for policy '%s' — "
+                    "the Ranger service '%s' may not exist or the API endpoint is unreachable. "
+                    "Treating as no existing policy and proceeding to attempt creation.",
+                    policy_name, self.service_name,
+                )
+                return None
             # Support both list and dict response (depends on client)
             if isinstance(policies, dict) and 'policies' in policies:
                 policy_list = policies['policies']

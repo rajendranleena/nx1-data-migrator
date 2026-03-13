@@ -46,6 +46,81 @@ def _parsed_data_one_policy():
     }
 
 
+class TestBuildReportHtml:
+    """Verify that user-controlled data is HTML-escaped to prevent XSS."""
+
+    def _make_run_info(self, **overrides):
+        defaults = dict(
+            run_id="run_001", dag_run_id="manual__2026",
+            excel_file_path="s3a://bucket/file.xlsx",
+            started_at="2026-03-10 10:00:00", completed_at="2026-03-10 10:05:00",
+            status="COMPLETED", total_policies_parsed=1, total_role_mappings_parsed=1,
+            groups_created=0, groups_existing=0, policies_created=1, policies_updated=0,
+            policies_failed=0, roles_created=0, roles_existing=0, mappings_created=0,
+            mappings_existing=0, failed_operations=0,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def test_xss_in_policy_name_is_escaped(self, dag_module):
+        payload = "<script>alert(1)</script>"
+        run_info = self._make_run_info()
+        policy_status = SimpleNamespace(
+            policy_name=payload, users=[], groups=[], permissions=[],
+            rowfilter="", status="CREATED", error_message="",
+            created_at="", updated_at="",
+        )
+        html = dag_module.build_report_html(run_info, [], [policy_status], [], "run_001")
+        assert payload not in html
+        assert "&lt;script&gt;" in html
+
+    def test_xss_in_rowfilter_is_escaped(self, dag_module):
+        payload = "<img src=x onerror=alert(1)>"
+        run_info = self._make_run_info()
+        policy_status = SimpleNamespace(
+            policy_name="p1", users=[], groups=[], permissions=[],
+            rowfilter=payload, status="CREATED", error_message="",
+            created_at="", updated_at="",
+        )
+        html = dag_module.build_report_html(run_info, [], [policy_status], [], "run_001")
+        assert payload not in html
+        assert "&lt;img" in html
+
+    def test_xss_in_error_message_is_escaped(self, dag_module):
+        payload = "<b>bold</b>"
+        run_info = self._make_run_info()
+        obj = SimpleNamespace(
+            object_type="policy", object_name="iceberg.db1.t1",
+            policy_name="iceberg.db1.t1", policy_id="1",
+            status="FAILED", error_message=payload, attempt=1,
+            started_at="", completed_at="",
+        )
+        html = dag_module.build_report_html(run_info, [obj], [], [], "run_001")
+        assert payload not in html
+        assert "&lt;b&gt;" in html
+
+    def test_xss_in_skipped_row_reason_is_escaped(self, dag_module):
+        payload = "<script>steal(document.cookie)</script>"
+        run_info = self._make_run_info()
+        skipped = [{"row_index": 0, "role": "r1", "database": "", "url": "", "reason": payload}]
+        html = dag_module.build_report_html(run_info, [], [], skipped, "run_001")
+        assert payload not in html
+        assert "&lt;script&gt;" in html
+
+    def test_xss_in_run_id_is_escaped(self, dag_module):
+        payload = "<script>x</script>"
+        run_info = self._make_run_info()
+        html = dag_module.build_report_html(run_info, [], [], [], payload)
+        assert payload not in html
+        assert "&lt;script&gt;" in html
+
+    def test_xss_in_excel_path_is_escaped(self, dag_module):
+        run_info = self._make_run_info(excel_file_path="s3a://bucket/<evil>.xlsx")
+        html = dag_module.build_report_html(run_info, [], [], [], "run_001")
+        assert "<evil>" not in html
+        assert "&lt;evil&gt;" in html
+
+
 class TestBuildInitialPolicyStatuses:
     def test_conflicting_rowfilters_raises(self, dag_module):
         fn = _unwrap(dag_module, "build_initial_policy_statuses")
@@ -260,35 +335,67 @@ class TestCreateKeycloakRoles:
         assert result["connection_error"] is True
         ranger_utils_mock.KeycloakRoleManager.side_effect = None
 
+    def test_attempt_num_from_context_on_failure(self, dag_module):
+        """When get_current_context is available, attempt_num should flow into failure statuses."""
+        fn = _unwrap(dag_module, "create_keycloak_roles")
+        import sys
+        ranger_utils_mock = sys.modules["ranger_utils"]
+        ranger_utils_mock.KeycloakRoleManager.side_effect = ConnectionError("timeout")
+
+        ctx_mock = MagicMock()
+        ctx_mock.__getitem__.side_effect = lambda k: SimpleNamespace(try_number=3) if k == "ti" else None
+
+        operators_python_mock = MagicMock()
+        operators_python_mock.get_current_context = MagicMock(return_value=ctx_mock)
+
+        with patch.object(dag_module, "get_config", return_value=_CONFIG), \
+             patch.dict(sys.modules, {
+                 "airflow.operators": MagicMock(),
+                 "airflow.operators.python": operators_python_mock,
+             }):
+            result = fn(_parsed_data_one_policy(), "run_001", {"status": "healthy"})
+
+        assert result["connection_error"] is True
+        # All failure statuses should carry attempt=3
+        assert all(s["attempt"] == 3 for s in result["statuses"])
+        ranger_utils_mock.KeycloakRoleManager.side_effect = None
+
+    def test_attempt_num_defaults_to_1_without_context(self, dag_module):
+        """When get_current_context raises, attempt_num defaults to 1 gracefully."""
+        fn = _unwrap(dag_module, "create_keycloak_roles")
+        import sys
+        ranger_utils_mock = sys.modules["ranger_utils"]
+        ranger_utils_mock.KeycloakRoleManager.side_effect = ConnectionError("timeout")
+
+        with patch.object(dag_module, "get_config", return_value=_CONFIG), \
+             patch("airflow.operators.python.get_current_context", side_effect=RuntimeError("no context")):
+            result = fn(_parsed_data_one_policy(), "run_001", {"status": "healthy"})
+
+        assert result["connection_error"] is True
+        assert all(s["attempt"] == 1 for s in result["statuses"])
+        ranger_utils_mock.KeycloakRoleManager.side_effect = None
+
 
 class TestFinalizePolicyRun:
-    def _make_inputs(self):
-        parsed = _parsed_data_one_policy()
-        ranger = {
-            "summary": {
-                "groups": {"created": ["role_analyst"], "existing": []},
-                "policies": {"created": ["iceberg.db1.t1"], "updated": [], "failed": []},
-            },
-            "statuses": [{"status": "CREATED", "object_type": "policy", "object_name": "iceberg.db1.t1"}],
+    def _make_run_metrics(self):
+        return {
+            "groups_created": 1, "groups_existing": 0,
+            "policies_created": 1, "policies_updated": 0, "policies_failed": 0,
+            "roles_created": 1, "roles_existing": 0,
+            "mappings_created": 1, "mappings_existing": 0,
+            "total_objects": 2, "successful_objects": 2, "failed_objects": 0,
+            "overall_status": "COMPLETED",
+            "total_policies_parsed": 1,
+            "total_role_mappings_parsed": 1,
         }
-        keycloak = {
-            "summary": {
-                "created_roles": ["role_analyst"], "existing_roles": [],
-                "created_groups": [], "existing_groups": [],
-                "created_mappings": [{"role": "role_analyst", "principal": "grp1", "type": "group"}],
-                "existing_mappings": [],
-            },
-            "statuses": [{"status": "CREATED", "object_type": "role", "object_name": "role_analyst"}],
-        }
-        return parsed, ranger, keycloak
 
     def test_metrics_flow_into_update_sql(self, dag_module):
         fn = _unwrap(dag_module, "finalize_policy_run")
         spark = MagicMock()
-        parsed, ranger, keycloak = self._make_inputs()
+        run_metrics = self._make_run_metrics()
 
         with patch.object(dag_module, "get_config", return_value=_CONFIG):
-            result = fn("run_001", "dag_run_1", "s3a://b/f.xlsx", parsed, ranger, keycloak, spark)
+            result = fn("run_001", "dag_run_1", "s3a://b/f.xlsx", run_metrics, spark)
 
         update_sql = spark.sql.call_args_list[0][0][0]
         assert "policy_tracking.tracking_ranger_policy_runs" in update_sql
@@ -300,10 +407,10 @@ class TestFinalizePolicyRun:
     def test_leftover_running_statuses_marked_failed(self, dag_module):
         fn = _unwrap(dag_module, "finalize_policy_run")
         spark = MagicMock()
-        parsed, ranger, keycloak = self._make_inputs()
+        run_metrics = self._make_run_metrics()
 
         with patch.object(dag_module, "get_config", return_value=_CONFIG):
-            fn("run_001", "dag_run_1", "s3a://b/f.xlsx", parsed, ranger, keycloak, spark)
+            fn("run_001", "dag_run_1", "s3a://b/f.xlsx", run_metrics, spark)
 
         fallback_sql = spark.sql.call_args_list[1][0][0]
         assert "status = 'FAILED'" in fallback_sql
@@ -313,10 +420,10 @@ class TestFinalizePolicyRun:
     def test_returns_run_summary(self, dag_module):
         fn = _unwrap(dag_module, "finalize_policy_run")
         spark = MagicMock()
-        parsed, ranger, keycloak = self._make_inputs()
+        run_metrics = self._make_run_metrics()
 
         with patch.object(dag_module, "get_config", return_value=_CONFIG):
-            result = fn("run_001", "dag_run_1", "s3a://b/f.xlsx", parsed, ranger, keycloak, spark)
+            result = fn("run_001", "dag_run_1", "s3a://b/f.xlsx", run_metrics, spark)
 
         assert result["run_id"] == "run_001"
         assert result["status"] == "COMPLETED"
@@ -381,6 +488,7 @@ class TestGeneratePolicyReport:
 
         assert result["report_path"].startswith("s3a://data-lake/policy_reports/")
         assert "run_001" in result["report_path"]
+        assert "html_content" not in result, "html_content must not be stored in XCom"
 
         written_bytes = output_stream.write.call_args[0][0]
         assert len(written_bytes) > 0
@@ -402,20 +510,25 @@ class TestSendPolicyReportEmail:
         email_mock = sys.modules["airflow.utils.email"]
         email_mock.send_email = MagicMock()
 
-        report = {"html_content": "<html>report</html>", "report_path": "s3a://bucket/report.html"}
+        report = {"report_path": "s3a://bucket/report.html"}
         config = {**_CONFIG, "email_recipients": "a@b.com, c@d.com"}
 
-        with patch.object(dag_module, "get_config", return_value=config):
-            result = fn(report, "run_001", MagicMock())
+        boto3_mock = MagicMock()
+        boto3_mock.client.return_value.get_object.return_value = {
+            'Body': MagicMock(read=MagicMock(return_value=b"<html>report</html>"))
+        }
+        with patch.object(dag_module, "get_config", return_value=config), \
+             patch.dict(sys.modules, {"boto3": boto3_mock}):
+            result = fn(report, "run_001")
 
         assert result["sent"] is True
 
     def test_skips_when_no_recipients(self, dag_module):
         fn = _unwrap(dag_module, "send_policy_report_email")
-        report = {"html_content": "<html/>", "report_path": "s3a://bucket/r.html"}
+        report = {"report_path": "s3a://bucket/r.html"}
 
         with patch.object(dag_module, "get_config", return_value=_CONFIG):
-            result = fn(report, "run_001", MagicMock())
+            result = fn(report, "run_001")
 
         assert result["sent"] is False
 

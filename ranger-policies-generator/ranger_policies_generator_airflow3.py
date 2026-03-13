@@ -141,6 +141,9 @@ def build_policy_name(catalog: str, database: str, table: str, column: str) -> s
     If database is '*', policy name is just <catalog>
     Otherwise, it's a dot-separated string of non-wildcard parts:
     iceberg.${database}.${table if not *}.${column if not *}
+    When table is '*' but column is specific, both are included so that
+    column-scoped wildcard-table policies get unique, descriptive names
+    (e.g. iceberg.finance_db.*.amount instead of iceberg.finance_db).
     """
     if database == '*':
         return catalog
@@ -149,6 +152,11 @@ def build_policy_name(catalog: str, database: str, table: str, column: str) -> s
         parts.append(table)
         if column and column != '*':
             parts.append(column)
+    elif column and column != '*':
+        # table is a wildcard but column is specific — include both so the
+        # name is unique and reflects the actual resource scope.
+        parts.append('*')
+        parts.append(column)
     return '.'.join(parts)
 
 
@@ -184,7 +192,9 @@ def parse_excel_rows(df) -> Dict[str, Any]:
 
         if new_database_row:
             # New resource block: tables/columns read from this row; blank = default *
+            # Entering table context — clear any stale URL fill-down state.
             fd_database = raw_database
+            fd_url = ''
             raw_tables  = str(row.get('tables', '')).strip()
             raw_columns = str(row.get('columns', '')).strip()
             fd_tables  = raw_tables  if not is_empty_like(raw_tables)  else '*'
@@ -208,6 +218,14 @@ def parse_excel_rows(df) -> Dict[str, Any]:
 
         if new_url_row:
             fd_url = raw_url
+            if not new_database_row:
+                # Entering URL context from a row that has no explicit database.
+                # Clear any stale database fill-down state so the
+                # "must have either database or url" validation does not false-positive.
+                # (When both are *explicitly* set on the same row, we leave them — the
+                # validation will correctly reject that row as ambiguous.)
+                fd_database = ''
+                databases   = ''
         url = raw_url if new_url_row else fd_url
 
         if not is_empty_like(raw_label):
@@ -1506,7 +1524,6 @@ with DAG(
                 "status": "success",
                 "total_policies": len(all_policies),
                 "policy_names": policy_names,
-                "all_policies": all_policies
             }
         except Exception as e:
             logger.error(f"DEBUG: Error querying Ranger policies: {e}", exc_info=True)
@@ -1524,40 +1541,64 @@ with DAG(
         all_statuses.extend(keycloak_result.get("statuses", []))
         return all_statuses
 
+    @task
+    def compute_finalize_metrics(
+        parsed_data: Dict[str, Any],
+        ranger_result: Dict[str, Any],
+        keycloak_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Reduce large XCom dicts to scalar metrics so finalize_policy_run avoids XCom bloat."""
+        metrics = compute_run_metrics(parsed_data, ranger_result, keycloak_result)
+        return {
+            "total_policies_parsed": len(parsed_data.get('policies', {})),
+            "total_role_mappings_parsed": len(parsed_data.get('role_principals', {})),
+            "groups_created": metrics["groups_created"],
+            "groups_existing": metrics["groups_existing"],
+            "policies_created": metrics["policies_created"],
+            "policies_updated": metrics["policies_updated"],
+            "policies_failed": metrics["policies_failed"],
+            "roles_created": metrics["roles_created"],
+            "roles_existing": metrics["roles_existing"],
+            "mappings_created": metrics["mappings_created"],
+            "mappings_existing": metrics["mappings_existing"],
+            "total_objects": metrics["total_objects"],
+            "successful_objects": metrics["successful_objects"],
+            "failed_objects": metrics["failed_objects"],
+            "overall_status": metrics["overall_status"],
+        }
+
     @task.pyspark(conn_id="spark_default")
     def finalize_policy_run(
         tracking_run_id: str,
         dag_run_identifier: str,
         excel_file_path: str,
-        parsed_data: Dict[str, Any],
-        ranger_result: Dict[str, Any],
-        keycloak_result: Dict[str, Any],
+        run_metrics: Dict[str, Any],
         spark=None,
         sc=None
     ) -> Dict:
         """
-        Finalize the policy run: compute metrics from parsed data and task results,
-        update the tracking_ranger_policy_runs table, and return summary.
+        Finalize the policy run: write metrics to the tracking table and return summary.
+        Accepts pre-computed scalar metrics from compute_finalize_metrics to avoid
+        deserialising large XCom payloads inside this Spark task.
         """
         cfg = get_config()
         db = cfg["tracking_database"]
 
-        metrics = compute_run_metrics(parsed_data, ranger_result, keycloak_result)
-        groups_created = metrics["groups_created"]
-        groups_existing = metrics["groups_existing"]
-        policies_created = metrics["policies_created"]
-        policies_updated = metrics["policies_updated"]
-        policies_failed = metrics["policies_failed"]
-        roles_created = metrics["roles_created"]
-        roles_existing = metrics["roles_existing"]
-        mappings_created = metrics["mappings_created"]
-        mappings_existing = metrics["mappings_existing"]
-        total_objects = metrics["total_objects"]
-        successful_objects = metrics["successful_objects"]
-        failed_objects = metrics["failed_objects"]
-        overall_status = metrics["overall_status"]
-        ranger_summary = metrics["ranger_summary"]
-        keycloak_summary = metrics["keycloak_summary"]
+        groups_created = run_metrics["groups_created"]
+        groups_existing = run_metrics["groups_existing"]
+        policies_created = run_metrics["policies_created"]
+        policies_updated = run_metrics["policies_updated"]
+        policies_failed = run_metrics["policies_failed"]
+        roles_created = run_metrics["roles_created"]
+        roles_existing = run_metrics["roles_existing"]
+        mappings_created = run_metrics["mappings_created"]
+        mappings_existing = run_metrics["mappings_existing"]
+        total_objects = run_metrics["total_objects"]
+        successful_objects = run_metrics["successful_objects"]
+        failed_objects = run_metrics["failed_objects"]
+        overall_status = run_metrics["overall_status"]
+        total_policies_parsed = run_metrics["total_policies_parsed"]
+        total_role_mappings_parsed = run_metrics["total_role_mappings_parsed"]
 
         safe_overall_status = sql_str(overall_status)
         safe_tracking_run_id = sql_str(tracking_run_id)
@@ -1570,8 +1611,8 @@ with DAG(
                 total_objects = {total_objects},
                 successful_objects = {successful_objects},
                 failed_objects = {failed_objects},
-                total_policies_parsed = {len(parsed_data.get('policies', {}))},
-                total_role_mappings_parsed = {len(parsed_data.get('role_principals', {}))},
+                total_policies_parsed = {total_policies_parsed},
+                total_role_mappings_parsed = {total_role_mappings_parsed},
                 groups_created = {groups_created},
                 groups_existing = {groups_existing},
                 policies_created = {policies_created},
@@ -1788,8 +1829,6 @@ with DAG(
             "failed_objects": failed_objects,
             "dag_run_id": dag_run_identifier,
             "excel_file_path": excel_file_path,
-            "ranger_summary": ranger_summary,
-            "keycloak_summary": keycloak_summary
         }
 
 
@@ -1853,11 +1892,10 @@ with DAG(
         logger.info(f"Report generated at: {report_path}")
         return {
             "report_path": report_path,
-            "html_content": html,
         }
 
-    @task.pyspark(conn_id='spark_default')
-    def send_policy_report_email(report_result: Dict[str, Any], tracking_run_id: str, spark) -> Dict[str, Any]:
+    @task
+    def send_policy_report_email(report_result: Dict[str, Any], tracking_run_id: str) -> Dict[str, Any]:
         """Send HTML policy report via email using SMTP."""
         cfg = get_config()
         smtp_conn_id = cfg.get('smtp_conn_id', 'smtp_default')
@@ -1868,13 +1906,23 @@ with DAG(
             return {'sent': False, 'reason': 'no_recipients'}
 
         recipients = [r.strip() for r in recipients_str.split(',') if r.strip()]
-        html_content = report_result.get('html_content', '')
         report_path = report_result.get('report_path', '')
 
         try:
             import tempfile
             import os
+            import boto3
+            from urllib.parse import urlparse
             from airflow.utils.email import send_email
+
+            # Read the HTML report from storage.
+            # Normalise Hadoop-style schemes (s3a:// / s3n://) to s3:// for boto3.
+            read_path = report_path.replace('s3a://', 's3://', 1).replace('s3n://', 's3://', 1)
+            parsed_url = urlparse(read_path)
+            html_content = boto3.client('s3').get_object(
+                Bucket=parsed_url.netloc,
+                Key=parsed_url.path.lstrip('/')
+            )['Body'].read().decode('utf-8')
 
             tmp = tempfile.NamedTemporaryFile(
                 mode='w',
@@ -2131,13 +2179,12 @@ with DAG(
     all_statuses = extract_statuses(ranger_result, keycloak_result)
     write_statuses = write_policy_object_statuses(all_statuses)
 
+    run_metrics = compute_finalize_metrics(parsed_data, ranger_result, keycloak_result)
     finalize = finalize_policy_run(
         tracking_run_id=tracking_run_id,
         dag_run_identifier=dag_run_identifier,
         excel_file_path=excel_path,
-        parsed_data=parsed_data,
-        ranger_result=ranger_result,
-        keycloak_result=keycloak_result,
+        run_metrics=run_metrics,
     )
 
 
