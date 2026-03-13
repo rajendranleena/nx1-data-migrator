@@ -1,4 +1,3 @@
-# Virtual environments
 .venv/
 
 # Bytecode
@@ -23,3 +22,16 @@ env.*
 
 # OS
 .DS_Store
+
+# Test / coverage artifacts
+.coverage
+coverage.xml
+htmlcov/
+
+# Pytest cache
+.pytest_cache/
+
+# Python cache
+*.pyc
+venv/
+.pytest_tmp/

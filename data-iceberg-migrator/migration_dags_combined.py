@@ -2680,7 +2680,7 @@ def create_iceberg_migration_run(excel_file_path: str, dag_run_id: str, spark) -
 
 @task.pyspark(conn_id='spark_default')
 def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
-    """Read Excel config for Iceberg migration from S3."""
+    """Read Excel config for Iceberg migration from S3, grouping rows by (database, inplace_migration, destination_iceberg_database)."""
     import pandas as ps
     from io import BytesIO
 
@@ -2688,36 +2688,58 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
     row = binary_df.select("content").first()
     excel_bytes = bytes(row.content)
     df = ps.read_excel(BytesIO(excel_bytes), engine='openpyxl')
-    
+
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
-    
-    configs = []
+
+    grouped = {}
     for _, row in df.iterrows():
-        src_db = str(row.get('database', '')).strip() if row.get('database') is not None else ''
+        src_db = str(row.get('database', '') or '').strip()
         if not src_db:
             continue
-        
-        tbl_val = row.get('table', None)
-        tbl_pattern = '*' if (tbl_val is None or (isinstance(tbl_val, float) and __import__('math').isnan(tbl_val)) or str(tbl_val).strip().lower() in ('', 'nan')) else str(tbl_val).strip() or '*'
-        
+
         inplace_val = row.get('inplace_migration', None)
         if inplace_val is None or (isinstance(inplace_val, float) and __import__('math').isnan(inplace_val)) or str(inplace_val).strip().lower() in ('', 'nan', 'f', 'false', 'no', '0'):
             inplace_migration = False
         else:
             inplace_migration = str(inplace_val).strip().upper() in ('T', 'TRUE', 'YES', '1')
-        
-        dest_ice_db = str(row.get('destination_iceberg_database', '')).strip() if row.get('destination_iceberg_database') is not None else ''
+
+        dest_ice_db_val = row.get('destination_iceberg_database', '')
+        dest_ice_db = str(dest_ice_db_val).strip() if dest_ice_db_val is not None else ''
         if not dest_ice_db or dest_ice_db.lower() == 'nan':
             dest_ice_db = src_db if inplace_migration else f"{src_db}_iceberg"
-        
+
+        raw_cell_val = row.get('table', '')
+        raw_cell = '*' if (raw_cell_val is None or (isinstance(raw_cell_val, float) and __import__('math').isnan(raw_cell_val)) or str(raw_cell_val).strip().lower() in ('', 'nan')) else str(raw_cell_val).strip() or '*'
+
+        key = (src_db, inplace_migration, dest_ice_db)
+        if key not in grouped:
+            grouped[key] = {'tokens': []}
+
+        for tok in raw_cell.split(','):
+            tok = tok.strip()
+            if tok:
+                grouped[key]['tokens'].append(tok)
+
+    configs = []
+    for (src_db, inplace_migration, dest_ice_db), group in grouped.items():
+        unique_tokens = list(dict.fromkeys(group['tokens']))
+        if '*' in unique_tokens:
+            unique_tokens = ['*']
+
+        logger.info(
+            f"[ParseIcebergExcel] {src_db} -> dest={dest_ice_db} | inplace={inplace_migration} | "
+            f"tokens={unique_tokens[:10]}" + (" ..." if len(unique_tokens) > 10 else "")
+        )
+
         configs.append({
             'source_database': src_db,
-            'table_pattern': tbl_pattern,
+            'table_tokens': unique_tokens,
             'inplace_migration': inplace_migration,
             'destination_iceberg_database': dest_ice_db,
-            'run_id': run_id, 
+            'run_id': run_id,
         })
-    
+
+    logger.info(f"[ParseIcebergExcel] Total database configs emitted: {len(configs)}")
     return configs
 
 
@@ -2726,18 +2748,39 @@ def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
 def discover_hive_tables(db_config: dict, spark) -> dict:
     """Discover Hive tables matching the pattern in the source database."""
     src_db = db_config['source_database']
-    tbl_pattern = db_config['table_pattern']
+    raw_tokens = db_config.get('table_tokens') or []
+    if not raw_tokens:
+        pattern_str = db_config.get('table_pattern', '*')
+        raw_tokens = [t.strip() for t in pattern_str.split(',') if t.strip()] or ['*']
     run_id = db_config['run_id']
     
-    all_tables = [row.tableName for row in spark.sql(f"SHOW TABLES IN {src_db}").collect()]
-    
-    if tbl_pattern == '*':
-        matched_tables = all_tables
-    else:
-        import fnmatch
-        matched_tables = [t for t in all_tables if fnmatch.fnmatch(t, tbl_pattern)]
+    def resolve_tokens(spark, db, tokens):
+        resolved = []
+        seen = set()
+        for tok in tokens:
+            if tok == '*':
+                rows = spark.sql(f"SHOW TABLES IN {db}").collect()
+                for r in rows:
+                    t = r.tableName
+                    if t not in seen:
+                        seen.add(t)
+                        resolved.append(t)
+            elif '*' in tok:
+                rows = spark.sql(f"SHOW TABLES IN {db} LIKE '{tok}'").collect()
+                for r in rows:
+                    t = r.tableName
+                    if t not in seen:
+                        seen.add(t)
+                        resolved.append(t)
+            else:
+                if tok not in seen:
+                    seen.add(tok)
+                    resolved.append(tok)
+        return resolved
 
-    logger.info(f"[IcebergDiscover] Database '{src_db}': {len(all_tables)} total tables, {len(matched_tables)} matched pattern '{tbl_pattern}'")
+    matched_tables = resolve_tokens(spark, src_db, raw_tokens)
+
+    logger.info(f"[IcebergDiscover] Database '{src_db}': {len(matched_tables)} table(s) matched tokens={raw_tokens}")
     
     tables_metadata = []
     for tbl in matched_tables:
@@ -4675,7 +4718,7 @@ def finalize_data_copy_run(run_id: str, spark) -> dict:
 
 
 @task.pyspark(conn_id='spark_default')
-def generate_data_copy_html_report(run_id: str, finalize_result: dict, spark) -> dict:
+def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark) -> dict:
     """Generate HTML report for folder-only data copy run and write to S3."""
     from datetime import datetime
 
