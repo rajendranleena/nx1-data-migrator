@@ -20,18 +20,19 @@ When you run `ranger_policy_automation`, it:
 
 Your Excel sheet must include these columns (case-insensitive):
 
-| Column | Meaning | Required | Example |
-|---|---|---|---|
-| `role` | Role name used for policy principals | Conditional | `data_analysts` |
-| `database` | One or more schema names (comma-separated) or `*` | Yes* | `sales,marketing` |
-| `tables` | Table names (comma-separated) or `*` | No (defaults to `*`) | `orders,customers` |
-| `columns` | Column names (comma-separated) or `*` | No (defaults to `*`) | `id,email` |
-| `url` | Storage URL path for URL policies | Yes* | `s3a://bucket/path/*` |
-| `permissions` | Access level(s), comma-separated | No (defaults to `read`) | `read,write` |
-| `groups` | Keycloak groups to map to the role | No | `finance,bi-team` |
-| `users` | Keycloak users to map to the role | No | `alice,bob` |
-| `rowfilter` | SQL row filter for table policies only | No | `region = 'US'` |
-| `policy_label` | (Optional) Policy label(s) for Ranger policy. If provided, this value will be used as the policy label(s) in Ranger. | No | `label1,label2` |
+| Column | Meaning | Required | Fill-down? | Example |
+|---|---|---|---|---|
+| `role` | Role name used for policy principals | Conditional | No | `data_analysts` |
+| `database` | One or more schema names (comma-separated) or `*` | Yes* | **Yes** | `sales,marketing` |
+| `tables` | Table names (comma-separated) or `*` | No (defaults to `*`) | **Conditional** | `orders,customers` |
+| `columns` | Column names (comma-separated) or `*` | No (defaults to `*`) | **Conditional** | `id,email` |
+| `url` | Storage URL path for URL policies | Yes* | **Yes** | `s3a://bucket/path/*` |
+| `permissions` | Access level(s), comma-separated | No (defaults to `read`) | No | `read,write` |
+| `groups` | Keycloak groups to map to the role | No | No | `finance,bi-team` |
+| `users` | Keycloak users to map to the role | No | No | `alice,bob` |
+| `rowfilter` | SQL row filter for table policies only. Only valid for `item_type=allow`. | No | No | `region = 'US'` |
+| `policy_label` | Policy label(s) for Ranger policy | No | **Yes** | `label1,label2` |
+| `item_type` | Which Ranger policy item list this row goes into. Valid values: `allow` (default), `allow_exception`, `deny`, `deny_exception`. | No | No | `deny` |
 
 `*` Exactly one of `database` or `url` must be provided in each row:
 - `database` set and `url` empty ✅
@@ -39,10 +40,40 @@ Your Excel sheet must include these columns (case-insensitive):
 - both set ❌
 - both empty ❌
 
+**Fill-down columns:** Fill-down applies to `database`, `tables`, `columns`, `url`, and `policy_label` — but only when the **primary resource identifier** for the row is also blank.
+
+- `tables` and `columns` fill down **only when `database` is also blank** on that row.
+- `url` and `policy_label` fill down when their respective cells are blank.
+- When a row specifies a new `database` (or `url`) value, `tables` and `columns` on that row are read as written — blank means default (`*`), **not** the previous row's value.
+
+This means fill-down is scoped to a "same resource block": consecutive rows that share the same resource by leaving `database`/`url` blank inherit the full resource definition. As soon as a new `database`/`url` value appears, `tables`/`columns` start fresh.
+
+This lets you stack multiple item types for the same resource without repeating the resource definition:
+
+```
+| role          | database | tables | columns | permissions | groups       | item_type       |
+|---------------|----------|--------|---------|-------------|--------------|------------------|
+| analysts      | sales    | orders | *       | read        | analytics    | allow            |
+| blocked       |          |        |         | read        | contractors  | deny             |
+```
+Both rows target the same `iceberg.sales.orders.*` policy; row 2 fills all resource columns down from row 1.
+
+Contrast with a new database row where blank columns mean default:
+```
+| role          | database | tables     | columns | permissions | item_type |
+|---------------|----------|------------|---------|-------------|-----------|
+| analysts      | sales    | orders     | name    | read        | allow     |
+| readers       | finance  |            |         | read        | allow     |
+```
+Row 2 has a new `database=finance`, so blank `tables` and `columns` default to `*` (not filled from row 1). Policy: `iceberg.finance.*.*`.
+
+Item-level columns (`role`, `permissions`, `groups`, `users`, `rowfilter`, `item_type`) never fill down.
+
 ### Important validation behavior
 
 Rows are **skipped** (not fatal for whole run) when invalid, for example:
 - Both `database` and `url` are set, or both are empty
+- `rowfilter` is present on a `deny`, `deny_exception`, or `allow_exception` row (rowfilter is only valid for `allow`)
 - `rowfilter` is present on URL rows
 - `groups` is provided but `role` is empty
 - Role binding cannot be derived from row content
@@ -109,11 +140,30 @@ This prevents duplicate policies and keeps access definitions consolidated. Unle
 
 ## Rowfilter behavior
 
-For rows with `rowfilter` (table policies only), the automation creates two Ranger policies:
-1. Access policy (normal permissions)
-2. Row-filter policy (`<base_policy_name>__rowfilter`)
+For rows with `rowfilter` (table policies with `item_type=allow` only), the automation creates two Ranger policies:
+1. Access policy (normal permissions) — policyType 0
+2. Row-filter policy (`<base_policy_name>__rowfilter`) — policyType 2
 
 This is expected and both can appear in status/report outputs.
+
+Ranger does not support row filters on deny or exception items. A `rowfilter` value on a `deny`, `deny_exception`, or `allow_exception` row is ignored and the row is skipped with a warning.
+
+---
+
+## Deny and exception item types
+
+The `item_type` column controls which Ranger policy item list a row's role entry is placed in:
+
+| `item_type` | Ranger list | Use case |
+|---|---|---|
+| `allow` (default) | `policyItems` | Grant access |
+| `allow_exception` | `allowExceptions` | Exclude a principal from an allow rule |
+| `deny` | `denyPolicyItems` | Explicitly deny access |
+| `deny_exception` | `denyExceptions` | Exclude a principal from a deny rule |
+
+**Keycloak provisioning applies to all item types equally.** The KC realm role (= Ranger group) must be created and have KC group/user mappings before it can be placed in any Ranger policy item list — whether `allow`, `deny`, `allow_exception`, or `deny_exception`. All four item types go through the same KC → Ranger group provisioning flow.
+
+All rows that share the same resource (same `database`/`tables`/`columns` or `url`) are merged into one Ranger policy, with each row contributing to its respective item list within that policy.
 
 ---
 
@@ -223,7 +273,8 @@ Use this as the authoring standard for input files:
 | `permissions` | No | CSV String | Defaults to `read` when omitted | `read,write` |
 | `groups` | No | CSV String | Keycloak groups | `engineering,bi-team` |
 | `users` | No | CSV String | Keycloak user IDs/usernames | `john.doe,jane.smith` |
-| `rowfilter` | No | String | SQL predicate for table policies only | `country='US'` |
+| `rowfilter` | No | String | SQL predicate for `allow` table policies only | `country='US'` |
+| `item_type` | No | String | `allow` (default), `allow_exception`, `deny`, `deny_exception` | `deny` |
 
 `*` Exactly one of `database` or `url` must be provided per row.
 
@@ -238,8 +289,8 @@ Use this as the authoring standard for input files:
 **DON'T**
 - Don’t set both `database` and `url` in one row.
 - Don’t leave `role` empty when `groups` is populated.
-- Don’t add `rowfilter` to URL rows.
-- Don’t use temporary/unclear role names that will be hard to maintain.
+- Don’t add `rowfilter` to URL rows.- Don't add `rowfilter` to `deny`, `deny_exception`, or `allow_exception` rows — it will be ignored.
+- Don't use temporary/unclear role names that will be hard to maintain.
 
 ### 3) Naming conventions
 

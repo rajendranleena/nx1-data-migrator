@@ -366,7 +366,7 @@ class TestGeneratePolicyReport:
         spark, output_stream = self._mock_spark()
 
         with patch.object(dag_module, "get_config", return_value=_CONFIG):
-            result = fn("run_001", [], spark)
+            result = fn("run_001", spark)
 
         sql_calls = [call[0][0] for call in spark.sql.call_args_list]
         tables_queried = [
@@ -392,7 +392,7 @@ class TestGeneratePolicyReport:
 
         with patch.object(dag_module, "get_config", return_value=_CONFIG):
             with pytest.raises(ValueError, match="No run found"):
-                fn("run_missing", [], spark)
+                fn("run_missing", spark)
 
 
 class TestSendPolicyReportEmail:

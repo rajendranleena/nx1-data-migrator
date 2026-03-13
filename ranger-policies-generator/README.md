@@ -16,20 +16,22 @@ The Excel file should have the following columns:
 | Column | Description | Required | Example |
 |--------|-------------|----------|---------|
 | role | Role name (becomes Ranger group); optional for users-only rows (synthetic role is created) | Conditional | `data_analysts` |
-| database | Database/schema names (comma-separated, or `*` for wildcard) | Yes* | `sales,marketing` or `*` |
-| tables | Table names (* for all, comma-separated) | No | `*` or `customers,orders` |
-| columns | Column names (* for all, comma-separated) | No | `*` or `name,email,phone` |
-| url | URL for storage-based policies | Yes* | `s3a://bucket/path/*` |
+| database | Database/schema names (comma-separated, or `*` for wildcard). **Fill-down**: if blank, the value from the previous row is used. | Yes* | `sales,marketing` or `*` |
+| tables | Table names (* for all, comma-separated). **Fill-down**: if blank *and `database` is also blank*, the value from the previous row is used; otherwise defaults to `*`. | No | `*` or `customers,orders` |
+| columns | Column names (* for all, comma-separated). **Fill-down**: if blank *and `database` is also blank*, the value from the previous row is used; otherwise defaults to `*`. | No | `*` or `name,email,phone` |
+| url | URL for storage-based policies. **Fill-down**: if blank, the value from the previous row is used. | Yes* | `s3a://bucket/path/*` |
 | permissions | Access level (read, write, or both) | Yes | `read` or `read,write` |
 | groups | Keycloak groups to assign the role | No | `engineering,data-team` |
 | users | Users to assign the role (users must already exist in Keycloak) | No | `alice,bob` |
-| rowfilter | Row-level filter expression for table policies only (optional, must not contain `;` or newlines) | No | `region = 'US'` |
-| policy_label | (Optional) Policy label(s) for Ranger policy. If provided, this value will be used as the policy label(s) in Ranger. | No | `label1,label2` |
+| rowfilter | Row-level filter expression for table policies only (optional, must not contain `;` or newlines). Only valid for `item_type=allow`. | No | `region = 'US'` |
+| policy_label | Policy label(s) for Ranger policy. **Fill-down**: if blank, the value from the previous row is used. | No | `label1,label2` |
+| item_type | Which Ranger policy item list this row contributes to. One of: `allow` (default), `allow_exception`, `deny`, `deny_exception`. | No | `deny` |
 
 *Note:
 - Exactly one of `database` or `url` must be provided per row (not both, not neither).
 - For database, you may use `*` as a wildcard to apply the policy to all databases.
-- Rowfilters are only supported for table policies; URL-based rows with a rowfilter are skipped.
+- Rowfilters are only supported for table policies with `item_type=allow`; any other combination is skipped.
+- **Fill-down columns** (`database`, `tables`, `columns`, `url`, `policy_label`) carry their value forward to subsequent rows that leave them blank — but with one important rule: `tables` and `columns` only fill down when `database` is also blank on that row. When a row introduces a new `database` value, blank `tables`/`columns` reset to their defaults (`*`), not the previous row's values. Item-level columns (`role`, `permissions`, `groups`, `users`, `rowfilter`, `item_type`) never fill down.
 *
 
 
@@ -72,14 +74,18 @@ This prevents duplicate policies and keeps access definitions consolidated. Unle
 
 The Excel file with sample values:
 ```
-| role           | database         | tables    | columns | url                        | permissions  | groups               | users         | rowfilter         | policy_label         |
-|----------------|------------------|-----------|---------|----------------------------|--------------|----------------------|---------------|-------------------|----------------------|
-| data_analysts  | sales,marketing  | *         | *       |                            | read         | analysts,bi-team     | alice,bob     | region = 'US'     | analytics,us         |
-| data_engineers | sales            | customers | *       |                            | read,write   | engineering          | carol         |                   | engineering          |
-| data_engineers | raw_data         | *         | *       |                            | write        | engineering          |               |                   | raw                  |
-| ml_team        |                  |           |         | s3a://ml-bucket/models/*   | read,write   | data-science         |               |                   | ml,models            |
-| finance_team   | finance          | transactions | amount,date |                     | read         | finance,accounting   | dave,erin     | dept = 'acct'     | finance,acct         |
+| role           | database         | tables       | columns     | url                        | permissions  | groups               | users         | rowfilter         | policy_label  | item_type        |
+|----------------|------------------|--------------|-------------|----------------------------|--------------|----------------------|---------------|-------------------|---------------|------------------|
+| data_analysts  | sales,marketing  | *            | *           |                            | read         | analysts,bi-team     | alice,bob     | region = 'US'     | analytics,us  | allow            |
+| blocked_users  |                  |              |             |                            | read         | blocked-team         |               |                   |               | deny             |
+| data_engineers | sales            | customers    | *           |                            | read,write   | engineering          | carol         |                   | engineering   | allow            |
+| data_engineers |                  |              |             |                            | read         | engineering-exc      |               |                   |               | allow_exception  |
+| data_engineers | raw_data         | *            | *           |                            | write        | engineering          |               |                   | raw           | allow            |
+| ml_team        |                  |              |             | s3a://ml-bucket/models/*   | read,write   | data-science         |               |                   | ml,models     | allow            |
+| finance_team   | finance          | transactions | amount,date |                            | read         | finance,accounting   | dave,erin     | dept = 'acct'     | finance,acct  | allow            |
 ```
+
+In rows 2 and 4, `database`/`tables`/`columns` are left blank and fill down from row 1 and 3 respectively — both rows contribute to the same Ranger policy as their predecessor but go into different item lists (`deny` and `allow_exception`).
 
 # Role, Group, and User Mapping Logic
 
@@ -91,12 +97,31 @@ The Excel file with sample values:
 - Ranger policy grants are role/group-based only (no direct Ranger user grants).
 - Ranger policy assignment for a role proceeds when at least one Keycloak principal mapping (group or user) is successful/already exists.
 - A role is blocked for Ranger policy assignment only when all attempted Keycloak principal mappings fail for that role (or role creation fails).
+- **`deny`, `deny_exception`, and `allow_exception` rows require KC provisioning just like `allow` rows.** The KC realm role (= Ranger group) must be created and have KC group/user mappings before it can be placed in any Ranger policy item list. All four item types go through the same KC → Ranger group provisioning flow.
+
+# Policy Item Types (`item_type`)
+
+The `item_type` column controls which of the four Ranger policy item lists a row's role entry is placed into:
+
+| `item_type` | Ranger API field | Meaning |
+|---|---|---|
+| `allow` (default) | `policyItems` | Grants access |
+| `allow_exception` | `allowExceptions` | Excludes principals from an allow rule |
+| `deny` | `denyPolicyItems` | Explicitly denies access |
+| `deny_exception` | `denyExceptions` | Excludes principals from a deny rule |
+
+If `item_type` is omitted or blank, it defaults to `allow`.
+
+All rows sharing the same resource (same `database`/`tables`/`columns` or `url`) are merged into a single Ranger policy, regardless of their `item_type`. The `item_type` only determines which item list within that policy they belong to.
 
 # Validation and SQL Safeguards
 
 - All policy names and rowfilters are sanitized before being used in SQL.
 - Rowfilters containing `;` or newlines are rejected and logged.
 - Invalid Excel rows are skipped, persisted in `tracking_ranger_policy_skipped_rows`, and shown in the HTML report.
+
+**Note on Row Filter Policy Architecture (Apache Ranger):**
+In Apache Ranger, row filter policies (`policyType=2`) are implemented as a distinct policy type, separate from standard access policies and their deny/exception items. Row filters apply only to `allow`-type policy entries and define a filter condition that is enforced when access is granted. Ranger does not support attaching row filters to deny rules. Consequently, a `rowfilter` value on a `deny`, `deny_exception`, or `allow_exception` row in the Excel input is ignored — only `allow` rows contribute to the row filter policy.
 
 *Note: Policy names are prefixed with `iceberg` to match the catalog used for table-type policies in Ranger.*
 
