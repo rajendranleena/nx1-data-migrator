@@ -146,6 +146,70 @@ IMPORT_REPLACEMENTS = [
         "severity": "DEPRECATED",
         "description": "task_group moved to airflow.sdk",
     },
+    # Additional SDK imports
+    {
+        "pattern": r"from\s+airflow\.notifications\.basenotifier\s+import\s+BaseNotifier\b",
+        "replacement": "from airflow.sdk import BaseNotifier",
+        "category": "SDK Migration",
+        "severity": "DEPRECATED",
+        "description": "BaseNotifier moved to airflow.sdk",
+    },
+    {
+        "pattern": r"from\s+airflow\.models\.baseoperatorlink\s+import\s+BaseOperatorLink\b",
+        "replacement": "from airflow.sdk import BaseOperatorLink",
+        "category": "SDK Migration",
+        "severity": "DEPRECATED",
+        "description": "BaseOperatorLink moved to airflow.sdk",
+    },
+    {
+        "pattern": r"from\s+airflow\.models\.connection\s+import\s+Connection\b",
+        "replacement": "from airflow.sdk import Connection",
+        "category": "SDK Migration",
+        "severity": "DEPRECATED",
+        "description": "Connection moved to airflow.sdk",
+    },
+    {
+        "pattern": r"from\s+airflow\.utils\.context\s+import\s+Context\b",
+        "replacement": "from airflow.sdk import Context",
+        "category": "SDK Migration",
+        "severity": "DEPRECATED",
+        "description": "Context moved to airflow.sdk",
+    },
+    {
+        "pattern": r"from\s+airflow\.operators\.python\s+import\s+get_current_context\b",
+        "replacement": "from airflow.sdk import get_current_context",
+        "category": "SDK Migration",
+        "severity": "DEPRECATED",
+        "description": "get_current_context moved to airflow.sdk",
+    },
+    {
+        "pattern": r"from\s+airflow\.io\.path\s+import\s+ObjectStoragePath\b",
+        "replacement": "from airflow.sdk import ObjectStoragePath",
+        "category": "SDK Migration",
+        "severity": "DEPRECATED",
+        "description": "ObjectStoragePath moved to airflow.sdk",
+    },
+    {
+        "pattern": r"from\s+airflow\.models\.taskmixin\s+import\s+TaskMixin\b",
+        "replacement": "from airflow.models.taskmixin import DependencyMixin",
+        "category": "SDK Migration",
+        "severity": "BREAKING",
+        "description": "TaskMixin renamed to DependencyMixin",
+    },
+    {
+        "pattern": r"from\s+airflow\.models\s+import\s+ImportError\b",
+        "replacement": "from airflow.models.errors import ParseImportError",
+        "category": "SDK Migration",
+        "severity": "BREAKING",
+        "description": "ImportError moved and renamed to ParseImportError",
+    },
+    {
+        "pattern": r"from\s+airflow\.exceptions\s+import\s+FailStopDagInvalidTriggerRule\b",
+        "replacement": "from airflow.exceptions import FailFastDagInvalidTriggerRule",
+        "category": "SDK Migration",
+        "severity": "BREAKING",
+        "description": "FailStopDagInvalidTriggerRule renamed to FailFastDagInvalidTriggerRule",
+    },
     # 2. Datasets → Assets
     {
         "pattern": r"from\s+airflow\.datasets\s+import\s+Dataset\b",
@@ -181,6 +245,20 @@ IMPORT_REPLACEMENTS = [
         "category": "Assets Rename",
         "severity": "BREAKING",
         "description": "Metadata moved to airflow.sdk",
+    },
+    {
+        "pattern": r"from\s+airflow\.datasets\s+import\s+DatasetEvent\b",
+        "replacement": "from airflow.sdk import AssetEvent",
+        "category": "Assets Rename",
+        "severity": "BREAKING",
+        "description": "DatasetEvent renamed to AssetEvent",
+    },
+    {
+        "pattern": r"from\s+airflow\.datasets\.manager\s+import\s+DatasetManager\b",
+        "replacement": "from airflow.assets.manager import AssetManager",
+        "category": "Assets Rename",
+        "severity": "BREAKING",
+        "description": "DatasetManager renamed to AssetManager",
     },
     # 3. Operators → standard provider
     {
@@ -239,6 +317,20 @@ IMPORT_REPLACEMENTS = [
         "severity": "DEPRECATED",
         "description": "LatestOnlyOperator moved to standard provider",
     },
+    {
+        "pattern": r"from\s+airflow\.operators\.weekday\s+import\s+(.+)",
+        "handler": "standard_weekday_import",
+        "category": "Standard Provider",
+        "severity": "DEPRECATED",
+        "description": "Weekday operators moved to standard provider",
+    },
+    {
+        "pattern": r"from\s+airflow\.operators\.subdag\s+import\s+SubDagOperator\b",
+        "replacement": "# REMOVED: SubDagOperator - refactor to TaskGroup",
+        "category": "Removed Feature",
+        "severity": "BREAKING",
+        "description": "SubDagOperator removed entirely; refactor to TaskGroup",
+    },
     # 4. Sensors → standard provider
     {
         "pattern": r"from\s+airflow\.sensors\.python\s+import\s+(.+)",
@@ -279,6 +371,30 @@ IMPORT_REPLACEMENTS = [
         "category": "Standard Provider",
         "severity": "DEPRECATED",
         "description": "ExternalTask sensors moved to standard provider",
+    },
+    {
+        "pattern": r"from\s+airflow\.sensors\.filesystem\s+import\s+(.+)",
+        "handler": "standard_sensor_import",
+        "source_module": "filesystem",
+        "category": "Standard Provider",
+        "severity": "DEPRECATED",
+        "description": "FileSensor moved to standard provider",
+    },
+    {
+        "pattern": r"from\s+airflow\.sensors\.weekday\s+import\s+(.+)",
+        "handler": "standard_sensor_import",
+        "source_module": "weekday",
+        "category": "Standard Provider",
+        "severity": "DEPRECATED",
+        "description": "DayOfWeekSensor moved to standard provider",
+    },
+    {
+        "pattern": r"from\s+airflow\.sensors\.time_sensor\s+import\s+(.+)",
+        "handler": "standard_sensor_import",
+        "source_module": "time",
+        "category": "Standard Provider",
+        "severity": "DEPRECATED",
+        "description": "TimeSensor moved to standard provider",
     },
     # 5. Hooks → standard provider
     {
@@ -354,6 +470,51 @@ IMPORT_REPLACEMENTS = [
         "severity": "BREAKING",
         "description": "days_ago removed; use pendulum.today('UTC').add(days=-N)",
     },
+    {
+        "pattern": r"from\s+airflow\.utils\.dates\s+import\s+(.+)",
+        "replacement": "# REMOVED: airflow.utils.dates module removed in Airflow 3",
+        "category": "Removed Utility",
+        "severity": "BREAKING",
+        "description": "airflow.utils.dates module removed; use pendulum directly",
+    },
+    # 9. Auth manager / security import changes
+    {
+        "pattern": r"from\s+airflow\.www\.security\s+import\s+AirflowSecurityManager\b",
+        "replacement": "from airflow.providers.fab.auth_manager.security_manager.override import FabAirflowSecurityManagerOverride",
+        "category": "Auth Manager",
+        "severity": "BREAKING",
+        "description": "AirflowSecurityManager moved to FAB provider",
+    },
+    {
+        "pattern": r"from\s+airflow\.auth\.managers\.fab\.fab_auth_manager\s+import\s+FabAuthManager\b",
+        "replacement": "from airflow.providers.fab.auth_manager.fab_auth_manager import FabAuthManager",
+        "category": "Auth Manager",
+        "severity": "BREAKING",
+        "description": "FabAuthManager moved to FAB provider package",
+    },
+    # 10. Direct database access (removed in Airflow 3)
+    {
+        "pattern": r"from\s+airflow\.utils\.db\s+import\s+create_session\b",
+        "replacement": "# REMOVED: Direct DB access removed in Airflow 3; use REST API via apache-airflow-client",
+        "category": "Database Access",
+        "severity": "BREAKING",
+        "description": "create_session removed; tasks cannot access DB directly, use REST API",
+    },
+    {
+        "pattern": r"from\s+airflow\.utils\.session\s+import\s+provide_session\b",
+        "replacement": "# REMOVED: Direct DB access removed in Airflow 3; use REST API via apache-airflow-client",
+        "category": "Database Access",
+        "severity": "BREAKING",
+        "description": "provide_session removed; tasks cannot access DB directly, use REST API",
+    },
+    # 11. Provider-specific import changes
+    {
+        "pattern": r"from\s+airflow\.providers\.apache\.spark\.operators\.spark_submit\s+import\s+SparkSubmitOperator\b",
+        "replacement": "from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator",
+        "category": "Spark Provider",
+        "severity": "WARNING",
+        "description": "Verify spark provider version is compatible with Airflow 3",
+    },
 ]
 
 # --- Operator class name replacements (for instantiation) ------------------
@@ -377,6 +538,12 @@ CONN_ID_RENAMES = {
     "mssql_conn_id": "conn_id",
     "snowflake_conn_id": "conn_id",
     "hive_cli_conn_id": "conn_id",
+    # Google provider conn_id renames
+    "bigquery_conn_id": "gcp_conn_id",
+    "google_cloud_storage_conn_id": "gcp_conn_id",
+    "datastore_conn_id": "gcp_conn_id",
+    # AWS provider conn_id renames
+    "s3_conn_id": "aws_conn_id",
 }
 
 # --- DAG parameter deprecations -------------------------------------------
@@ -402,6 +569,13 @@ DAG_PARAM_CHANGES = [
         "category": "DAG Parameters",
         "severity": "BREAKING",
         "description": "task_concurrency removed; use max_active_tis_per_dag",
+    },
+    {
+        "pattern": r"\bfail_stop\s*=",
+        "replacement_key": "fail_fast",
+        "category": "DAG Parameters",
+        "severity": "BREAKING",
+        "description": "fail_stop renamed to fail_fast",
     },
 ]
 
@@ -515,6 +689,24 @@ class Airflow3MigrationScanner:
             # Check use_dill parameter
             self._check_use_dill(rel_path, line_num, stripped, line)
 
+            # Check SLA usage (removed in Airflow 3)
+            self._check_sla_usage(rel_path, line_num, stripped, line)
+
+            # Check use_task_execution_date parameter
+            self._check_execution_date_params(rel_path, line_num, stripped, line)
+
+            # Check delegate_to parameter (Google provider)
+            self._check_delegate_to(rel_path, line_num, stripped, line)
+
+            # Check .get_hook() method (AWS provider)
+            self._check_get_hook(rel_path, line_num, stripped, line)
+
+            # Check direct DB access patterns
+            self._check_direct_db_access(rel_path, line_num, stripped, line)
+
+            # Check DatasetAlias/DatasetAll/DatasetAny class usage (non-import)
+            self._check_dataset_class_usage(rel_path, line_num, stripped, line)
+
     def _check_imports(self, file: str, line_num: int, stripped: str, original: str):
         for rule in IMPORT_REPLACEMENTS:
             match = re.match(rule["pattern"], stripped)
@@ -549,6 +741,9 @@ class Airflow3MigrationScanner:
         elif handler == "standard_datetime_import":
             names = match.group(1).strip()
             return f"from airflow.providers.standard.operators.datetime import {names}"
+        elif handler == "standard_weekday_import":
+            names = match.group(1).strip()
+            return f"from airflow.providers.standard.operators.weekday import {names}"
         elif handler == "standard_sensor_import":
             names = match.group(1).strip()
             module = rule.get("source_module", "")
@@ -700,6 +895,114 @@ class Airflow3MigrationScanner:
                 new_code=new_code,
                 description="use_dill parameter removed from PythonOperator",
             ))
+
+    def _check_sla_usage(self, file: str, line_num: int, stripped: str, original: str):
+        # Check for sla= parameter in task/DAG definitions
+        if re.search(r"\bsla\s*=\s*timedelta", stripped):
+            self.findings.append(MigrationFinding(
+                file=file,
+                line=line_num,
+                category="Removed Feature",
+                severity="BREAKING",
+                old_code=stripped,
+                new_code="# REMOVED: SLAs removed in Airflow 3; use custom monitoring or Deadline Alerts",
+                description="SLA feature removed entirely in Airflow 3",
+                auto_fixable=False,
+            ))
+        if re.search(r"\bsla_miss_callback\s*=", stripped):
+            self.findings.append(MigrationFinding(
+                file=file,
+                line=line_num,
+                category="Removed Feature",
+                severity="BREAKING",
+                old_code=stripped,
+                new_code="# REMOVED: sla_miss_callback removed in Airflow 3",
+                description="sla_miss_callback removed; SLAs replaced by Deadline Alerts",
+                auto_fixable=False,
+            ))
+
+    def _check_execution_date_params(self, file: str, line_num: int, stripped: str, original: str):
+        if re.search(r"\buse_task_execution_date\s*=", stripped):
+            new_code = re.sub(r"\buse_task_execution_date\b", "use_task_logical_date", stripped)
+            self.findings.append(MigrationFinding(
+                file=file,
+                line=line_num,
+                category="Removed Parameters",
+                severity="BREAKING",
+                old_code=stripped,
+                new_code=new_code,
+                description="use_task_execution_date removed; use use_task_logical_date",
+            ))
+
+    def _check_delegate_to(self, file: str, line_num: int, stripped: str, original: str):
+        if re.search(r"\bdelegate_to\s*=", stripped):
+            new_code = re.sub(r"\bdelegate_to\b", "impersonation_chain", stripped)
+            self.findings.append(MigrationFinding(
+                file=file,
+                line=line_num,
+                category="Google Provider",
+                severity="BREAKING",
+                old_code=stripped,
+                new_code=new_code,
+                description="delegate_to removed from GCP operators; use impersonation_chain",
+            ))
+
+    def _check_get_hook(self, file: str, line_num: int, stripped: str, original: str):
+        if re.search(r"\.get_hook\s*\(\s*\)", stripped):
+            new_code = stripped.replace(".get_hook()", ".hook")
+            self.findings.append(MigrationFinding(
+                file=file,
+                line=line_num,
+                category="AWS Provider",
+                severity="BREAKING",
+                old_code=stripped,
+                new_code=new_code,
+                description=".get_hook() removed from AWS sensors; use .hook property",
+            ))
+
+    def _check_direct_db_access(self, file: str, line_num: int, stripped: str, original: str):
+        # Check for common direct DB access patterns (not imports, those are handled above)
+        if not stripped.startswith("from ") and not stripped.startswith("import "):
+            patterns = [
+                (r"\bSession\s*\(\s*\)", "Direct Session() instantiation blocked in Airflow 3 tasks"),
+                (r"\bDagRun\.find\s*\(", "DagRun.find() blocked in tasks; use REST API client"),
+                (r"\.get_previous_dagrun\s*\(", "get_previous_dagrun() removed from context DagRun"),
+            ]
+            for pat, desc in patterns:
+                if re.search(pat, stripped):
+                    self.findings.append(MigrationFinding(
+                        file=file,
+                        line=line_num,
+                        category="Database Access",
+                        severity="BREAKING",
+                        old_code=stripped,
+                        new_code=f"# MANUAL FIX REQUIRED: {desc}; use REST API",
+                        description=desc,
+                        auto_fixable=False,
+                    ))
+                    break
+
+    def _check_dataset_class_usage(self, file: str, line_num: int, stripped: str, original: str):
+        if stripped.startswith("from ") or stripped.startswith("import "):
+            return
+        renames = {
+            "DatasetAlias": "AssetAlias",
+            "DatasetAll": "AssetAll",
+            "DatasetAny": "AssetAny",
+            "DatasetEvent": "AssetEvent",
+        }
+        for old_name, new_name in renames.items():
+            if re.search(rf"\b{old_name}\s*\(", stripped):
+                new_code = re.sub(rf"\b{old_name}\b", new_name, stripped)
+                self.findings.append(MigrationFinding(
+                    file=file,
+                    line=line_num,
+                    category="Assets Rename",
+                    severity="BREAKING",
+                    old_code=stripped,
+                    new_code=new_code,
+                    description=f"{old_name} renamed to {new_name} in Airflow 3",
+                ))
 
 
 # ---------------------------------------------------------------------------
