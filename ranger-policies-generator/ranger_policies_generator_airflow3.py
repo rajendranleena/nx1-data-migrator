@@ -350,7 +350,7 @@ def parse_excel_rows(df) -> Dict[str, Any]:
 
         if not is_empty_like(url) and url != '-' and url != '*':
             policy_name  = url
-            policy_label = policy_label_override if policy_label_override else None
+            policy_label = [l.strip() for l in policy_label_override.split(',') if l.strip()] if policy_label_override else None
             if policy_name not in policies:
                 policies[policy_name] = {'type': 'url', 'url': url, 'roles': [], 'label': policy_label}
             for binding in effective_role_bindings:
@@ -368,7 +368,7 @@ def parse_excel_rows(df) -> Dict[str, Any]:
                 for table in table_list:
                     for column in column_list:
                         policy_name  = build_policy_name('iceberg', database, table, column)
-                        policy_label = policy_label_override if policy_label_override else None
+                        policy_label = [l.strip() for l in policy_label_override.split(',') if l.strip()] if policy_label_override else None
                         if policy_name not in policies:
                             policies[policy_name] = {
                                 'type':    'table',
@@ -665,19 +665,27 @@ def build_keycloak_success_statuses(result: Dict[str, Any], tracking_run_id: str
             "completed_at": dt.now(timezone.utc)
         })
 
-    # Process failures
+    # Process failures — branch on operation type so role creation failures
+    # are recorded as object_type="role" rather than "mapping".
     for entry in result.get('failed', []):
         if isinstance(entry, dict):
-            principal = entry.get('principal', entry.get('group', entry.get('user', '')))
-            mtype = entry.get('type', 'group' if 'group' in entry else 'user')
-            name = f"{entry.get('role', '')}->{principal} ({mtype})"
+            operation = entry.get('operation', '')
             error = entry.get('error', '')
+            if operation == 'create_role':
+                obj_type = 'role'
+                name = entry.get('role', '')
+            else:  # assign_role / assign_role_user
+                principal = entry.get('principal', '')
+                mtype = entry.get('type', 'group')
+                name = f"{entry.get('role', '')}->{principal} ({mtype})"
+                obj_type = 'mapping'
         else:
+            obj_type = 'mapping'
             name = str(entry)
             error = ''
         statuses.append({
             "run_id": tracking_run_id,
-            "object_type": "mapping",
+            "object_type": obj_type,
             "object_name": name,
             "status": "FAILED",
             "error_message": error,
@@ -1279,18 +1287,24 @@ with DAG(
         groups_result = manager.ensure_groups_exist(list(all_roles))
 
         for g, created in groups_result.items():
-            if created:
+            if created is True:
                 groups_created.append(g)
                 status = "CREATED"
-            else:
+                error_message = ""
+            elif created is False:
                 groups_existing.append(g)
                 status = "ALREADY_EXISTS"
+                error_message = ""
+            else:  # None — creation attempt threw an exception
+                status = "FAILED"
+                error_message = f"Ranger group '{g}' could not be created; check Ranger logs."
+                logger.error(f"Ranger group '{g}' recorded as FAILED in tracking table.")
             statuses.append({
                 "run_id": tracking_run_id,
                 "object_type": "ranger_group",
                 "object_name": g,
                 "status": status,
-                "error_message": "",
+                "error_message": error_message,
                 "attempt": 1,
                 "started_at": dt.now(timezone.utc),
                 "completed_at": dt.now(timezone.utc)
@@ -1496,43 +1510,6 @@ with DAG(
         }
 
 
-    @task(trigger_rule=TriggerRule.ALL_DONE)
-    def debug_list_policies() -> Dict[str, Any]:
-        """
-        Debug task: Query Ranger backend to verify policies actually exist.
-        This runs during DAG execution and logs all policies for the service.
-        """
-        from ranger_utils import RangerPolicyManager
-        
-        cfg = get_config()
-        manager = RangerPolicyManager(
-            ranger_url=cfg["ranger_url"],
-            ranger_username=cfg["ranger_username"],
-            ranger_password=cfg["ranger_password"],
-            service_name=cfg["service_name"]
-        )
-        
-        try:
-            # Query all policies for the service
-            all_policies = manager.get_all_policies()
-            policy_names = [p.get('name', 'UNKNOWN') for p in all_policies]
-            
-            logger.info(f"DEBUG: Found {len(all_policies)} policies in Ranger service '{cfg['service_name']}'")
-            logger.info(f"DEBUG: Policy names: {policy_names}")
-            
-            return {
-                "status": "success",
-                "total_policies": len(all_policies),
-                "policy_names": policy_names,
-            }
-        except Exception as e:
-            logger.error(f"DEBUG: Error querying Ranger policies: {e}", exc_info=True)
-            return {
-                "status": "error",
-                "error": str(e),
-                "total_policies": 0,
-                "policy_names": []
-            }
     @task
     def extract_statuses(ranger_result: Dict[str, Any], keycloak_result: Dict[str, Any]) -> List[Dict]:
         """Combine statuses from both Ranger and Keycloak results."""
@@ -2175,7 +2152,6 @@ with DAG(
     write_final_policy_statuses = write_policy_statuses.override(
                             task_id="write_final_policy_statuses",
                             trigger_rule=TriggerRule.ALL_DONE)(final_policy_statuses)
-    debug_result = debug_list_policies()
     all_statuses = extract_statuses(ranger_result, keycloak_result)
     write_statuses = write_policy_object_statuses(all_statuses)
 
@@ -2199,7 +2175,7 @@ with DAG(
     keycloak_health >> keycloak_result
     [parsed_data, keycloak_result] >> ranger_result
     initial_policy_statuses >> write_initial_policy_statuses
-    ranger_result >> [debug_result, final_policy_statuses]
+    ranger_result >> final_policy_statuses
     final_policy_statuses >> write_final_policy_statuses
     write_initial_policy_statuses >> write_final_policy_statuses 
     [ranger_result, keycloak_result] >> all_statuses

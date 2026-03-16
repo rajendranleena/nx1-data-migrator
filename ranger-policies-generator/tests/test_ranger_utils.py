@@ -492,14 +492,15 @@ class TestRangerEnsureGroupsExist:
         # Exception during bulk-fetch → falls back to create path
         assert "any_group" in result
 
-    def test_create_exception_marks_false(self, ranger_utils_module):
+    def test_create_exception_marks_none(self, ranger_utils_module):
+        # None = creation failed (distinct from False = pre-existed)
         mgr = _make_manager(ranger_utils_module)
         all_groups = MagicMock()
         all_groups.list = []
         mgr.user_mgmt_client.find_groups.return_value = all_groups
         mgr.user_mgmt_client.create_group.side_effect = Exception("create failed")
         result = mgr.ensure_groups_exist(["bad_group"])
-        assert result["bad_group"] is False
+        assert result["bad_group"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -824,7 +825,8 @@ class TestCreateTablePolicy:
             role_permissions=rp_with_filter,
         )
         assert result["status"] == "created"
-        assert result.get("rowfilter_policy_name") == "p_rf__rowfilter"
+        # Rowfilter policy name is built from catalog.schema.table (not the access policy name)
+        assert result.get("rowfilter_policy_name") == "iceberg.db1.t1__rowfilter"
         # _create_policy called twice (access + rowfilter)
         assert mgr.client.create_policy.call_count == 2
 

@@ -261,7 +261,7 @@ class RangerPolicyManager:
                     logger.info(f"Created Ranger group: {group_name}")
                 except Exception as e:
                     logger.error(f"Failed to create group {group_name}: {e}")
-                    results[group_name] = False
+                    results[group_name] = None  # None = creation failed (distinct from False = pre-existed)
         
         return results
     
@@ -367,7 +367,13 @@ class RangerPolicyManager:
                 # CASE 1: Row Filters Present → separate access + rowfilter policy
                 # ============================================================
                 logger.info(f"Row filters detected. Creating separate Access and Row Filter policies")
-                resources_for_access    = safe_deepcopy({k: v for k, v in resources.items() if k != 'column'})
+                # Access policy keeps the column scope — column-scoped access policies
+                # (policyType=0) are valid in Ranger and must stay column-specific to
+                # avoid resource conflicts when multiple columns on the same table each
+                # have row filters.
+                resources_for_access    = safe_deepcopy(resources)
+                # Rowfilter policy is always table-level — Ranger does not support
+                # column-scoped row filter policies (policyType=2).
                 resources_for_rowfilter = safe_deepcopy({k: v for k, v in resources.items() if k != 'column'})
 
                 existing_access_policy = self.get_existing_policy(policy_name)
@@ -388,7 +394,13 @@ class RangerPolicyManager:
                         deny_exceptions=deny_exc_items or None,
                     )
 
-                rowfilter_policy_name  = f"{policy_name}__rowfilter"
+                # Rowfilter companion is named at table level (no column) so that all
+                # column-scoped policies on the same table share a single rowfilter
+                # policy, avoiding Ranger error 3010 (duplicate resource).
+                rf_parts = [p for p in [catalog, schema] if p and p != '*']
+                if table and table != '*':
+                    rf_parts.append(table)
+                rowfilter_policy_name = '.'.join(rf_parts) + '__rowfilter'
                 existing_rowfilter_policy = self.get_existing_policy(rowfilter_policy_name)
                 if existing_rowfilter_policy:
                     result_rowfilter = self._update_policy(
@@ -468,9 +480,9 @@ class RangerPolicyManager:
 
             # Build each item list — URL policies don't support row filters
             allow_items     = self._build_url_policy_items([rp for rp in role_permissions_with_policy_context if rp.get('item_type', 'allow') == 'allow'])
-            allow_exc_items = self._build_url_policy_items([rp for rp in role_permissions_with_policy_context if rp.get('item_type', 'allow') == 'allow_exception'])
-            deny_items      = self._build_url_policy_items([rp for rp in role_permissions_with_policy_context if rp.get('item_type', 'allow') == 'deny'])
-            deny_exc_items  = self._build_url_policy_items([rp for rp in role_permissions_with_policy_context if rp.get('item_type', 'allow') == 'deny_exception'])
+            allow_exc_items = self._build_url_policy_items([rp for rp in role_permissions_with_policy_context if rp.get('item_type') == 'allow_exception'])
+            deny_items      = self._build_url_policy_items([rp for rp in role_permissions_with_policy_context if rp.get('item_type') == 'deny'])
+            deny_exc_items  = self._build_url_policy_items([rp for rp in role_permissions_with_policy_context if rp.get('item_type') == 'deny_exception'])
 
             if not allow_items and not deny_items:
                 raise ValueError(
