@@ -11,17 +11,18 @@ This DAG:
 6. Generates an HTML report summarizing the run, policy statuses, and object-level results
 
 """
+import logging
+import os
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List
+
 from airflow import DAG
 from airflow.decorators import task
 from airflow.models import Variable
 from airflow.utils.trigger_rule import TriggerRule
 from dotenv import load_dotenv
-from pathlib import Path
-from typing import Dict, List, Any
-import logging
-import os
 
 _dag_stem = Path(__file__).stem
 logger = logging.getLogger(__name__)
@@ -87,9 +88,8 @@ def validate_rowfilter(rowfilter: str) -> str:
     Reject rowfilter values containing dangerous SQL characters (e.g., ; or newlines).
     Returns the rowfilter if valid, else raises ValueError.
     """
-    if rowfilter:
-        if any(c in rowfilter for c in [';', '\n', '\r']):
-            raise ValueError(f"Rowfilter contains forbidden characters (semicolon or newline): {rowfilter}")
+    if rowfilter and any(c in rowfilter for c in [';', '\n', '\r']):
+        raise ValueError(f"Rowfilter contains forbidden characters (semicolon or newline): {rowfilter}")
     return rowfilter
 
 def get_config() -> dict:
@@ -116,15 +116,15 @@ def parse_permission_string(permissions: str) -> List[str]:
     """Parse permission string into list."""
     if is_empty_like(permissions):
         return ['read']
-    
+
     perm_list = [p.strip().lower() for p in str(permissions).split(',') if p.strip()]
-    
+
     valid_perms = {'read', 'write', 'all', 'select', 'insert', 'update', 'delete', 'create', 'drop', 'alter', 'use', 'show', 'grant', 'revoke', 'execute', 'impersonate', 'read_sysinfo', 'write_sysinfo'}
     invalid_perms = [p for p in perm_list if p not in valid_perms]
-    
+
     if invalid_perms:
         logger.warning(f"Unknown permission types found: {invalid_perms}. They will be passed as-is to Ranger.")
-    
+
     return perm_list if perm_list else ['read']
 
 
@@ -419,7 +419,7 @@ def build_keycloak_failure_response(
     statuses = []
 
     # All roles that were supposed to be created failed
-    for role_name in role_principals.keys():
+    for role_name in role_principals:
         statuses.append({
             "run_id": tracking_run_id,
             "object_type": "role",
@@ -897,7 +897,8 @@ with DAG(
 
     @task
     def build_initial_policy_statuses(parsed_data: Dict[str, Any], tracking_run_id: str) -> List[Dict]:
-        from datetime import datetime as dt, timezone
+        from datetime import datetime as dt
+        from datetime import timezone
         policies = parsed_data.get('policies', {})
         now = dt.now(timezone.utc)
         status_list = []
@@ -939,8 +940,9 @@ with DAG(
 
     @task.pyspark(conn_id='spark_default')
     def parse_excel_to_dicts(excel_file_path: str, spark) -> Dict[str, Any]:
-        import pandas as pd
         from io import BytesIO
+
+        import pandas as pd
 
         # Read Excel from S3
         binary_df = spark.read.format("binaryFile").load(excel_file_path)
@@ -956,7 +958,8 @@ with DAG(
         """
         Write skipped Excel rows (validation errors) to the skipped rows tracking table.
         """
-        from datetime import datetime as dt, timezone
+        from datetime import datetime as dt
+        from datetime import timezone
         cfg = get_config()
         db = cfg["tracking_database"]
         now = dt.now(timezone.utc)
@@ -1084,7 +1087,7 @@ with DAG(
             USING iceberg
             LOCATION '{loc}/tracking_ranger_policy_skipped_rows'
         """)
-        
+
         return {"status": "initialized", "tracking_db": db}
 
     @task.pyspark(conn_id="spark_default")
@@ -1160,8 +1163,9 @@ with DAG(
         Create Ranger groups and policies.
         Returns both summary (for finalize) and statuses (for tracking).
         """
-        from ranger_utils import RangerPolicyManager
         from datetime import datetime as dt
+
+        from ranger_utils import RangerPolicyManager
 
         cfg = get_config()
         manager = RangerPolicyManager(
@@ -1322,11 +1326,11 @@ with DAG(
         Returns connection status and diagnostic info.
         """
         from ranger_utils import KeycloakRoleManager
-        
+
         cfg = get_config()
         try:
-            # Try to initialize manager with timeout and retries
-            manager = KeycloakRoleManager(
+            # Initialize manager to verify connectivity (constructor connects and calls get_realm)
+            KeycloakRoleManager(
                 server_url=cfg["keycloak_url"],
                 realm_name=cfg["keycloak_realm"],
                 client_id=cfg["keycloak_client_id"],
@@ -1381,7 +1385,7 @@ with DAG(
             return build_keycloak_failure_response(
                 filtered_role_principals, tracking_run_id, error_msg, attempt_num
             )
-        
+
         # Map roles to principals (groups and users) based on parsed data
         result = manager.sync_roles_and_principals(filtered_role_principals)
 
@@ -1408,7 +1412,7 @@ with DAG(
         This runs during DAG execution and logs all policies for the service.
         """
         from ranger_utils import RangerPolicyManager
-        
+
         cfg = get_config()
         manager = RangerPolicyManager(
             ranger_url=cfg["ranger_url"],
@@ -1416,15 +1420,15 @@ with DAG(
             ranger_password=cfg["ranger_password"],
             service_name=cfg["service_name"]
         )
-        
+
         try:
             # Query all policies for the service
             all_policies = manager.get_all_policies()
             policy_names = [p.get('name', 'UNKNOWN') for p in all_policies]
-            
+
             logger.info(f"DEBUG: Found {len(all_policies)} policies in Ranger service '{cfg['service_name']}'")
             logger.info(f"DEBUG: Policy names: {policy_names}")
-            
+
             return {
                 "status": "success",
                 "total_policies": len(all_policies),
@@ -1795,8 +1799,9 @@ with DAG(
         report_path = report_result.get('report_path', '')
 
         try:
-            import tempfile
             import os
+            import tempfile
+
             from airflow.utils.email import send_email
 
             tmp = tempfile.NamedTemporaryFile(
@@ -1830,7 +1835,8 @@ with DAG(
         """
         Write initial policy statuses to the policy_status table (status = RUNNING or PENDING).
         """
-        from datetime import datetime as dt, timezone
+        from datetime import datetime as dt
+        from datetime import timezone
         cfg = get_config()
         db = cfg["tracking_database"]
         now = dt.now(timezone.utc)
@@ -1856,7 +1862,7 @@ with DAG(
             users_sql = "array(" + ", ".join(["'" + sql_str(u) + "'" for u in users]) + ")" if users else "array()"
             groups_sql = "array(" + ", ".join(["'" + sql_str(g) + "'" for g in groups]) + ")" if groups else "array()"
             permissions_sql = "array(" + ", ".join(["'" + sql_str(perm) + "'" for perm in permissions]) + ")" if permissions else "array()"
-            rowfilter_sql = f"'" + sql_str(rowfilter) + "'" if rowfilter else "NULL"
+            rowfilter_sql = "'" + sql_str(rowfilter) + "'" if rowfilter else "NULL"
             created_at_sql = f"to_timestamp('{created_at.strftime('%Y-%m-%d %H:%M:%S')}', 'yyyy-MM-dd HH:mm:ss')"
             updated_at_sql = f"to_timestamp('{updated_at.strftime('%Y-%m-%d %H:%M:%S')}', 'yyyy-MM-dd HH:mm:ss')"
             try:
@@ -1883,11 +1889,12 @@ with DAG(
             except Exception as e:
                 logger.error(f"Failed to write initial policy status for {policy_name}: {e}")
         return written_count
-    
+
     # Build and write final policy statuses after policy processing
     @task(trigger_rule=TriggerRule.ALL_DONE)
     def build_final_policy_statuses(parsed_data: Dict[str, Any], tracking_run_id: str, ranger_result: Dict[str, Any]) -> List[Dict]:
-        from datetime import datetime as dt, timezone
+        from datetime import datetime as dt
+        from datetime import timezone
         policies = parsed_data.get('policies', {})
         policy_principals = ranger_result.get('policy_principals', {})
         applied_role_map = policy_principals.get('applied_roles', {})
@@ -1967,15 +1974,15 @@ with DAG(
         This avoids the mapped task complexity and type mismatches.
         """
         from datetime import datetime as dt
-        
+
         cfg = get_config()
         db = cfg["tracking_database"]
-        
+
         if not statuses:
             return {"written": 0}
-        
+
         written_count = 0
-        
+
         for obj in statuses:
             obj_run_id = sql_str(obj["run_id"])
             obj_type = sql_str(obj["object_type"])
@@ -2020,11 +2027,11 @@ with DAG(
                 written_count += 1
             except Exception as e:
                 logger.error(f"Failed to write status for {obj_type}/{obj_name}: {e}")
-        
+
         return {"written": written_count, "total": len(statuses)}
-    
+
     # -----------------------------
-    # DAG flow 
+    # DAG flow
     # -----------------------------
     excel_path = "{{ params.excel_file_path }}"
     dag_run_identifier = "{{ run_id }}"
@@ -2077,7 +2084,7 @@ with DAG(
     initial_policy_statuses >> write_initial_policy_statuses
     ranger_result >> [debug_result, final_policy_statuses]
     final_policy_statuses >> write_final_policy_statuses
-    write_initial_policy_statuses >> write_final_policy_statuses 
+    write_initial_policy_statuses >> write_final_policy_statuses
     [ranger_result, keycloak_result] >> all_statuses
     all_statuses >> write_statuses
     [write_statuses, write_final_policy_statuses] >> finalize

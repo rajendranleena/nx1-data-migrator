@@ -1223,11 +1223,10 @@ Config resolution: Airflow Variable → `os.getenv()` → hardcoded default in `
 
 ### Running Tests
 
-**Install test dependencies:**
+**Install test dependencies (from repo root):**
 
 ```bash
-cd data-iceberg-migrator
-pip install -r requirements-test.txt
+pip install ".[dev]"
 ```
 
 **Run the full suite:**
@@ -1241,21 +1240,22 @@ pytest tests/
 ```bash
 pytest tests/test_dag1_tasks.py
 pytest tests/test_dag2_tasks.py
-pytest tests/test_dag_structure.py
+pytest tests/test_dag3_tasks.py
+pytest tests/test_dag_integrity.py
 pytest tests/test_utils.py
 ```
 
 **Run with coverage report:**
 
 ```bash
-pytest tests/ --cov=migration_dags_combined --cov-report=term-missing
+pytest tests/ --cov
 ```
 
 ---
 
 ### Test Dependencies
 
-All test dependencies are in `requirements-test.txt`. No Airflow, PySpark, or Java installation is needed.
+All test dependencies are in the `dev` extra of the root `pyproject.toml`. No Airflow, PySpark, or Java installation is needed.
 
 | Package          | Purpose                                     |
 | ---------------- | ------------------------------------------- |
@@ -1270,13 +1270,14 @@ All test dependencies are in `requirements-test.txt`. No Airflow, PySpark, or Ja
 
 ### Test Files
 
-| File                    | Tests   | Covers                                                                                                                                                                        |
-| ----------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test_dag1_tasks.py`    | 58      | All DAG 1 task functions: prerequisites, tracking init, run creation, Excel parsing, SSH login, table discovery, DistCp, Hive table creation, validation, reporting, finalize |
-| `test_dag2_tasks.py`    | 32      | All DAG 2 task functions: tracking init, run creation, Excel parsing, Hive discovery, Iceberg migration, validation, reporting, finalize                                      |
-| `test_dag_structure.py` | 33      | DAG metadata (IDs, tags, params, schedule, catchup, max_active_runs), task presence, DAG independence, default args, status constants, DistCp metrics parsing                 |
-| `test_utils.py`         | 14      | `get_config()`, `@track_duration` decorator, `execute_with_iceberg_retry()`                                                                                                   |
-| **Total**               | **137** |                                                                                                                                                                               |
+| File                     | Tests  | Covers                                                                                                                                                                        |
+| ------------------------ | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_dag1_tasks.py`     | 37     | All DAG 1 task functions: prerequisites, tracking init, run creation, Excel parsing, SSH login, table discovery via SSH/Spark, DistCp, Hive table creation, validation, reporting, email, finalize |
+| `test_dag2_tasks.py`     | 22     | All DAG 2 task functions: tracking init, run creation, Excel parsing, Hive discovery, Iceberg migration (snapshot + inplace), validation, reporting, email, finalize           |
+| `test_dag3_tasks.py`     | 22     | All DAG 3 task functions: prerequisites, tracking init, run creation, folder Excel parsing, folder DistCp, status recording, validation, reporting, email, finalize            |
+| `test_dag_integrity.py`  | 6      | DAG IDs and params for all three DAGs (verifies module loads without import errors)                                                                                            |
+| `test_utils.py`          | 5      | `get_config()`, `@track_duration` decorator, `execute_with_iceberg_retry()`                                                                                                   |
+| **Total**                | **90** |                                                                                                                                                                               |
 
 ---
 
@@ -1284,67 +1285,74 @@ All test dependencies are in `requirements-test.txt`. No Airflow, PySpark, or Ja
 
 **`test_dag1_tasks.py`**
 
-| Class                           | What it tests                                                                |
-| ------------------------------- | ---------------------------------------------------------------------------- |
-| `TestValidatePrerequisites`     | SSH checks pass/fail, partial failure handling                               |
-| `TestInitTrackingTables`        | SQL DDL for database and table creation                                      |
-| `TestCreateMigrationRun`        | Run ID format, uniqueness, INSERT into tracking                              |
-| `TestParseExcel`                | Column parsing, bucket normalisation, wildcard handling, token deduplication |
-| `TestClusterLoginSetup`         | Auth methods, temp dir creation, failure handling                            |
-| `TestRecordDiscoveredTables`    | MERGE logic, invalid upstream handling                                       |
-| `TestRunDistcpSsh`              | Successful copy, incremental detection, failure path, metric parsing         |
-| `TestUpdateDistcpStatus`        | Status updates for completed and failed DistCp                               |
-| `TestCreateHiveTables`          | New table creation, incremental REPAIR, DDL generation                       |
-| `TestUpdateTableCreateStatus`   | Status updates for table creation results                                    |
-| `TestValidateDestinationTables` | Row count, partition, schema validation logic                                |
-| `TestUpdateValidationStatus`    | Final status determination, VALIDATED vs VALIDATION_FAILED                   |
-| `TestGenerateHtmlReport`        | Report path, S3 write, HTML content                                          |
-| `TestSendMigrationReportEmail`  | Email delivery, skip when no recipients configured                           |
-| `TestFinalizeRun`               | Stats aggregation, COMPLETED vs COMPLETED_WITH_FAILURES                      |
+| Class                           | What it tests                                                       |
+| ------------------------------- | ------------------------------------------------------------------- |
+| `TestValidatePrerequisites`     | SSH checks pass/fail                                                |
+| `TestInitTrackingTables`        | Database and table creation DDL                                     |
+| `TestCreateMigrationRun`        | Run ID format, INSERT with RUNNING status                           |
+| `TestParseExcel`                | Column parsing, bucket normalisation, wildcard handling, tokenising |
+| `TestClusterLoginSetup`         | Temp dir creation, exit code and marker failure handling             |
+| `TestDiscoverTablesViaSshSpark` | SSH/SFTP/PySpark discovery, JSON parsing, error handling             |
+| `TestRecordDiscoveredTables`    | INSERT vs UPDATE based on existing record count                     |
+| `TestRunDistcpSsh`              | Successful copy, incremental detection, failure path                |
+| `TestUpdateDistcpStatus`        | COPIED status on success, FAILED on error                           |
+| `TestCreateHiveTables`          | New table creation vs existing table REPAIR                         |
+| `TestUpdateTableCreateStatus`   | TABLE_CREATED status tracking                                       |
+| `TestValidateDestinationTables` | Row count match/mismatch, schema comparison                         |
+| `TestUpdateValidationStatus`    | VALIDATED vs VALIDATION_FAILED determination                        |
+| `TestGenerateHtmlReport`        | Report path, S3 write                                               |
+| `TestSendMigrationReportEmail`  | Email delivery, skip when no recipients                              |
+| `TestFinalizeRun`               | Stats aggregation, COMPLETED status                                  |
 
 **`test_dag2_tasks.py`**
 
 | Class                               | What it tests                                         |
 | ----------------------------------- | ----------------------------------------------------- |
-| `TestInitIcebergTrackingTables`     | SQL DDL for Iceberg tracking tables                   |
-| `TestCreateIcebergMigrationRun`     | Run ID format, uniqueness, INSERT                     |
-| `TestParseIcebergExcel`             | Column parsing, inplace flag, default database naming |
+| `TestInitIcebergTrackingTables`     | Database and Iceberg tracking table DDL               |
+| `TestCreateIcebergMigrationRun`     | Run ID format, INSERT with RUNNING status             |
+| `TestParseIcebergExcel`             | Snapshot default, inplace flag, custom dest database  |
 | `TestDiscoverHiveTables`            | Wildcard and pattern-based table discovery            |
-| `TestMigratesTablesToIceberg`       | Snapshot and inplace migration procedures             |
-| `TestUpdateMigrationDurations`      | Duration extraction from `@track_duration`            |
-| `TestValidateIcebergTables`         | Count/schema validation, failed migration skip        |
-| `TestUpdateIcebergValidationStatus` | Final status updates                                  |
+| `TestMigrateTablesToIceberg`        | Snapshot and inplace migration, failure handling      |
+| `TestUpdateMigrationDurations`      | Duration tracking update                              |
+| `TestValidateIcebergTables`         | Schema match/mismatch between Hive and Iceberg        |
+| `TestUpdateIcebergValidationStatus` | VALIDATED vs VALIDATION_FAILED status                 |
 | `TestGenerateIcebergHtmlReport`     | Report path, S3 write                                 |
 | `TestSendIcebergReportEmail`        | Email delivery, skip when no recipients               |
-| `TestFinalizeIcebergRun`            | Stats aggregation, empty-stats FAILED path            |
+| `TestFinalizeIcebergRun`            | Stats aggregation, COMPLETED status                   |
 
-**`test_dag_structure.py`**
+**`test_dag3_tasks.py`**
 
-| Class                            | What it tests                                                         |
-| -------------------------------- | --------------------------------------------------------------------- |
-| `TestMaprToS3DagStructure`       | DAG 1 ID, tags, params, schedule, catchup, task list, max_active_runs |
-| `TestIcebergDagStructure`        | DAG 2 ID, tags, params, schedule, catchup, task list, max_active_runs |
-| `TestDagIndependence`            | DAG 1 and DAG 2 have different IDs and are not chained                |
-| `TestDefaultArgs`                | owner, depends_on_past, retry_delay, SSH timeout                      |
-| `TestStatusProgressionConstants` | Status string values for both DAGs                                    |
-| `TestDistcpMetricsParsing`       | Bytes/files parsed from SSH output, tolerance logic                   |
+| Class                               | What it tests                                           |
+| ----------------------------------- | ------------------------------------------------------- |
+| `TestValidatePrerequisitesFolderCopy` | SSH, DistCp, Hadoop FS availability checks            |
+| `TestInitFolderCopyTrackingTables`  | Database and folder copy tracking table DDL              |
+| `TestCreateDataCopyRun`             | Run ID format, INSERT with RUNNING status                |
+| `TestParseFolderCopyExcel`          | Row parsing, bucket normalisation, basename defaulting   |
+| `TestRunFolderDistcpSsh`            | Successful copy, mismatch detection, failure paths       |
+| `TestRecordDataCopyStatus`          | Tracking insert for completed and failed copies          |
+| `TestValidateDataCopy`              | Post-copy validation: match, missing dest, mismatch      |
+| `TestUpdateDataCopyValidation`      | VALIDATED and VALIDATION_FAILED status updates           |
+| `TestFinalizeDataCopyRun`           | COMPLETED vs COMPLETED_WITH_ERRORS determination         |
+| `TestGenerateDataCopyHtmlReport`    | Report path, S3 write                                    |
+| `TestSendDataCopyReportEmail`       | Skip when no recipients configured                       |
+
+**`test_dag_integrity.py`**
+
+| Class                          | What it tests                                |
+| ------------------------------ | -------------------------------------------- |
+| `TestMaprToS3DagIntegrity`     | DAG ID and excel_file_path param             |
+| `TestIcebergDagIntegrity`      | DAG ID and excel_file_path param             |
+| `TestFolderCopyDagIntegrity`   | DAG ID and excel_file_path param             |
 
 **`test_utils.py`**
 
-| Class                         | What it tests                                                                    |
-| ----------------------------- | -------------------------------------------------------------------------------- |
-| `TestGetConfig`               | All required keys present, Variable values used, fallback to default             |
-| `TestTrackDuration`           | Duration added to result, function name preserved, non-dict result, sleep timing |
-| `TestExecuteWithIcebergRetry` | Success on first try, retry on exception, max retries, task label passthrough    |
+| Class                         | What it tests                                       |
+| ----------------------------- | --------------------------------------------------- |
+| `TestGetConfig`               | Variable values used, fallback to default            |
+| `TestTrackDuration`           | Duration added to result, args/kwargs preserved      |
+| `TestExecuteWithIcebergRetry` | Immediate and retry success, exhaustion after 6 tries |
 
 ---
-
-### CI / GitHub Actions
-
-Tests run automatically on every push to `main`, `develop`, or any `feature/**` branch, and on all pull requests targeting `main` or `develop`.
-
-**Matrix:** Python 3.9, 3.10, 3.11  
-**Steps:** checkout → setup Python → cache pip → install `requirements-test.txt` → run pytest with coverage → upload coverage to Codecov → upload HTML coverage report as artifact
 
 ## Notes for Dev
 

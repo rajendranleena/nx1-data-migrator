@@ -31,12 +31,14 @@ Two migration strategies supported:
 Excel columns: database | table | inplace_migration | destination_iceberg_database
 """
 
-from datetime import datetime, timedelta
 import json
+import logging
+import os
 import random
 import time
-from collections import defaultdict
+from datetime import datetime, timedelta
 from functools import wraps
+from pathlib import Path
 
 from airflow import DAG
 from airflow.decorators import task
@@ -44,9 +46,6 @@ from airflow.models import Variable
 from airflow.models.param import Param
 from airflow.providers.ssh.hooks.ssh import SSHHook
 from dotenv import load_dotenv
-from pathlib import Path
-import logging
-import os
 
 _dag_stem = Path(__file__).stem
 logger = logging.getLogger(__name__)
@@ -71,13 +70,13 @@ def track_duration(func):
         result = func(*args, **kwargs)
         end_time = dt.utcnow()
         duration = (end_time - start_time).total_seconds()
-        
+
         # Add duration to result if it's a dict
         if isinstance(result, dict):
             result['_task_duration'] = duration
-        
+
         return result
-    
+
     return wrapper
 
 def execute_with_iceberg_retry(spark, sql: str, max_retries: int = 6, task_label: str = ""):
@@ -86,7 +85,7 @@ def execute_with_iceberg_retry(spark, sql: str, max_retries: int = 6, task_label
     counter = 0
     last_exception = None
 
-    while status == False and counter < max_retries:
+    while not status and counter < max_retries:
         try:
             spark.sql(sql)
             status = True
@@ -103,7 +102,7 @@ def execute_with_iceberg_retry(spark, sql: str, max_retries: int = 6, task_label
             else:
                 logger.error(f"[IcebergRetry] {task_label} failed after {max_retries} attempts.")
 
-    if status == False:
+    if not status:
         raise last_exception
 
 # =============================================================================
@@ -213,7 +212,7 @@ def validate_prerequisites(run_id: str) -> dict:
 
             if exit_code == 0 and ('pyspark' in output.lower() or 'spark' in output.lower()):
                 validation_results['pyspark_available'] = True
-                logger.info(f"PySpark: PASSED")
+                logger.info("PySpark: PASSED")
                 logger.info(f"Version info: {output.strip()[:200]}")
             else:
                 error_msg = f"PySpark not found or failed. Output: {output[:200]}"
@@ -233,7 +232,7 @@ def validate_prerequisites(run_id: str) -> dict:
 
             if exit_code == 0 and 'hive' in output.lower():
                 validation_results['hive_available'] = True
-                logger.info(f"Hive: PASSED")
+                logger.info("Hive: PASSED")
                 logger.info(f"Version info: {output.strip()[:200]}")
             else:
                 error_msg = f"Hive not found or failed. Output: {output[:200]}"
@@ -254,8 +253,8 @@ def validate_prerequisites(run_id: str) -> dict:
 
             if exit_code == 0 and 'HADOOP_FS_OK' in output:
                 validation_results['hadoop_fs_available'] = True
-                logger.info(f"Hadoop FS: PASSED")
-                version_line = [l for l in output.split('\n') if 'hadoop' in l.lower()]
+                logger.info("Hadoop FS: PASSED")
+                version_line = [line for line in output.split('\n') if 'hadoop' in line.lower()]
                 if version_line:
                     logger.info(f"Version info: {version_line[0].strip()}")
             else:
@@ -313,10 +312,10 @@ def init_tracking_tables(spark) -> dict:
     config = get_config()
     tracking_db = config['tracking_database']
     tracking_loc = config['tracking_location']
-    
+
     # Create database
     spark.sql(f"CREATE DATABASE IF NOT EXISTS {tracking_db} LOCATION '{tracking_loc}'")
-    
+
     # Migration runs Iceberg table
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {tracking_db}.migration_runs (
@@ -334,7 +333,7 @@ def init_tracking_tables(spark) -> dict:
         USING iceberg
         LOCATION '{tracking_loc}/migration_runs'
     """)
-    
+
     # Table-level tracking Iceberg table
     spark.sql(f"""
             CREATE TABLE IF NOT EXISTS {tracking_db}.migration_table_status (
@@ -351,18 +350,18 @@ def init_tracking_tables(spark) -> dict:
                 schema_json STRING,
                 partitions_json STRING,
                 partition_columns STRING,
-                table_type STRING,                              
-                source_row_count BIGINT,                        
-                source_total_size_bytes BIGINT,                   
-                source_file_count BIGINT,                         
-                s3_total_size_bytes_before BIGINT, 
-                s3_file_count_before BIGINT,         
+                table_type STRING,
+                source_row_count BIGINT,
+                source_total_size_bytes BIGINT,
+                source_file_count BIGINT,
+                s3_total_size_bytes_before BIGINT,
+                s3_file_count_before BIGINT,
                 s3_total_size_bytes_after BIGINT,
                 s3_file_count_after BIGINT,
-                s3_bytes_transferred BIGINT,         
-                s3_files_transferred BIGINT,                             
-                file_size_match BOOLEAN,                        
-                file_count_match BOOLEAN,       
+                s3_bytes_transferred BIGINT,
+                s3_files_transferred BIGINT,
+                file_size_match BOOLEAN,
+                file_count_match BOOLEAN,
                 discovery_status STRING,
                 discovery_completed_at TIMESTAMP,
                 discovery_duration_seconds DOUBLE,
@@ -415,21 +414,21 @@ def init_tracking_tables(spark) -> dict:
         USING iceberg
         LOCATION '{tracking_loc}/validation_results'
     """)
-    
+
     return {'status': 'initialized', 'database': tracking_db}
 
 
 @task.pyspark(conn_id='spark_default')
 def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
     """Create migration run record in Iceberg tracking table."""
-    from datetime import datetime
     import uuid
-    
+    from datetime import datetime
+
     config = get_config()
     tracking_db = config['tracking_database']
-    
+
     run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    
+
     spark.sql(f"""
         INSERT INTO {tracking_db}.migration_runs
         VALUES (
@@ -443,23 +442,23 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
             '{json.dumps(config).replace("'", "''")}'
         )
     """)
-    
+
     return run_id
 
 
 @task.pyspark(conn_id='spark_default')
 def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     """Read Excel config from S3 using pandas.read_excel."""
-    import pandas as ps
     from io import BytesIO
-    from collections import defaultdict
+
+    import pandas as ps
 
     config = get_config()
     binary_df = spark.read.format("binaryFile").load(excel_file_path)
     row = binary_df.select("content").first()
     excel_bytes = bytes(row.content)
     df = ps.read_excel(BytesIO(excel_bytes), engine='openpyxl')
-    
+
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
@@ -472,7 +471,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         elif not val.startswith('s3a://'):
             val = f"s3a://{val}"
         return val
-    
+
     # Convert to list of dicts
     grouped = {}
     for _, row in df.iterrows():
@@ -496,7 +495,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
             tok = tok.strip()
             if tok:
                 grouped[key]['tokens'].append(tok)
-        
+
     configs = []
 
     for (src_db, dest_db, bucket_val), group in grouped.items():
@@ -542,10 +541,10 @@ else
     echo "WARNING: Profile not found at ~/.profile"
 fi
 """)
-    
+
     auth_method = config.get('auth_method', 'mapr')
     mapr_user = config.get('mapr_user', '')
-    mapr_ticketfile = config.get('mapr_ticketfile_location', '') 
+    mapr_ticketfile = config.get('mapr_ticketfile_location', '')
     kinit_principal = config.get('kinit_principal', '')
     kinit_keytab = config.get('kinit_keytab', '')
     kinit_password = config.get('kinit_password', '')
@@ -564,7 +563,7 @@ if [ "{auth_method}" = "mapr" ]; then
         echo "Please ensure a valid MapR ticket exists before running this DAG"
         exit 1
     fi
-    
+
 elif [ "{auth_method}" = "kinit" ]; then
     if [ -n "{kinit_keytab}" ] && [ -n "{kinit_principal}" ]; then
         kinit -kt "{kinit_keytab}" "{kinit_principal}"
@@ -574,10 +573,10 @@ elif [ "{auth_method}" = "kinit" ]; then
         echo "ERROR: kinit requires principal and keytab or password"
         exit 1
     fi
-    
+
 elif [ "{auth_method}" = "none" ]; then
     echo "No authentication required (auth_method=none)"
-    
+
 else
     echo "ERROR: Unknown auth_method: {auth_method}"
     exit 1
@@ -585,7 +584,7 @@ fi
 
 echo "Authentication successful"
 """)
-        
+
     auth_script_parts.append(f"""
 echo "=== Creating temp directory ==="
 mkdir -p {temp_dir}
@@ -601,16 +600,16 @@ echo "TEMP_DIR={temp_dir}"
         output = stdout.read().decode()
         error = stderr.read().decode()
 
-        logger.info(f"=== Cluster Login Output ===")
+        logger.info("=== Cluster Login Output ===")
         logger.info(output)
 
         if exit_code != 0:
-            logger.error(f"=== Cluster Login Errors ===")
+            logger.error("=== Cluster Login Errors ===")
             logger.error(error)
             raise Exception(
                 f"Cluster login setup failed with exit code {exit_code}\n"
                 f"Error: {error}\n"
-                f"Output: {output[-500:]}"  
+                f"Output: {output[-500:]}"
             )
 
         if "CLUSTER_LOGIN_SUCCESS" not in output:
@@ -623,11 +622,11 @@ echo "TEMP_DIR={temp_dir}"
 
 
 @task
-@track_duration 
+@track_duration
 def discover_tables_via_spark_ssh(db_config: dict) -> dict:
     """Use Spark SQL via SSH on edge node to discover tables and metadata."""
     import json
-    import re 
+    import re
 
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
@@ -700,42 +699,42 @@ for tbl in table_list:
             "DESCRIBE FORMATTED {{0}}.{{1}}".format(src_db, tbl)
         )
         desc_rows = desc_df.collect()
-        
+
         loc = None
         table_type = "UNKNOWN"
         input_format = None
-        
+
         for row in desc_rows:
             col_name = (row.col_name or "").strip().rstrip(":").lower()
             data_type = (row.data_type or "").strip()
-            
+
             if col_name == "location":
                 loc = data_type
             elif col_name in ("type", "table type"):
                 table_type = data_type.replace("_TABLE", "")
             elif col_name == "inputformat:":
                 input_format = data_type
-        
+
         source_total_size = 0
         source_file_count = 0
         if loc:
             try:
                 from py4j.java_gateway import java_import
                 java_import(spark._jvm, "org.apache.hadoop.fs.*")
-                
+
                 fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
                     spark._jvm.java.net.URI(loc),
                     spark._jsc.hadoopConfiguration()
                 )
                 path = spark._jvm.org.apache.hadoop.fs.Path(loc)
-                
+
                 if fs.exists(path):
                     content_summary = fs.getContentSummary(path)
                     source_total_size = int(content_summary.getLength())
                     source_file_count = int(content_summary.getFileCount())
-            except:
+            except Exception:
                 pass
-        
+
         file_format = "PARQUET"
         if input_format:
             if "parquet" in input_format.lower():
@@ -746,7 +745,7 @@ for tbl in table_list:
                 file_format = "AVRO"
             elif "text" in input_format.lower():
                 file_format = "TEXTFILE"
-        
+
         row_count = 0
         try:
             row_count = spark.sql(
@@ -754,7 +753,7 @@ for tbl in table_list:
             ).collect()[0].c
         except:
             pass
-            
+
         partition_cols_from_describe = []
         in_partition_section = False
         for row in desc_rows:
@@ -771,7 +770,7 @@ for tbl in table_list:
 
         partition_definition = len(partition_cols_from_describe) > 0
         partition_columns = ",".join(partition_cols_from_describe)
-        
+
         partitions = []
         registered_partition_count = 0
         try:
@@ -785,7 +784,7 @@ for tbl in table_list:
 
         is_partitioned = partition_definition
         unregistered_partitions = partition_definition and registered_partition_count == 0
-        
+
         schema_df = spark.sql(
             "DESCRIBE {{0}}.{{1}}".format(src_db, tbl)
         )
@@ -793,14 +792,14 @@ for tbl in table_list:
         for row in schema_df.collect():
             col_name = row.col_name.strip() if row.col_name else ""
             data_type = row.data_type.strip() if row.data_type else ""
-            
+
             if col_name.startswith("#") or col_name == "" or col_name == "col_name":
                 break
-            
+
             schema.append({{"name": col_name, "type": data_type}})
-        
+
         s3_location = "{{0}}/{{1}}/{{2}}".format(dest_bucket, dest_db, tbl)
-        
+
         metadata.append({{
             "source_database": src_db,
             "source_table": tbl,
@@ -820,7 +819,7 @@ for tbl in table_list:
             "source_total_size_bytes": source_total_size,
             "source_file_count": source_file_count
         }})
-        
+
     except Exception as e:
         metadata.append({{
             "source_database": src_db,
@@ -883,13 +882,13 @@ spark.stop()
         output = stdout.read().decode()
         error_output = stderr.read().decode()
 
-        logger.info(f"=== Spark Discovery Output ===")
+        logger.info("=== Spark Discovery Output ===")
         logger.info(output[-1000:])
 
         # client.exec_command(f"rm -rf {temp_dir}", timeout=60)
 
         if exit_code != 0:
-            logger.error(f"=== Spark Discovery Errors ===")
+            logger.error("=== Spark Discovery Errors ===")
             logger.error(error_output)
             raise Exception(
                 f"Table discovery Spark job failed with exit code {exit_code}\n"
@@ -922,7 +921,7 @@ spark.stop()
         failed_names = ', '.join([t['source_table'] for t in failed_discoveries[:3]])
 
         raise Exception(f"Discovery failed for {failed_count}/{total_count} table(s) in {src_db}: {failed_names}. ")
-    
+
     return {
         'run_id': run_id,
         'source_database': src_db,
@@ -935,29 +934,29 @@ spark.stop()
 @task.pyspark(conn_id='spark_default')
 def record_discovered_tables(discovery: dict, spark) -> dict:
     """Record discovered tables in Iceberg tracking table."""
-    
+
     if not isinstance(discovery, dict) or 'tables' not in discovery:
         logger.warning(f"[record_discovered_tables] Skipping invalid/failed upstream input: {type(discovery)}")
         return {}
-    
+
     config = get_config()
     tracking_db = config['tracking_database']
     run_id = discovery['run_id']
 
     discovery_duration = discovery.get('_task_duration', 0.0)
-    
+
     for t in discovery['tables']:
         parts = t.get('partitions', [])
         if isinstance(parts, str):
             parts = [p for p in parts.split(',') if p]
-        
+
         schema_json = json.dumps(t.get('schema', [])).replace("'", "''")
         parts_json = json.dumps(parts).replace("'", "''")
         row_count = t.get('row_count', 0)
         table_type = t.get('table_type', 'UNKNOWN')
         source_total_size = t.get('source_total_size_bytes', 0)
         source_file_count = t.get('source_file_count', 0)
-        
+
         existing = spark.sql(f"""
             SELECT COUNT(*) as cnt
             FROM {tracking_db}.migration_table_status
@@ -978,7 +977,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     source_row_count = {row_count},
                     source_total_size_bytes = {source_total_size},
                     source_file_count = {source_file_count},
-                    source_partition_count = {t.get('partition_count', 0)}, 
+                    source_partition_count = {t.get('partition_count', 0)},
                     unregistered_partitions = {str(t.get('unregistered_partitions', False)).lower()},
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
@@ -1035,7 +1034,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                 )
             """,
             task_label=f"record_discovered_tables:{t['source_table']}")
-    
+
     return discovery
 
 
@@ -1049,17 +1048,16 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
     if not isinstance(discovery, dict) or 'tables' not in discovery:
         logger.warning(f"[run_distcp_ssh] Skipping invalid/failed upstream input: {type(discovery)}")
         return {}
-    
-    run_id = discovery['run_id']
+
     tables = discovery['tables']
     temp_dir = cluster_setup['temp_dir']
     mappers = config['distcp_mappers']
     bandwidth = config['distcp_bandwidth']
-    
+
     s3_endpoint = config['s3_endpoint']
     s3_access_key = config['s3_access_key']
     s3_secret_key = config['s3_secret_key']
-    
+
     s3_opts = ""
     if s3_endpoint:
         s3_opts += f" -Dfs.s3a.endpoint={s3_endpoint}"
@@ -1069,10 +1067,10 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
         s3_opts += f" -Dfs.s3a.secret.key={s3_secret_key}"
 
     source_profile = "source ~/.profile 2>/dev/null || true\n"
-    
+
     results = []
     for t in tables:
-        if t.get('error'): 
+        if t.get('error'):
             results.append({
                 'source_database': t['source_database'],
                 'source_table': t['source_table'],
@@ -1096,18 +1094,18 @@ set -e
 
 calculate_s3_metrics_hadoop() {{
     local location=$1
-    
+
     if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
         echo "S3_FILE_COUNT=0"
         echo "S3_TOTAL_SIZE=0"
         return
     fi
-    
+
     FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
     TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
     [ -z "$FILE_COUNT" ] && FILE_COUNT=0
     [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
-    
+
     echo "S3_FILE_COUNT=$FILE_COUNT"
     echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
 }}
@@ -1200,12 +1198,12 @@ exit 0
                             s3_bytes_transferred = int(line.split('=')[1].strip() or 0)
                         elif 'S3_FILES_TRANSFERRED=' in line:
                             s3_files_transferred = int(line.split('=')[1].strip() or 0)
-                except:
+                except Exception:
                     pass
-                
+
                 if exit_code != 0:
                     logger.error(f"=== DistCp Error for {src_db}.{tbl} ===")
-                    logger.error(error_output[:1000])  
+                    logger.error(error_output[:1000])
                     raise Exception(
                         f"DistCp failed for {src_db}.{tbl} with exit code {exit_code}\n"
                         f"Error: {error_output[:1000]}"
@@ -1214,7 +1212,7 @@ exit 0
                 distcp_completed_at = _end_dt.strftime('%Y-%m-%d %H:%M:%S')
                 distcp_duration_secs = (_end_dt - _dt.strptime(distcp_started_at, '%Y-%m-%d %H:%M:%S')).total_seconds()
                 logger.info(f"[DistCp] COMPLETED: {src_db}.{tbl} | incremental={is_incr} | bytes_copied={bytes_copied} | files_copied={files_copied}")
-                
+
                 results.append({
                     'source_database': src_db,
                     'source_table': tbl,
@@ -1251,7 +1249,7 @@ exit 0
                 's3_total_size_bytes_after': 0,
                 's3_file_count_after': 0,
                 's3_bytes_transferred': 0,
-                's3_files_transferred': 0, 
+                's3_files_transferred': 0,
                 'error': str(e)[:2000]
             })
             logger.error(f"ERROR: {error_msg}")
@@ -1284,12 +1282,12 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
     if not isinstance(distcp_result, dict) or 'run_id' not in distcp_result:
         logger.warning(f"[update_distcp_status] Skipping invalid input: {type(distcp_result)}")
         return {}
-    
+
     config = get_config()
     tracking_db = config['tracking_database']
     run_id = distcp_result['run_id']
     src_db = distcp_result['source_database']
-    
+
     for r in distcp_result.get('distcp_results', []):
         if r.get('status') == 'SKIPPED':
             continue
@@ -1297,7 +1295,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         error_msg = r.get('error', '').replace("'", "''") if r.get('error') else ''
         distcp_duration = r.get('distcp_duration_secs', 0.0)
         started_at = r.get('distcp_started_at', '')
-        completed_at = r.get('distcp_completed_at', '') 
+        completed_at = r.get('distcp_completed_at', '')
 
         s3_size_before = r.get('s3_total_size_bytes_before', 0)
         s3_files_before = r.get('s3_file_count_before', 0)
@@ -1305,7 +1303,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         s3_files_after = r.get('s3_file_count_after', 0)
         s3_bytes_transfer = r.get('s3_bytes_transferred', 0)
         s3_files_transfer = r.get('s3_files_transferred', 0)
-        
+
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.migration_table_status
             SET distcp_status = '{r['status']}',
@@ -1320,9 +1318,9 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 s3_total_size_bytes_after = {s3_size_after},
                 s3_file_count_after = {s3_files_after},
                 s3_bytes_transferred = {s3_bytes_transfer},
-                s3_files_transferred = {s3_files_transfer},                                     
-                file_count_match = (source_file_count = {s3_files_after}),               
-                file_size_match = (ABS(source_total_size_bytes - {s3_size_after}) / GREATEST(source_total_size_bytes, 1) < 0.01),  
+                s3_files_transferred = {s3_files_transfer},
+                file_count_match = (source_file_count = {s3_files_after}),
+                file_size_match = (ABS(source_total_size_bytes - {s3_size_after}) / GREATEST(source_total_size_bytes, 1) < 0.01),
                 overall_status = '{overall}',
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
                 updated_at = current_timestamp()
@@ -1360,7 +1358,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
           AND discovery_status = 'COMPLETED'
     """,
     task_label="update_distcp_status:catchall")
-    
+
     return distcp_result
 
 
@@ -1372,13 +1370,13 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
     if not isinstance(distcp_result, dict) or 'tables' not in distcp_result:
         logger.warning(f"[create_hive_tables] Skipping invalid input: {type(distcp_result)}")
         return {}
-    
+
     dest_db = distcp_result['dest_database']
     tables = distcp_result['tables']
-    
+
     results = []
     spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
-    
+
     for t in tables:
         distcp_status = next(
             (r['status'] for r in distcp_result.get('distcp_results', [])
@@ -1393,7 +1391,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                 'existed': False
             })
             continue
-        
+
         tbl = t['source_table']
         s3_loc = t['s3_location']
         fmt = t.get('file_format', 'PARQUET')
@@ -1403,15 +1401,15 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
         full_name = f"{dest_db}.{tbl}"
 
         logger.info(f"[HiveTable] Processing {full_name} | format={fmt} | partitioned={is_part}")
-        
+
         try:
             exists = False
             try:
                 spark.sql(f"DESCRIBE {full_name}")
                 exists = True
-            except:
+            except Exception:
                 pass
-            
+
             if exists:
                 if is_part:
                     spark.sql(f"MSCK REPAIR TABLE {full_name}")
@@ -1426,18 +1424,18 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                 })
             else:
                 part_col_list = [p.strip() for p in part_cols_str.split(',') if p.strip()]
-                
+
                 if schema_list:
-                    cols = [f"`{c['name']}` {c['type']}" for c in schema_list 
+                    cols = [f"`{c['name']}` {c['type']}" for c in schema_list
                             if c.get('name') and c['name'] not in part_col_list]
                     col_def = ", ".join(cols)
                 else:
                     df = spark.read.format(fmt.lower()).load(s3_loc)
                     col_def = ", ".join([
-                        f"`{f.name}` {f.dataType.simpleString()}" 
+                        f"`{f.name}` {f.dataType.simpleString()}"
                         for f in df.schema.fields if f.name not in part_col_list
                     ])
-                
+
                 part_clause = ""
                 if is_part and part_col_list:
                     pdefs = []
@@ -1449,7 +1447,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                                 break
                         pdefs.append(f"`{pc}` {ptype}")
                     part_clause = f"PARTITIONED BY ({', '.join(pdefs)})"
-                
+
                 ddl = f"""
                     CREATE EXTERNAL TABLE IF NOT EXISTS {full_name} ({col_def})
                     {part_clause}
@@ -1457,11 +1455,11 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                     LOCATION '{s3_loc}'
                 """
                 spark.sql(ddl)
-                
+
                 if is_part:
                     spark.sql(f"MSCK REPAIR TABLE {full_name}")
                 spark.sql(f"REFRESH TABLE {full_name}")
-                
+
                 logger.info(f"[HiveTable] CREATED: {full_name} | location={s3_loc}")
                 results.append({
                     'source_table': tbl,
@@ -1509,7 +1507,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
     if not isinstance(table_result, dict) or 'run_id' not in table_result:
         logger.warning(f"[update_table_create_status] Skipping invalid input: {type(table_result)}")
         return {}
-    
+
     config = get_config()
     tracking_db = config['tracking_database']
     run_id = table_result['run_id']
@@ -1517,11 +1515,11 @@ def update_table_create_status(table_result: dict, spark) -> dict:
     src_db = table_result['source_database']
 
     table_duration = table_result.get('_task_duration', 0.0)
-    
+
     for r in table_result.get('table_results', []):
         overall = 'TABLE_CREATED' if r['status'] == 'COMPLETED' else ('FAILED' if r['status'] == 'FAILED' else 'SKIPPED')
         error_msg = (r.get('error', '') or '').replace("'", "''")[:2000]
-        
+
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.migration_table_status
             SET table_create_status = '{r['status']}',
@@ -1565,7 +1563,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
           AND discovery_status = 'COMPLETED'
     """,
     task_label="update_table_create_status:catchall")
-    
+
     return table_result
 
 
@@ -1577,17 +1575,17 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
     if not isinstance(source_validation, dict) or 'tables' not in source_validation:
         logger.warning(f"[validate_destination_tables] Skipping invalid input: {type(source_validation)}")
         return {}
-    
+
     config = get_config()
     tracking_db = config['tracking_database']
-    
+
     run_id = source_validation['run_id']
     src_db = source_validation['source_database']
     dest_db = source_validation['dest_database']
     tables = source_validation['tables']
-    
+
     validation_results = []
-    
+
     for t in tables:
         tbl = t['source_table']
         dest_tbl = f"{dest_db}.{tbl}"
@@ -1599,7 +1597,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
               AND source_database = '{src_db}'
               AND source_table = '{tbl}'
         """).collect()
-        
+
         if upstream:
             row = upstream[0]
             if row['distcp_status'] == 'FAILED' or row['table_create_status'] in ('FAILED', 'SKIPPED') or row['overall_status'] == 'FAILED':
@@ -1611,7 +1609,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 continue
 
         logger.info(f"[Validation] Starting validation for {dest_db}.{tbl}")
-        
+
         try:
             source_metrics = spark.sql(f"""
                 SELECT source_row_count, source_partition_count
@@ -1620,7 +1618,7 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                   AND source_database = '{src_db}'
                   AND source_table = '{tbl}'
             """).collect()
-            
+
             if not source_metrics:
                 validation_results.append({
                     'source_table': tbl,
@@ -1628,21 +1626,21 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                     'error': 'Source metrics not found in tracking table'
                 })
                 continue
-            
+
             source_row_count = source_metrics[0]['source_row_count'] or 0
             source_partition_count = source_metrics[0]['source_partition_count'] or t.get('partition_count', 0)
-            
+
             # Get destination row count
             dest_row_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_tbl}").collect()[0]['c']
-            
+
             # Get destination partition count
             dest_partition_count = 0
             try:
                 dest_partitions_df = spark.sql(f"SHOW PARTITIONS {dest_tbl}")
                 dest_partition_count = dest_partitions_df.count()
-            except:
-                pass  
-            
+            except Exception:
+                pass
+
             logger.info(f"[Validation] {dest_db}.{tbl} | source_rows={source_row_count} | dest_rows={dest_row_count} | source_parts={source_partition_count} | dest_parts={dest_partition_count}")
 
             # Schema comparison
@@ -1653,14 +1651,14 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 for row in dest_schema_df.collect()
                 if row.col_name and not row.col_name.startswith('#')
             ]
-            
+
             # Compare schemas
             schema_match = True
             schema_diffs = []
-            
+
             src_cols = {c['name']: c['type'] for c in src_schema}
             dest_cols = {c['name']: c['type'] for c in dest_schema}
-            
+
             for col_name, col_type in src_cols.items():
                 if col_name not in dest_cols:
                     schema_match = False
@@ -1668,12 +1666,12 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 elif dest_cols[col_name] != col_type:
                     schema_match = False
                     schema_diffs.append(f"Type mismatch for {col_name}: {col_type} vs {dest_cols[col_name]}")
-            
+
             for col_name in dest_cols:
                 if col_name not in src_cols:
                     schema_match = False
                     schema_diffs.append(f"Extra column in dest: {col_name}")
-            
+
             # Validations
             row_count_match = (source_row_count == dest_row_count)
             partition_count_match = (source_partition_count == dest_partition_count)
@@ -1696,11 +1694,11 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 mismatch_parts.append(f"Schema differences: {'; '.join(schema_diffs[:3])}")
 
             mismatch_error = '; '.join(mismatch_parts) if mismatch_parts else None
-            
+
             validation_results.append({
                 'source_table': tbl,
                 'status': 'COMPLETED',
-                'source_row_count': source_row_count,         
+                'source_row_count': source_row_count,
                 'dest_hive_row_count': dest_row_count,
                 'source_partition_count': source_partition_count,
                 'dest_partition_count': dest_partition_count,
@@ -1708,9 +1706,9 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 'partition_count_match': partition_count_match,
                 'schema_match': schema_match,
                 'schema_differences': '; '.join(schema_diffs) if schema_diffs else '',
-                'error': mismatch_error  
+                'error': mismatch_error
             })
-            
+
         except Exception as e:
             error_msg = f"Validation failed for {dest_db}.{tbl}: {str(e)[:2000]}"
             validation_results.append({
@@ -1765,14 +1763,14 @@ def update_validation_status(validation_result: dict, spark) -> dict:
     if not isinstance(validation_result, dict) or 'run_id' not in validation_result:
         logger.warning(f"[update_validation_status] Skipping invalid input: {type(validation_result)}")
         return {}
-    
+
     config = get_config()
     tracking_db = config['tracking_database']
-    
+
     run_id = validation_result['run_id']
     dest_db = validation_result['dest_database']
     src_db = validation_result.get('source_database', '')
-    
+
     validation_duration = validation_result.get('_task_duration', 0.0)
 
     total_validated = 0
@@ -1781,13 +1779,13 @@ def update_validation_status(validation_result: dict, spark) -> dict:
     row_mismatches = 0
     partition_mismatches = 0
     schema_mismatches = 0
-    
+
     for v in validation_result.get('validation_results', []):
         if v['status'] != 'COMPLETED':
             continue
 
         total_validated += 1
-        
+
         error_msg = (v.get('error', '') or '').replace("'", "''")[:2000]
         schema_diffs = (v.get('schema_differences', '') or '').replace("'", "''")[:2000]
 
@@ -1798,8 +1796,8 @@ def update_validation_status(validation_result: dict, spark) -> dict:
         if not v.get('schema_match', False):
             schema_mismatches += 1
 
-        if (v.get('row_count_match', True) and 
-            v.get('partition_count_match', True) and 
+        if (v.get('row_count_match', True) and
+            v.get('partition_count_match', True) and
             v.get('schema_match', True)):
             passed_validation += 1
         else:
@@ -1823,10 +1821,10 @@ def update_validation_status(validation_result: dict, spark) -> dict:
             mismatch_msg = str(v['error']).replace("'", "''")[:2000]
             error_message_sql = f"'{mismatch_msg}'"
         elif is_validated:
-            error_message_sql = "NULL"  
+            error_message_sql = "NULL"
         else:
             error_message_sql = "error_message"
-        
+
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.migration_table_status
             SET validation_status = '{v['status']}',
@@ -1840,11 +1838,11 @@ def update_validation_status(validation_result: dict, spark) -> dict:
                 partition_count_match = {str(v.get('partition_count_match', False)).lower()},
                 schema_match = {str(v.get('schema_match', False)).lower()},
                 schema_differences = '{schema_diffs}',
-                overall_status = CASE 
+                overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN overall_status
                     ELSE '{final_overall_status}'
                 END,
-                error_message = CASE 
+                error_message = CASE
                     WHEN overall_status = 'FAILED' THEN error_message
                     ELSE {error_message_sql}
                 END,
@@ -1858,16 +1856,16 @@ def update_validation_status(validation_result: dict, spark) -> dict:
 
     if total_validated > 0:
         file_metrics = spark.sql(f"""
-            SELECT 
+            SELECT
                 SUM(CASE WHEN file_size_match = false THEN 1 ELSE 0 END) as size_mismatches,
                 SUM(CASE WHEN file_count_match = false THEN 1 ELSE 0 END) as count_mismatches
             FROM {tracking_db}.migration_table_status
             WHERE run_id = '{run_id}'
         """).collect()[0]
-        
+
         size_mismatches = file_metrics['size_mismatches'] or 0
         count_mismatches = file_metrics['count_mismatches'] or 0
-        
+
         validation_summary = {
             'run_id': run_id,
             'total_validated': total_validated,
@@ -1882,7 +1880,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
 
         summary_json = json.dumps(validation_summary).replace("'", "''")
         execute_with_iceberg_retry(spark, f"DELETE FROM {tracking_db}.validation_results WHERE run_id = '{run_id}'", task_label="update_validation_status:delete_summary")
-        
+
         execute_with_iceberg_retry(spark, f"""
             INSERT INTO {tracking_db}.validation_results
             VALUES (
@@ -1931,7 +1929,7 @@ def update_validation_status(validation_result: dict, spark) -> dict:
           AND validation_status IS NULL
     """,
     task_label="update_validation_status:catchall")
-    
+
     return validation_result
 
 
@@ -1939,24 +1937,24 @@ def update_validation_status(validation_result: dict, spark) -> dict:
 def generate_html_report(run_id: str, spark) -> str:
     """Generate comprehensive HTML migration report."""
     from datetime import datetime
-    
+
     config = get_config()
     tracking_db = config['tracking_database']
     report_location = config['report_output_location']
-    
+
     # Get migration run info
     run_info = spark.sql(f"""
         SELECT * FROM {tracking_db}.migration_runs
         WHERE run_id = '{run_id}'
     """).collect()[0]
-    
+
     # Get table status
     table_status = spark.sql(f"""
         SELECT * FROM {tracking_db}.migration_table_status
         WHERE run_id = '{run_id}'
         ORDER BY source_database, source_table
     """).collect()
-    
+
     # Calculate summary stats
     total_tables = len(table_status)
     successful_tables = sum(1 for t in table_status if t.overall_status in ['VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED'])
@@ -1965,7 +1963,7 @@ def generate_html_report(run_id: str, spark) -> str:
     total_files = sum(t.s3_file_count_after or 0 for t in table_status)
     total_rows = sum(t.source_row_count or 0 for t in table_status)
     incremental_runs = sum(1 for t in table_status if t.distcp_is_incremental)
-    
+
     # Generate HTML
     html = f"""
 <!DOCTYPE html>
@@ -2112,16 +2110,16 @@ def generate_html_report(run_id: str, spark) -> str:
 <body>
     <div class="container">
         <h1>MapR to S3 Migration Report</h1>
-        
+
         <div class="timestamp">
             Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
             Run ID: <strong>{run_id}</strong><br>
             DAG Run: <strong>{run_info.dag_run_id}</strong>
 """
-    
+
     html += f"""
         </div>
-        
+
         <h2>Migration Summary</h2>
         <div class="summary-grid">
             <div class="summary-card">
@@ -2153,13 +2151,13 @@ def generate_html_report(run_id: str, spark) -> str:
                 <p class="value">{incremental_runs}</p>
             </div>
         </div>
-        
+
         <div class="section-divider"></div>
 
         <h2>Validation Summary</h2>
 """
     validation_summary_data = spark.sql(f"""
-        SELECT 
+        SELECT
             COUNT(*) as total_tables_validated,
             SUM(CASE WHEN row_count_match = true AND partition_count_match = true AND schema_match = true THEN 1 ELSE 0 END) as tables_passed_validation,
             SUM(CASE WHEN row_count_match = false OR partition_count_match = false OR schema_match = false THEN 1 ELSE 0 END) as tables_failed_validation,
@@ -2170,7 +2168,7 @@ def generate_html_report(run_id: str, spark) -> str:
         WHERE run_id = '{run_id}'
           AND validation_status = 'COMPLETED'
     """).collect()
-            
+
     if validation_summary_data and validation_summary_data[0]['total_tables_validated']:
         vs = validation_summary_data[0]
         html += f"""
@@ -2202,13 +2200,13 @@ def generate_html_report(run_id: str, spark) -> str:
         </div>
 """
     else:
-        html += f"""
+        html += """
         <p style="color: #95a5a6; font-style: italic;">No validation summary available for this run.</p>
 """
-            
+
     html += """
         <div class="section-divider"></div>
-        
+
         <h2>Table Migration Details</h2>
         <table>
             <thead>
@@ -2225,7 +2223,7 @@ def generate_html_report(run_id: str, spark) -> str:
             </thead>
             <tbody>
 """
-    
+
     for t in table_status:
         status = t.overall_status or ''
         if 'VALIDATED_WITH_WARNINGS' in status:
@@ -2234,19 +2232,18 @@ def generate_html_report(run_id: str, spark) -> str:
             status_class = 'status-completed'
         else:
             status_class = 'status-failed'
-        
+
         discovery_dur = f"{t.discovery_duration_seconds:.1f}s" if t.discovery_duration_seconds else "N/A"
         distcp_dur = f"{t.distcp_duration_seconds:.1f}s" if t.distcp_duration_seconds else "N/A"
         distcp_detail = f"<br><small>{t.distcp_bytes_copied/(1024**2):.1f} MB, {t.distcp_files_copied:,} files</small>" if t.distcp_bytes_copied else ""
         if t.distcp_is_incremental:
             distcp_dur += " <span style='background-color: #fff3cd; padding: 2px 6px; border-radius: 4px; font-size: 10px;'>INCREMENTAL</span>"
-        table_name = f"<strong>{t.source_table}</strong>"
         table_dur = f"{t.table_create_duration_seconds:.1f}s" if t.table_create_duration_seconds else "N/A"
         val_dur = f"{t.validation_duration_seconds:.1f}s" if t.validation_duration_seconds else "N/A"
-        
+
         total_dur = (t.discovery_duration_seconds or 0) + (t.distcp_duration_seconds or 0) + \
                     (t.table_create_duration_seconds or 0) + (t.validation_duration_seconds or 0)
-        
+
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
@@ -2259,13 +2256,13 @@ def generate_html_report(run_id: str, spark) -> str:
                     <td class="metric">{total_dur:.1f}s</td>
                 </tr>
 """
-    
+
     html += """
             </tbody>
         </table>
-        
+
         <div class="section-divider"></div>
-        
+
         <h2>Metadata Validation Results</h2>
         <table>
             <thead>
@@ -2283,20 +2280,20 @@ def generate_html_report(run_id: str, spark) -> str:
             </thead>
             <tbody>
 """
-    
+
     for t in table_status:
         if not t.validation_status:
             continue
-        
+
         row_match_class = 'validation-pass' if t.row_count_match else 'validation-fail'
         row_match_icon = '✓ PASS' if t.row_count_match else '✗ FAIL'
-        
+
         part_match_class = 'validation-pass' if t.partition_count_match else 'validation-warn'
         part_match_icon = '✓ PASS' if t.partition_count_match else '⚠ WARN: Stale partitions on source, Run MSCK'
-        
+
         schema_match_class = 'validation-pass' if t.schema_match else 'validation-fail'
         schema_match_icon = '✓ PASS' if t.schema_match else '✗ FAIL'
-        
+
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
@@ -2315,7 +2312,7 @@ def generate_html_report(run_id: str, spark) -> str:
         </table>
 
         <div class="section-divider"></div>
-        
+
         <h2>Data Validation Results</h2>
         <table>
             <thead>
@@ -2336,22 +2333,22 @@ def generate_html_report(run_id: str, spark) -> str:
             </thead>
             <tbody>
 """
-    
+
     for t in table_status:
         if not t.distcp_status:
             continue
-        
+
         source_total_size_gb = (t.source_total_size_bytes or 0) / (1024**3)
         s3_size_before_gb = (t.s3_total_size_bytes_before or 0) / (1024**3)
         s3_size_after_gb = (t.s3_total_size_bytes_after or 0) / (1024**3)
         s3_transferred_gb = (t.s3_bytes_transferred or 0) / (1024**3)
-        
+
         size_match_class = 'validation-pass' if t.file_size_match else 'validation-fail'
         size_match_icon = '✓ PASS' if t.file_size_match else '✗ FAIL'
-        
+
         count_match_class = 'validation-pass' if t.file_count_match else 'validation-fail'
         count_match_icon = '✓ PASS' if t.file_count_match else '✗ FAIL'
-        
+
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
@@ -2367,14 +2364,14 @@ def generate_html_report(run_id: str, spark) -> str:
                     <td class="metric">{(t.s3_files_transferred or 0):,}</td>
                     <td class="{count_match_class}">{count_match_icon}</td>
                 </tr>
-""" 
-    
+"""
+
     html += """
             </tbody>
         </table>
-        
+
         <div class="section-divider"></div>
-        
+
         <h2>Performance Metrics</h2>
         <table>
             <thead>
@@ -2389,16 +2386,16 @@ def generate_html_report(run_id: str, spark) -> str:
             </thead>
             <tbody>
 """
-    
+
     for t in table_status:
         data_gb = (t.s3_total_size_bytes_after or 0) / (1024**3)
         distcp_speed = (t.s3_total_size_bytes_after or 0) / (1024**2) / (t.distcp_duration_seconds or 1)
-        
+
         total_dur = (t.discovery_duration_seconds or 0) + (t.distcp_duration_seconds or 0) + \
                     (t.table_create_duration_seconds or 0) + (t.validation_duration_seconds or 0)
-        
+
         rows_per_sec = (t.source_row_count or 0) / (total_dur or 1)
-        
+
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
@@ -2409,11 +2406,11 @@ def generate_html_report(run_id: str, spark) -> str:
                     <td class="metric">{total_dur:.1f}s ({total_dur/60:.1f}m)</td>
                 </tr>
 """
-    
+
     html += """
             </tbody>
         </table>
-        
+
         <div style="margin-top: 50px; padding-top: 20px; border-top: 1px solid #ecf0f1; color: #95a5a6; font-size: 12px;">
             <p>This report was automatically generated by the MapR to S3 Migration DAG.</p>
         </div>
@@ -2421,24 +2418,23 @@ def generate_html_report(run_id: str, spark) -> str:
 </body>
 </html>
 """
-    
+
     # Write HTML to S3
     report_filename = f"{run_id}_report.html"
     report_path = f"{report_location}/{report_filename}"
-    
+
     # Use Spark to write HTML
-    from pyspark.sql import Row
     hadoop_conf = spark._jsc.hadoopConfiguration()
     fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
         spark._jvm.java.net.URI(report_path),
         hadoop_conf
     )
-    
+
     output_path = spark._jvm.org.apache.hadoop.fs.Path(report_path)
-    output_stream = fs.create(output_path, True)  
+    output_stream = fs.create(output_path, True)
     output_stream.write(html.encode('utf-8'))
     output_stream.close()
-    
+
     return {'report_path': report_path}
 
 
@@ -2448,7 +2444,7 @@ def finalize_run(run_id: str, spark) -> dict:
     config = get_config()
     tracking_db = config['tracking_database']
 
-    stats = {'total': 0, 'successful': 0, 'failed': 0} 
+    stats = {'total': 0, 'successful': 0, 'failed': 0}
     final_status = 'FAILED'
 
     try:
@@ -2513,7 +2509,7 @@ def cleanup_edge(cluster_setup: dict, run_id: str) -> dict:
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
     temp_dir = cluster_setup.get('temp_dir', '')
-    
+
     if temp_dir:
         try:
             with ssh.get_conn() as client:
@@ -2521,7 +2517,7 @@ def cleanup_edge(cluster_setup: dict, run_id: str) -> dict:
                 stdout.channel.recv_exit_status()
         except:
             pass
-    
+
     return {'cleaned': temp_dir}
 '''
 
@@ -2542,8 +2538,9 @@ def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict
     report_path = report_result.get('report_path', '')
 
     try:
-        import tempfile
         import os
+        import tempfile
+
         from airflow.utils.email import send_email
 
         logger.info(f"[Email] Reading HTML report from S3: {report_path}")
@@ -2652,14 +2649,14 @@ def init_iceberg_tracking_tables(spark) -> dict:
 @task.pyspark(conn_id='spark_default')
 def create_iceberg_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
     """Create migration run record."""
-    from datetime import datetime
     import uuid
+    from datetime import datetime
 
     config = get_config()
     tracking_db = config['tracking_database']
-    
+
     run_id = f"iceberg_run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    
+
     spark.sql(f"""
         INSERT INTO {tracking_db}.iceberg_migration_runs
         VALUES (
@@ -2674,15 +2671,16 @@ def create_iceberg_migration_run(excel_file_path: str, dag_run_id: str, spark) -
             '{json.dumps(config).replace("'", "''")}'
         )
     """)
-    
+
     return run_id
 
 
 @task.pyspark(conn_id='spark_default')
 def parse_iceberg_excel(excel_file_path: str, run_id: str, spark) -> list:
     """Read Excel config for Iceberg migration from S3, grouping rows by (database, inplace_migration, destination_iceberg_database)."""
-    import pandas as ps
     from io import BytesIO
+
+    import pandas as ps
 
     binary_df = spark.read.format("binaryFile").load(excel_file_path)
     row = binary_df.select("content").first()
@@ -2752,8 +2750,7 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
     if not raw_tokens:
         pattern_str = db_config.get('table_pattern', '*')
         raw_tokens = [t.strip() for t in pattern_str.split(',') if t.strip()] or ['*']
-    run_id = db_config['run_id']
-    
+
     def resolve_tokens(spark, db, tokens):
         resolved = []
         seen = set()
@@ -2781,7 +2778,7 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
     matched_tables = resolve_tokens(spark, src_db, raw_tokens)
 
     logger.info(f"[IcebergDiscover] Database '{src_db}': {len(matched_tables)} table(s) matched tokens={raw_tokens}")
-    
+
     tables_metadata = []
     for tbl in matched_tables:
         logger.info(f"[IcebergDiscover] Getting location for {src_db}.{tbl}")
@@ -2792,7 +2789,7 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
                 if row.col_name and row.col_name.strip() == "Location":
                     location = row.data_type.strip() if row.data_type else None
                     break
-            
+
             tables_metadata.append({
                 'table': tbl,
                 'location': location
@@ -2806,7 +2803,7 @@ def discover_hive_tables(db_config: dict, spark) -> dict:
             })
 
     logger.info(f"[IcebergDiscover] Completed discovery for '{src_db}': {len(tables_metadata)} table(s) ready for migration")
-    
+
     return {
         **db_config,
         'discovered_tables': tables_metadata
@@ -2819,17 +2816,17 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
     """Migrate discovered Hive tables to Iceberg format."""
     config = get_config()
     tracking_db = config['tracking_database']
-    
+
     src_db = discovery['source_database']
     dest_db = discovery['destination_iceberg_database']
     inplace = discovery['inplace_migration']
     run_id = discovery['run_id']
-    
+
     if not inplace:
         spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
-    
+
     results = []
-    
+
     for tbl_meta in discovery.get('discovered_tables', []):
         tbl = tbl_meta['table']
         location = tbl_meta.get('location')
@@ -2837,7 +2834,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
         logger.info(f"[IcebergMigrate] Starting migration for {src_db}.{tbl} | strategy={'INPLACE' if inplace else 'SNAPSHOT'} | dest={dest_db}.{tbl}")
         from datetime import datetime as _dt
         tbl_migrate_start = _dt.utcnow()
-        
+
         try:
             hive_count = spark.sql(f"SELECT COUNT(*) as c FROM {src_db}.{tbl}").collect()[0]['c']
             src_hive_partition_count = 0
@@ -2849,7 +2846,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     non_empty_count = 0
                     table_location = tbl_meta.get('location') or ''
                     for part_row in all_partitions:
-                        part_spec = part_row[0]   
+                        part_spec = part_row[0]
                         part_path = f"{table_location}/{part_spec.replace('=', '=').rstrip('/')}"
                         try:
                             from py4j.java_gateway import java_import
@@ -2873,8 +2870,8 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                         f"non_empty_partitions={non_empty_count} "
                         f"(0-byte partitions excluded from comparison)"
                     )
-            except:
-                pass 
+            except Exception:
+                pass
 
             if inplace:
                 migration_type = "INPLACE"
@@ -2888,29 +2885,29 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     logger.info(f"[IcebergMigrate] Destination {dest_table} already exists (prior attempt). Dropping before re-snapshot.")
                     spark.sql(f"DROP TABLE IF EXISTS {dest_table}")
                 except Exception:
-                    pass  
+                    pass
                 spark.sql(f"CALL spark_catalog.system.snapshot('{src_db}.{tbl}', '{dest_db}.{tbl}')")
-            
+
             iceberg_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_table}").collect()[0]['c']
             dest_iceberg_partition_count = 0
             try:
-                spark.catalog.refreshTable(dest_table) 
+                spark.catalog.refreshTable(dest_table)
                 dest_iceberg_partition_count = spark.sql(f"""SELECT COUNT(*) as cnt FROM {dest_table}.partitions""").collect()[0]['cnt']
-            except:
+            except Exception:
                 pass
 
             counts_match = (hive_count == iceberg_count)
             partition_match = (src_hive_partition_count == dest_iceberg_partition_count)
 
             logger.info(f"[IcebergMigrate] COMPLETED: {src_db}.{tbl} | hive_rows={hive_count} | iceberg_rows={iceberg_count} | rows_match={counts_match} | partitions_match={partition_match}")
-            
+
             desc_df = spark.sql(f"DESCRIBE FORMATTED {dest_table}")
             new_location = None
             for row in desc_df.collect():
                 if row.col_name and row.col_name.strip() == "Location":
                     new_location = row.data_type.strip() if row.data_type else None
                     break
-            
+
             results.append({
                 'source_table': f"{src_db}.{tbl}",
                 'destination_table': dest_table,
@@ -2931,7 +2928,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                   AND source_database = '{src_db}'
                   AND source_table = '{tbl}'
             """)
-            
+
             tbl_migrate_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds()
             spark.sql(f"""
                 INSERT INTO {tracking_db}.iceberg_migration_table_status
@@ -2963,11 +2960,11 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                     current_timestamp()
                 )
             """)
-            
+
         except Exception as e:
             error_msg = f"Migration to Iceberg failed for {dest_db}.{tbl}: {str(e)[:2000]}".replace("'", "''")
-            tbl_fail_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds() 
-            
+            tbl_fail_duration = (_dt.utcnow() - tbl_migrate_start).total_seconds()
+
             results.append({
                 'source_table': f"{src_db}.{tbl}",
                 'destination_table': f"{dest_db}.{tbl}" if not inplace else f"{src_db}.{tbl}",
@@ -2982,7 +2979,7 @@ def migrate_tables_to_iceberg(discovery: dict, dag_run_id: str, spark, **context
                   AND source_database = '{src_db}'
                   AND source_table = '{tbl}'
             """)
-            
+
             spark.sql(f"""
                 INSERT INTO {tracking_db}.iceberg_migration_table_status
                 VALUES (
@@ -3046,16 +3043,16 @@ def update_migration_durations(migration_result: dict, spark) -> dict:
     if not isinstance(migration_result, dict) or 'run_id' not in migration_result:
         logger.warning(f"[update_migration_durations] Skipping invalid input: {type(migration_result)}")
         return {}
-    
+
     config = get_config()
     tracking_db = config['tracking_database']
-    
+
     run_id = migration_result['run_id']
     src_db = migration_result['source_database']
-    
+
     # Extract duration from XCom result
     migration_duration = migration_result.get('_task_duration', 0.0)
-    
+
     # Update all records for this run
     execute_with_iceberg_retry(spark, f"""
         UPDATE {tracking_db}.iceberg_migration_table_status
@@ -3093,7 +3090,7 @@ def update_migration_durations(migration_result: dict, spark) -> dict:
           AND status IS NULL
     """,
     task_label="update_migration_durations:catchall")
-    
+
     return migration_result
 
 
@@ -3105,20 +3102,16 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
     if not isinstance(migration_result, dict) or 'run_id' not in migration_result:
         logger.warning(f"[validate_iceberg_tables] Skipping invalid input: {type(migration_result)}")
         return {}
-    
-    config = get_config()
-    tracking_db = config['tracking_database']
-    
-    run_id = migration_result['run_id']
+
     src_db = migration_result['source_database']
     dest_db = migration_result['destination_database']
-    
+
     validation_results = []
-    
+
     for r in migration_result.get('results', []):
         if r['status'] != 'COMPLETED':
             continue
-        
+
         # Extract table name from fully qualified name
         src_tbl_full = r['source_table']
         tbl = src_tbl_full.split('.')[-1]
@@ -3127,7 +3120,7 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
         logger.info(f"[IcebergValidation] Validating {src_db}.{tbl} vs {dest_tbl}")
         from datetime import datetime as _dt
         tbl_val_start = _dt.utcnow()
-        
+
         try:
             # Schema comparison between source Hive and destination Iceberg
             src_hive_schema_df = spark.sql(f"DESCRIBE {src_db}.{tbl}")
@@ -3136,21 +3129,21 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
                 for row in src_hive_schema_df.collect()
                 if row.col_name and not row.col_name.startswith('#')
             ]
-            
+
             dest_iceberg_schema_df = spark.sql(f"DESCRIBE {dest_tbl}")
             dest_iceberg_schema = [
                 {'name': row.col_name, 'type': row.data_type}
                 for row in dest_iceberg_schema_df.collect()
                 if row.col_name and not row.col_name.startswith('#')
             ]
-            
+
             # Compare schemas
             schema_match = True
             schema_diffs = []
-            
+
             src_cols = {c['name']: c['type'] for c in src_hive_schema}
             dest_cols = {c['name']: c['type'] for c in dest_iceberg_schema}
-            
+
             for col_name, col_type in src_cols.items():
                 if col_name not in dest_cols:
                     schema_match = False
@@ -3158,7 +3151,7 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
                 elif dest_cols[col_name] != col_type:
                     schema_match = False
                     schema_diffs.append(f"Type mismatch for {col_name}: Hive {col_type} vs Iceberg {dest_cols[col_name]}")
-            
+
             for col_name in dest_cols:
                 if col_name not in src_cols:
                     schema_match = False
@@ -3169,7 +3162,7 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
             logger.info(f"[IcebergValidation] DONE: {src_db}.{tbl} | rows={'✓' if row_ok else '✗'} partitions={'✓' if part_ok else '✗'} schema={'✓' if schema_match else '✗'}")
             if schema_diffs:
                 logger.warning(f"[IcebergValidation] Schema diffs for {src_db}.{tbl}: {'; '.join(schema_diffs[:5])}")
-            
+
             validation_results.append({
                 'source_table': tbl,
                 'destination_table': dest_tbl,
@@ -3185,7 +3178,7 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
                 'per_table_validation_duration': (_dt.utcnow() - tbl_val_start).total_seconds(),
                 'error': None
             })
-            
+
         except Exception as e:
             error_msg = f"Validation failed for {dest_db}.{tbl}: {str(e)[:2000]}"
             validation_results.append({
@@ -3207,7 +3200,7 @@ def validate_iceberg_tables(migration_result: dict, spark, **context) -> dict:
     ]
     total_failures = len(failed_validations) + len(mismatched)
     has_failures = total_failures > 0
-    
+
     result_dict = {
         **migration_result,
         'validation_results': validation_results,
@@ -3233,26 +3226,25 @@ def update_iceberg_validation_status(validation_result: dict, spark) -> dict:
     if not isinstance(validation_result, dict) or 'run_id' not in validation_result:
         logger.warning(f"[update_iceberg_validation_status] Skipping invalid input: {type(validation_result)}")
         return {}
-    
+
     config = get_config()
     tracking_db = config['tracking_database']
-    
+
     run_id = validation_result['run_id']
     src_db = validation_result['source_database']
-    
+
     # Extract duration from XCom result
     task_level_validation_duration = validation_result.get('_task_duration', 0.0)
-    
+
     for v in validation_result.get('validation_results', []):
         if v['status'] != 'COMPLETED':
             continue
-        
-        error_msg = (v.get('error', '') or '').replace("'", "''")[:2000]
+
         schema_diffs = (v.get('schema_differences', '') or '').replace("'", "''")[:2000]
-        
+
         overall_status = 'VALIDATED' if (
-            v.get('row_count_match', False) and 
-            v.get('partition_count_match', True) and 
+            v.get('row_count_match', False) and
+            v.get('partition_count_match', True) and
             v.get('schema_match', False)
         ) else 'VALIDATION_FAILED'
 
@@ -3261,15 +3253,15 @@ def update_iceberg_validation_status(validation_result: dict, spark) -> dict:
             v.get('partition_count_match', True) and
             v.get('schema_match', False)
         )
-        
+
         if not is_validated and v.get('error'):
             mismatch_msg = str(v['error']).replace("'", "''")[:2000]
             error_message_sql = f"'{mismatch_msg}'"
         elif is_validated:
             error_message_sql = "NULL"
         else:
-            error_message_sql = "error_message" 
-        
+            error_message_sql = "error_message"
+
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.iceberg_migration_table_status
             SET validation_status = '{v['status']}',
@@ -3326,7 +3318,7 @@ def update_iceberg_validation_status(validation_result: dict, spark) -> dict:
           AND validation_status IS NULL
     """,
     task_label="update_iceberg_validation_status:catchall")
-    
+
     return validation_result
 
 
@@ -3334,18 +3326,18 @@ def update_iceberg_validation_status(validation_result: dict, spark) -> dict:
 def generate_iceberg_html_report(run_id: str, spark) -> str:
     """Generate comprehensive HTML Iceberg migration report."""
     from datetime import datetime
-    
+
     config = get_config()
     tracking_db = config['tracking_database']
     report_location = config['report_output_location']
-    
+
     # Get migration status
     migration_status = spark.sql(f"""
         SELECT * FROM {tracking_db}.iceberg_migration_table_status
         WHERE run_id = '{run_id}'
         ORDER BY source_database, source_table
     """).collect()
-    
+
     # Calculate summary stats
     total_tables = len(migration_status)
     successful_tables = sum(1 for t in migration_status if t.status in ['VALIDATED', 'COMPLETED'])
@@ -3353,7 +3345,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
     total_rows = sum(t.source_hive_row_count or 0 for t in migration_status)
     count_mismatches = sum(1 for t in migration_status if not t.row_count_match and t.row_count_match is not None)
 
-    # Validation summary query 
+    # Validation summary query
     iceberg_validation_summary = spark.sql(f"""
         SELECT
             COUNT(*) as total_tables_validated,
@@ -3366,7 +3358,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
         WHERE run_id = '{run_id}'
           AND validation_status = 'COMPLETED'
     """).collect()
-    
+
     # Generate HTML
     html = f"""
 <!DOCTYPE html>
@@ -3502,12 +3494,12 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
 <body>
     <div class="container">
         <h1>Iceberg Migration Report</h1>
-        
+
         <div class="timestamp">
             Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
             Run ID: <strong>{run_id}</strong>
         </div>
-        
+
         <h2>Migration Summary</h2>
         <div class="summary-grid">
             <div class="summary-card">
@@ -3531,7 +3523,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
                 <p class="value">{count_mismatches}</p>
             </div>
         </div>
-        
+
         <div class="section-divider"></div>
 
         <h2>Validation Summary</h2>
@@ -3575,7 +3567,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
 
     html += """
         <div class="section-divider"></div>
-        
+
         <h2>Table Migration Details</h2>
         <table>
             <thead>
@@ -3591,7 +3583,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
             </thead>
             <tbody>
 """
-    
+
     for t in migration_status:
         if t.status == 'VALIDATED':
             status_class = 'status-validated'
@@ -3599,10 +3591,10 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
             status_class = 'status-completed'
         else:
             status_class = 'status-failed'
-        
+
         migration_dur = f"{t.migration_duration_seconds:.1f}s" if t.migration_duration_seconds else "N/A"
         validation_dur = f"{t.validation_duration_seconds:.1f}s" if t.validation_duration_seconds else "N/A"
-        
+
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
@@ -3614,13 +3606,13 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
                     <td class="duration">{validation_dur}</td>
                 </tr>
 """
-    
-    html += f"""
+
+    html += """
             </tbody>
         </table>
-        
+
         <div class="section-divider"></div>
-        
+
         <h2>Validation Results (Hive vs Iceberg)</h2>
         <table>
             <thead>
@@ -3638,7 +3630,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
             </thead>
             <tbody>
 """
-    
+
     for t in migration_status:
         if t.validation_status == 'COMPLETED':
             row_match_class = 'validation-pass' if t.row_count_match else 'validation-fail'
@@ -3650,7 +3642,7 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
         else:
             row_match_class = part_match_class = schema_match_class = 'duration'
             row_match_icon = part_match_icon = schema_match_icon = 'N/A'
-        
+
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
@@ -3664,13 +3656,13 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
                     <td class="{schema_match_class}">{schema_match_icon}</td>
                 </tr>
 """
-    
-    html += f"""
+
+    html += """
             </tbody>
         </table>
-        
+
         <div class="section-divider"></div>
-        
+
         <h2>Performance Metrics</h2>
         <table>
             <thead>
@@ -3686,14 +3678,14 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
             </thead>
             <tbody>
 """
-    
+
     for t in migration_status:
         migration_dur = t.migration_duration_seconds or 0
         validation_dur = t.validation_duration_seconds or 0
         total_dur = migration_dur + validation_dur
-        
+
         rows_per_sec = (t.source_hive_row_count or 0) / (total_dur or 1)
-        
+
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
@@ -3705,11 +3697,11 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
                     <td class="metric">{rows_per_sec:,.0f}</td>
                 </tr>
 """
-    
+
     html += """
             </tbody>
         </table>
-        
+
         <div style="margin-top: 50px; padding-top: 20px; border-top: 1px solid #ecf0f1; color: #95a5a6; font-size: 12px;">
             <p>This report was automatically generated by the Iceberg Migration DAG.</p>
         </div>
@@ -3717,24 +3709,23 @@ def generate_iceberg_html_report(run_id: str, spark) -> str:
 </body>
 </html>
 """
-    
+
     # Write HTML to S3
     report_filename = f"{run_id}_iceberg_report.html"
     report_path = f"{report_location}/{report_filename}"
-    
+
     # Use Spark to write HTML
-    from pyspark.sql import Row
     hadoop_conf = spark._jsc.hadoopConfiguration()
     fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
         spark._jvm.java.net.URI(report_path),
         hadoop_conf
     )
-    
+
     output_path = spark._jvm.org.apache.hadoop.fs.Path(report_path)
-    output_stream = fs.create(output_path, True)  
+    output_stream = fs.create(output_path, True)
     output_stream.write(html.encode('utf-8'))
     output_stream.close()
-    
+
     return {'report_path': report_path}
 
 
@@ -3824,7 +3815,9 @@ def finalize_iceberg_run(run_id: str, spark) -> dict:
 @task.pyspark(conn_id='spark_default')
 def send_iceberg_report_email(report_result: dict, run_id: str, spark) -> dict:
     """Send HTML Iceberg migration report via email using SMTP."""
-    import tempfile, os
+    import os
+    import tempfile
+
     from airflow.utils.email import send_email
 
     config = get_config()
@@ -3864,7 +3857,7 @@ def send_iceberg_report_email(report_result: dict, run_id: str, spark) -> dict:
         )
         tmp.write(html_content)
         tmp.close()
-    
+
         send_email(
             to=recipients,
             subject=f"Iceberg Migration Report - {run_id}",
@@ -3914,7 +3907,7 @@ with DAG(
         run_id=t_run_id
     )
     t_cluster = cluster_login_setup(run_id=t_run_id)
-    
+
     # Per-database processing (dynamic task mapping)
     t_discover = discover_tables_via_spark_ssh.expand(db_config=t_excel)
     t_record = record_discovered_tables.expand(discovery=t_discover)
@@ -3934,25 +3927,25 @@ with DAG(
     t_dest_validation.operator.trigger_rule = 'all_done'
     t_val_status = update_validation_status.expand(validation_result=t_dest_validation)
     t_val_status.operator.trigger_rule = 'all_done'
-    
-    # Report generation 
+
+    # Report generation
     t_report = generate_html_report(run_id=t_run_id)
     t_report.operator.trigger_rule = 'all_done'
 
     # Email report
     t_email = send_migration_report_email(run_id=t_run_id, report_result=t_report)
     t_email.operator.trigger_rule = 'all_done'
-    
+
     # Finalize
     t_final = finalize_run(run_id=t_run_id)
     t_final.operator.trigger_rule = 'all_done'
     # t_cleanup = cleanup_edge(cluster_setup=t_cluster, run_id=t_run_id)
     # t_cleanup.operator.trigger_rule = 'all_done'
-    
+
     # Dependencies
     t_validate >> t_init >> t_run_id >> t_excel >> t_cluster >> t_discover >> t_record
     t_record >> t_distcp >> t_distcp_status >> t_tables >> t_tbl_status
-    t_tbl_status >> t_dest_validation >> t_val_status 
+    t_tbl_status >> t_dest_validation >> t_val_status
     t_val_status >> t_report >> t_email >> t_final #>> t_cleanup
 
 # =============================================================================
@@ -3988,7 +3981,7 @@ with DAG(
         excel_file_path="{{ params.excel_file_path }}",
         run_id=t_ice_run_id
     )
-    
+
     # Per-database processing
     t_ice_discover = discover_hive_tables.expand(db_config=t_ice_excel)
     t_ice_migrate = migrate_tables_to_iceberg.partial(dag_run_id="{{ run_id }}").expand(discovery=t_ice_discover)
@@ -3997,26 +3990,26 @@ with DAG(
     # Duration update
     t_ice_durations = update_migration_durations.expand(migration_result=t_ice_migrate)
     t_ice_durations.operator.trigger_rule = 'all_done'
-    
-    # Validation 
+
+    # Validation
     t_ice_validate = validate_iceberg_tables.expand(migration_result=t_ice_durations)
     t_ice_validate.operator.max_active_tis_per_dagrun = 3
     t_ice_validate.operator.trigger_rule = 'all_done'
     t_ice_val_status = update_iceberg_validation_status.expand(validation_result=t_ice_validate)
     t_ice_val_status.operator.trigger_rule = 'all_done'
-    
-    # Report generation 
+
+    # Report generation
     t_ice_report = generate_iceberg_html_report(run_id=t_ice_run_id)
     t_ice_report.operator.trigger_rule = 'all_done'
 
     # Email report
     t_ice_email = send_iceberg_report_email(run_id=t_ice_run_id, report_result=t_ice_report)
     t_ice_email.operator.trigger_rule = 'all_done'
-    
+
     # Finalize
     t_ice_final = finalize_iceberg_run(run_id=t_ice_run_id)
     t_ice_final.operator.trigger_rule = 'all_done'
-    
+
     # Dependencies
     t_ice_init >> t_ice_run_id >> t_ice_excel >> t_ice_discover >> t_ice_migrate >> t_ice_durations
     t_ice_durations >> t_ice_validate >> t_ice_val_status >> t_ice_report >> t_ice_email >> t_ice_final
@@ -4206,8 +4199,9 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
     Returns a list of dicts, one per valid row.
     """
     import os
-    import pandas as ps
     from io import BytesIO
+
+    import pandas as ps
 
     def _normalize_bucket(raw: str) -> str:
         val = raw.strip()
@@ -4454,7 +4448,7 @@ exit 0
             'error': error_msg,
         }
         context['ti'].xcom_push(key='return_value', value=result)
-        raise Exception(f"DistCp failed for {source_path} -> {s3_dest}: {error_msg}")
+        raise Exception(f"DistCp failed for {source_path} -> {s3_dest}: {error_msg}") from e
 
 
 @task.pyspark(conn_id='spark_default')
@@ -4522,12 +4516,10 @@ def record_data_copy_status(distcp_result: dict, spark) -> dict:
 @task
 def validate_data_copy(copy_status: dict, **context) -> dict:
     """Re-verify the S3 destination after copy: recount files/bytes and update data_copy_status."""
-    from datetime import datetime as _dt
 
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
 
-    run_id      = copy_status['run_id']
     source_path = copy_status['source_path']
     dest_bucket = copy_status['dest_bucket']
     dest_path   = copy_status['dest_path']
@@ -4577,9 +4569,9 @@ fi
     try:
         with ssh.get_conn() as client:
             _, stdout, stderr = client.exec_command(cmd, timeout=SSH_COMMAND_TIMEOUT)
-            exit_code = stdout.channel.recv_exit_status()
+            stdout.channel.recv_exit_status()
             output = stdout.read().decode()
-            err_output = stderr.read().decode()
+            stderr.read()
 
             for line in output.split('\n'):
                 line = line.strip()
@@ -4938,8 +4930,9 @@ def generate_data_copy_html_report(finalize_result: dict, run_id: str, spark) ->
 @task.pyspark(conn_id='spark_default')
 def send_data_copy_report_email(report_result: dict, run_id: str, spark) -> dict:
     """Send the folder data copy HTML report via SMTP."""
-    import tempfile
     import os
+    import tempfile
+
     from airflow.utils.email import send_email
 
     config = get_config()
@@ -5027,7 +5020,7 @@ with DAG(
         excel_file_path="{{ params.excel_file_path }}"
     )
 
-    # Cluster authentication — receives tracking run_id 
+    # Cluster authentication — receives tracking run_id
     t_fc_cluster = cluster_login_setup(run_id=t_fc_run_id)
 
     # Parse Excel — one dict per folder row

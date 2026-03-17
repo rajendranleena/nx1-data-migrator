@@ -1,0 +1,6 @@
+[run]
+source = ranger_policies_generator_airflow3
+
+[report]
+fail_under = 80
+show_missing = true

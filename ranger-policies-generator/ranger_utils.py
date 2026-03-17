@@ -9,21 +9,22 @@ This module provides helper classes and functions for:
 Based on the existing ranger.py implementation with enhancements for Excel-based automation.
 """
 
-from apache_ranger.client.ranger_client import RangerClient
-from apache_ranger.model.ranger_policy import (
-    RangerPolicy, RangerPolicyResource,
-    RangerPolicyItem, RangerPolicyItemAccess
-)
-from apache_ranger.model.ranger_service import RangerService
-from apache_ranger.model.ranger_user_mgmt import RangerGroup, RangerUser, RangerGroupUser
-from apache_ranger.client.ranger_user_mgmt_client import RangerUserMgmtClient
-from apache_ranger.exceptions import RangerServiceException
-from typing import Dict, List, Optional, Set, Any
 import logging
-import string
-import secrets
 import os
-import copy 
+import secrets
+import string
+from typing import Any, Dict, List, Optional, Set
+
+from apache_ranger.client.ranger_client import RangerClient
+from apache_ranger.client.ranger_user_mgmt_client import RangerUserMgmtClient
+from apache_ranger.model.ranger_policy import (
+    RangerPolicy,
+    RangerPolicyItem,
+    RangerPolicyItemAccess,
+    RangerPolicyResource,
+)
+from apache_ranger.model.ranger_user_mgmt import RangerGroup
+
 logger = logging.getLogger(__name__)
 
 def safe_deepcopy(obj):
@@ -35,11 +36,11 @@ def safe_deepcopy(obj):
         return tuple(safe_deepcopy(x) for x in obj)
     else:
         return obj
-    
+
 # Permission mappings
 class Permissions:
     """Standard permission sets for read/write access patterns."""
-    
+
     READ = ["select", "use", "execute", "show", "read_sysinfo"]
     WRITE = [
         "select", "insert", "update", "delete", "create", "drop",
@@ -51,7 +52,7 @@ class Permissions:
         "alter", "use", "show", "grant", "revoke", "impersonate",
         "execute", "read", "write", "read_sysinfo", "write_sysinfo"
     ]
-    
+
     @classmethod
     def get_access_types(cls, permission: str) -> List[str]:
         """Convert permission string to list of access types."""
@@ -73,18 +74,18 @@ def generate_secure_password(length: int = 16) -> str:
     uppercase = string.ascii_uppercase
     digits = string.digits
     special = "!@#$%^&*()_+-=[]{}|;:,.<>?"
-    
+
     password = [
         secrets.choice(lowercase),
         secrets.choice(uppercase),
         secrets.choice(digits),
         secrets.choice(special)
     ]
-    
+
     all_chars = lowercase + uppercase + digits + special
     for _ in range(length - 4):
         password.append(secrets.choice(all_chars))
-    
+
     secrets.SystemRandom().shuffle(password)
     return ''.join(password)
 
@@ -92,10 +93,10 @@ def generate_secure_password(length: int = 16) -> str:
 class RangerPolicyManager:
     """
     Manager class for creating and managing Ranger policies.
-    
+
     Designed for use with the policy automation DAG.
     """
-    
+
     def __init__(
         self,
         ranger_url: str,
@@ -105,7 +106,7 @@ class RangerPolicyManager:
     ):
         """
         Initialize the Ranger Policy Manager.
-        
+
         Args:
             ranger_url: URL of the Ranger admin server
             ranger_username: Ranger admin username
@@ -114,12 +115,12 @@ class RangerPolicyManager:
         """
         self.ranger_url = ranger_url
         self.service_name = service_name
-        
+
         ranger_auth = (ranger_username, ranger_password)
         self.client = RangerClient(ranger_url, ranger_auth)
         self.user_mgmt_client = RangerUserMgmtClient(self.client)
         self.supported_access_types = self._load_supported_access_types_once()
-        
+
         logger.info(f"Initialized RangerPolicyManager for service: {service_name}")
 
     def _load_supported_access_types_once(self) -> Optional[Set[str]]:
@@ -201,21 +202,21 @@ class RangerPolicyManager:
                 sorted(self.supported_access_types),
             )
         return valid
-    
+
     def ensure_group_exists(self, group_name: str) -> bool:
         """
         Ensure a Ranger group exists, creating it if necessary.
-        
+
         Args:
             group_name: Name of the group to ensure exists
-            
+
         Returns:
             True if group was created, False if it already existed
         """
         try:
             groups_result = self.user_mgmt_client.find_groups({'name': group_name})
             existing_groups = [g.name for g in groups_result.list] if groups_result.list else []
-            
+
             if group_name not in existing_groups:
                 group = RangerGroup({'name': group_name})
                 self.user_mgmt_client.create_group(group)
@@ -227,19 +228,19 @@ class RangerPolicyManager:
         except Exception as e:
             logger.error(f"Error ensuring group {group_name} exists: {e}")
             raise
-    
+
     def ensure_groups_exist(self, group_names: List[str]) -> Dict[str, bool]:
         """
         Ensure multiple Ranger groups exist.
-        
+
         Args:
             group_names: List of group names to ensure exist
-            
+
         Returns:
             Dictionary mapping group names to whether they were created (True) or existed (False)
         """
         results = {}
-        
+
         # Get all existing groups first
         try:
             all_groups = self.user_mgmt_client.find_groups()
@@ -247,7 +248,7 @@ class RangerPolicyManager:
         except Exception as e:
             logger.error(f"Error fetching existing groups: {e}")
             existing_groups = set()
-        
+
         for group_name in group_names:
             if group_name in existing_groups:
                 results[group_name] = False
@@ -262,9 +263,9 @@ class RangerPolicyManager:
                 except Exception as e:
                     logger.error(f"Failed to create group {group_name}: {e}")
                     results[group_name] = False
-        
+
         return results
-    
+
     def get_existing_policy(self, policy_name: str) -> Optional[Dict]:
         """
         Get an existing policy by name using find_policies.
@@ -292,7 +293,7 @@ class RangerPolicyManager:
         except Exception as e:
             logger.error(f"Error checking for existing policy {policy_name}: {e}")
             return None
-    
+
     def create_table_policy(
         self,
         policy_name: str,
@@ -306,7 +307,7 @@ class RangerPolicyManager:
     ) -> Dict[str, Any]:
         """
         Create or update a table-based policy.
-        
+
         Args:
             policy_name: Name of the policy
             catalog: Catalog name (e.g., 'iceberg')
@@ -315,7 +316,7 @@ class RangerPolicyManager:
             column: Column name or '*' for all
             role_permissions: List of {'role': str, 'permissions': List[str]}
             description: Optional policy description
-            
+
         Returns:
             Dictionary with 'status' ('created', 'updated', or 'failed') and policy details
         """
@@ -349,7 +350,7 @@ class RangerPolicyManager:
                 # ============================================================
                 # CASE 1: Row Filters Present → Create Separate Policies
                 # ============================================================
-                logger.info(f"Row filters detected. Creating separate Access and Row Filter policies")
+                logger.info("Row filters detected. Creating separate Access and Row Filter policies")
                 access_policy_name = policy_name
                 resources_for_access = safe_deepcopy({k: v for k, v in resources.items() if k != "column"})
                 logger.debug(f"Resources for access policy: {resources_for_access}")
@@ -394,7 +395,7 @@ class RangerPolicyManager:
             else:
                 # ============================================================
                 # CASE 2: Single Access Policy (No Row Filters)
-                # ============================================================    
+                # ============================================================
                 resources_for_policy = safe_deepcopy(resources)
                 logger.debug(f"Resources for single access policy: {resources_for_policy}")
                 existing_policy = self.get_existing_policy(policy_name)
@@ -417,7 +418,7 @@ class RangerPolicyManager:
                 'policy_name': policy_name,
                 'error': str(e)
             }
-    
+
     def create_url_policy(
         self,
         policy_name: str,
@@ -428,22 +429,22 @@ class RangerPolicyManager:
     ) -> Dict[str, Any]:
         """
         Create or update a URL-based policy.
-        
+
         Args:
             policy_name: Name of the policy
             url: URL pattern (S3, HDFS, ABFS, GCS path)
             role_permissions: List of {'role': str, 'permissions': List[str]}
             description: Optional policy description
-            
+
         Returns:
             Dictionary with 'status' ('created', 'updated', or 'failed') and policy details
         """
         try:
             logger.debug(f"Processing table policy '{policy_name}' -  url={url}")
             logger.debug(f"Role permissions: {role_permissions}")
-            
+
             existing_policy = self.get_existing_policy(policy_name)
-            
+
             role_permissions_with_policy_context = [{**rp, 'policy_name': policy_name} for rp in role_permissions]
 
             # Build policy items (no row filters for URL policies)
@@ -454,12 +455,12 @@ class RangerPolicyManager:
                 raise ValueError(
                     f"No supported access types remain for URL policy '{policy_name}' after filtering unsupported permissions"
                 )
-            
+
             # Build resources
             resources = {
                 'url': RangerPolicyResource({'values': [url], 'isRecursive': True})
             }
-            
+
             if existing_policy:
                 # Update existing policy
                 return self._update_policy(
@@ -472,7 +473,7 @@ class RangerPolicyManager:
                     policy_name, resources, policy_items, row_filter_items, description,
                     policy_labels=policy_labels
                 )
-                
+
         except Exception as e:
             logger.error(f"Failed to create/update URL policy {policy_name}: {e}")
             return {
@@ -490,7 +491,7 @@ class RangerPolicyManager:
         if not text:
             return False
         return text.lower() not in {'nan', 'null', 'none'}
-    
+
     def _build_policy_items(self, role_permissions: List[Dict[str, Any]]) -> List[RangerPolicyItem]:
         """Build policy items from role_permissions list using group principals only."""
         policy_items = []
@@ -527,7 +528,7 @@ class RangerPolicyManager:
             logger.debug(f"Final policy item: groups={allow_item.groups}, users={allow_item.users}, accesses={[a.type for a in allow_item.accesses]}, delegateAdmin={allow_item.delegateAdmin}")
             policy_items.append(allow_item)
         return policy_items
-    
+
     def _build_url_policy_items(self, role_permissions: List[Dict[str, Any]]) -> List[RangerPolicyItem]:
         """Build policy items for URL-based policies using group principals only."""
         policy_items = []
@@ -571,7 +572,7 @@ class RangerPolicyManager:
             ]
             policy_items.append(allow_item)
         return policy_items
-        
+
     def _create_policy(
         self,
         policy_name: str,
@@ -634,7 +635,7 @@ class RangerPolicyManager:
         """
         Update an existing policy, merging groups, users, and permissions safely.
         Handles both dict and object access representations.
-        """   
+        """
         def get_access_type(a):
             """Return access type safely whether a is dict or object."""
             if isinstance(a, dict):
@@ -644,7 +645,7 @@ class RangerPolicyManager:
         policy_name = existing_policy['name']
         policy_id = existing_policy['id']
         logger.info(f"_update_policy called for policy_name={policy_name}, policy_id={policy_id}")
-        logger.info(f"Incoming resources: {resources}")        
+        logger.info(f"Incoming resources: {resources}")
         merged_policy = safe_deepcopy(existing_policy)
 
         # Update resources safely
@@ -697,7 +698,7 @@ class RangerPolicyManager:
             for idx, item in enumerate(existing_rowfilters):
                 for group in item.get('groups', []):
                     group_to_rowfilter[group] = idx
-    
+
             for new_item in row_filter_items:
                 for group in new_item.get('groups', []):
                     if group in group_to_rowfilter:
@@ -731,7 +732,7 @@ class RangerPolicyManager:
         policy_obj = RangerPolicy()
         for key, value in merged_policy.items():
             setattr(policy_obj, key, value)
-    
+
         policy_obj.id = policy_id
         policy_obj.service = self.service_name
         try:
@@ -740,7 +741,7 @@ class RangerPolicyManager:
             logger.info(f"Updated policy: {policy_name}")
         except Exception as e:
             logger.error(f"Update failed for policy {policy_name} (id={policy_id}): {e}")
-            raise   
+            raise
         updated_policy = self.client.get_policy_by_id(policy_id)
         logger.info(f"Policy from Ranger after update: {updated_policy}")
         return {
@@ -748,14 +749,14 @@ class RangerPolicyManager:
             'policy_name': policy_name,
             'policy_id': policy_id
         }
-    
+
     def delete_policy(self, policy_name: str) -> bool:
         """
         Delete a policy by name.
-        
+
         Args:
             policy_name: Name of the policy to delete
-            
+
         Returns:
             True if deleted successfully, False otherwise
         """
@@ -766,7 +767,7 @@ class RangerPolicyManager:
         except Exception as e:
             logger.error(f"Failed to delete policy {policy_name}: {e}")
             return False
-    
+
     def get_all_policies(self) -> List[Dict]:
         """Get all policies from the service."""
         try:
@@ -777,28 +778,28 @@ class RangerPolicyManager:
         except Exception as e:
             logger.error(f"Error fetching policies: {e}")
             return []
-        
+
     def _build_row_filter_items(self, role_permissions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Build row filter policy items from role_permissions list.
-        
+
         NOTE: Row filters in Ranger only support 'select' access type.
         Other permissions (read, write) are mapped to 'select'.
         """
         row_filter_items = []
         logger.debug(f"Building row filter items from {len(role_permissions)} role permissions")
-        
+
         for idx, rp in enumerate(role_permissions):
             rowfilter = rp.get('rowfilter', '').strip()
             logger.debug(f"Role permission {idx}: {rp.keys()} - rowfilter='{rowfilter}'")
-            
+
             # Skip if no rowfilter or if it's 'nan'
             if not rowfilter or rowfilter.lower() in {'nan', 'null', 'none'}:
                 logger.debug(f"Skipping role permission {idx} - no valid rowfilter")
                 continue
-                
+
             role = rp.get('role')
             permissions = rp.get('permissions', ['read'])  # Get permissions for row filter
-            
+
             # For rowfilter, only 'select' and '_ALL' are valid access types
             # Map any permission to 'select' (rowfilter is read-only data visibility)
             access_types = set()
@@ -810,12 +811,12 @@ class RangerPolicyManager:
                 else:
                     # If it's already a valid access type, check if it's allowable
                     access_types.add('select')
-            
+
             # Strict RBAC: row filter applies only to Ranger role-group, not Keycloak groups
             group_list = [role] if self._is_valid_role_name(role) else []
-            
+
             logger.info(f"Creating row filter item: role={role}, groups={group_list}, filter='{rowfilter}', accesses={list(access_types)}")
-            
+
             row_filter_items.append({
                 "groups": group_list,
                 "users": [],
@@ -827,14 +828,14 @@ class RangerPolicyManager:
                 "roles": [],  # Roles handled via groups
                 "isEnabled": True  # Ensure rowfilter is enabled
             })
-        
+
         logger.debug(f"Built {len(row_filter_items)} row filter items")
         return row_filter_items
 
     def sync_policies_from_dict(self, policies_dict: Dict[str, Dict]) -> Dict[str, List]:
         """
         Sync policies from a dictionary structure (as parsed from Excel).
-        
+
         Args:
             policies_dict: Dictionary with policy_name as key and policy config as value
                 Expected structure:
@@ -849,7 +850,7 @@ class RangerPolicyManager:
                         'roles': [{'role': str, 'permissions': List[str]}]
                     }
                 }
-                
+
         Returns:
             Dictionary with 'created', 'updated', and 'failed' lists
             Each entry in 'created'/'updated' is a dict with policy_name and policy_id
@@ -860,7 +861,7 @@ class RangerPolicyManager:
             'updated': [],
             'failed': []
         }
-        
+
         for policy_name, policy_config in policies_dict.items():
             policy_type = policy_config.get('type', 'table')
             role_permissions = policy_config.get('roles', [])
@@ -875,7 +876,7 @@ class RangerPolicyManager:
                     'error': 'No valid role principal found for this policy (role is empty/null-like).'
                 })
                 continue
-            
+
             label_val = policy_config.get('label')
             policy_labels = label_val if isinstance(label_val, list) else ([label_val] if label_val else None)
             if policy_type == 'url':
@@ -895,7 +896,7 @@ class RangerPolicyManager:
                     role_permissions=valid_role_permissions,
                     policy_labels=policy_labels
                 )
-            
+
             status = result.get('status', 'failed')
             if status == 'created':
                 # Keep the full result dict with policy_id and rowfilter_policy_id if present
@@ -924,7 +925,7 @@ class RangerPolicyManager:
                     'name': policy_name,
                     'error': result.get('error', 'Unknown error')
                 })
-        
+
         return results
 
 
@@ -932,7 +933,7 @@ class KeycloakRoleManager:
     """
     Manager class for creating and managing Keycloak realm roles and group mappings.
     """
-    
+
     def __init__(
         self,
         server_url: str,
@@ -946,7 +947,7 @@ class KeycloakRoleManager:
     ):
         """
         Initialize the Keycloak Role Manager with retry logic.
-        
+
         Args:
             server_url: Keycloak server URL
             realm_name: Realm name
@@ -957,9 +958,10 @@ class KeycloakRoleManager:
             max_retries: Number of connection retry attempts (default: 3)
             connection_timeout: Connection timeout in seconds (default: 10)
         """
-        from keycloak import KeycloakAdmin
         import time
-        
+
+        from keycloak import KeycloakAdmin
+
         self.server_url = server_url
         self.realm_name = realm_name
         self.max_retries = max_retries
@@ -992,7 +994,7 @@ class KeycloakRoleManager:
         if not self.verify_ssl:
             logger.warning("Keycloak TLS certificate verification is disabled (verify_ssl=false).")
         verify_setting = self.ca_cert_path if (self.verify_ssl and self.ca_cert_path) else self.verify_ssl
-        
+
         # Try to connect with exponential backoff retry logic
         last_error = None
         for attempt in range(max_retries):
@@ -1005,12 +1007,12 @@ class KeycloakRoleManager:
                     verify=verify_setting,
                     timeout=connection_timeout
                 )
-                
+
                 # Test the connection by attempting to get realm info
                 self.keycloak_admin.get_realm(realm_name)
                 logger.info(f"Successfully initialized KeycloakRoleManager for realm: {realm_name}")
                 return
-                
+
             except Exception as e:
                 last_error = e
                 if attempt < max_retries - 1:
@@ -1025,13 +1027,13 @@ class KeycloakRoleManager:
                         f"Failed to connect to Keycloak after {max_retries} attempts. "
                         f"Server URL: {server_url}, Realm: {realm_name}"
                     )
-        
+
         # If we get here, all retries failed
         raise ConnectionError(
             f"Could not connect to Keycloak server at {server_url} "
             f"after {max_retries} attempts. Last error: {str(last_error)}"
         )
-    
+
     def _assign_role_to_principal(self, role_name: str, principal_name: str, principal_type: str) -> bool:
         """
         Assign a realm role to a group or user.
@@ -1065,7 +1067,7 @@ class KeycloakRoleManager:
                 if not user_id:
                     error_msg = f"User '{principal_name}' not found in Keycloak realm. Cannot assign role."
                     logger.error(error_msg)
-                    raise ValueError(error_msg) 
+                    raise ValueError(error_msg)
                 role = self.keycloak_admin.get_realm_role(role_name)
                 user_roles = self.keycloak_admin.get_realm_roles_of_user(user_id)
                 user_role_names = {r['name'] for r in user_roles}
@@ -1087,17 +1089,17 @@ class KeycloakRoleManager:
     def ensure_realm_role_exists(self, role_name: str, description: Optional[str] = None) -> bool:
         """
         Ensure a realm role exists, creating it if necessary.
-        
+
         Args:
             role_name: Name of the role
             description: Optional role description
-            
+
         Returns:
             True if role was created, False if it already existed
         """
         try:
             existing_roles = {r['name'] for r in self.keycloak_admin.get_realm_roles()}
-            
+
             if role_name not in existing_roles:
                 self.keycloak_admin.create_realm_role({
                     'name': role_name,
@@ -1111,20 +1113,20 @@ class KeycloakRoleManager:
         except Exception as e:
             logger.error(f"Error ensuring realm role {role_name} exists: {e}")
             raise
-    
+
     def ensure_group_exists(self, group_name: str) -> tuple:
         """
         Ensure a group exists, creating it if necessary.
-        
+
         Args:
             group_name: Name of the group
-            
+
         Returns:
             Tuple of (group_id, created) where created=True if group was newly created, False if already existed
         """
         try:
             groups = {g['name']: g['id'] for g in self.keycloak_admin.get_groups()}
-            
+
             if group_name not in groups:
                 self.keycloak_admin.create_group({'name': group_name})
                 groups = {g['name']: g['id'] for g in self.keycloak_admin.get_groups()}
@@ -1136,29 +1138,29 @@ class KeycloakRoleManager:
         except Exception as e:
             logger.error(f"Error ensuring group {group_name} exists: {e}")
             raise
-    
+
     def assign_role_to_group(self, role_name: str, group_name: str) -> bool:
         """
         Assign a realm role to a group.
-        
+
         Args:
             role_name: Name of the role to assign
             group_name: Name of the group
-            
+
         Returns:
             True if assignment was made, False if already assigned
         """
         try:
             # Ensure group exists and get its ID
             group_id, _ = self.ensure_group_exists(group_name)  # Unpack tuple, ignore created flag
-            
+
             # Get the role object
             role = self.keycloak_admin.get_realm_role(role_name)
-            
+
             # Check if already assigned
             group_roles = self.keycloak_admin.get_group_realm_roles(group_id)
             group_role_names = {r['name'] for r in group_roles}
-            
+
             if role_name not in group_role_names:
                 self.keycloak_admin.assign_group_realm_roles(group_id, [role])
                 logger.info(f"Assigned role {role_name} to group {group_name}")
@@ -1169,18 +1171,18 @@ class KeycloakRoleManager:
         except Exception as e:
             logger.error(f"Error assigning role {role_name} to group {group_name}: {e}")
             raise
-    
+
     def sync_roles_and_principals(self, role_principals_dict: Dict[str, Any]) -> Dict[str, List]:
         """
         Sync roles and assignments to groups and users from a dictionary.
-        
+
         Args:
             role_principals_dict: Dictionary mapping role names to dicts with 'groups' and 'users' keys
                 {
                     'role_name': {'groups': [...], 'users': [...]},
                     ...
                 }
-                
+
         Returns:
             Dictionary with 'created_roles', 'created_groups', 'created_mappings', and 'failed' lists
         """
@@ -1193,10 +1195,10 @@ class KeycloakRoleManager:
             'existing_mappings': [],
             'failed': []
         }
-        
+
         # Track groups we've already processed to avoid duplicates
         processed_groups = set()
-        
+
         for role_name, mapping in role_principals_dict.items():
             groups = mapping.get('groups', [])
             users = mapping.get('users', [])
@@ -1225,10 +1227,10 @@ class KeycloakRoleManager:
                         else:
                             results['existing_groups'].append(group_name)
                         processed_groups.add(group_name)
-                    
+
                     # Now assign the role to the group
                     assigned = self._assign_role_to_principal(role_name, group_name, 'group')
-                    
+
                     mapping_obj = {'role': role_name, 'principal': group_name, 'type': 'group'}
                     if assigned:
                         results['created_mappings'].append(mapping_obj)

@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install "ruff>=0.4"
+
+      - name: Lint
+        run: ruff check .
+
+  test-data-iceberg-migrator:
+    needs: lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: data-iceberg-migrator
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install ".[dev]"
+        working-directory: .
+
+      - name: Run tests
+        run: >
+          pytest tests/
+          --cov
+          --cov-report=term-missing
+          --cov-report=xml:coverage.xml
+
+      - name: Label coverage package
+        if: always()
+        run: sed -i 's/package name="\."/package name="data-iceberg-migrator"/' coverage.xml
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          echo '## data-iceberg-migrator coverage' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f .coverage ]; then
+            coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '_No coverage data available (tests may have failed)._' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: coverage-data-iceberg-migrator
+          path: data-iceberg-migrator/coverage.xml
+
+  test-ranger-policies-generator:
+    needs: lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ranger-policies-generator
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install ".[dev]"
+        working-directory: .
+
+      - name: Run tests
+        run: >
+          pytest tests/
+          --cov
+          --cov-report=term-missing
+          --cov-report=xml:coverage.xml
+
+      - name: Label coverage package
+        if: always()
+        run: sed -i 's/package name="\."/package name="ranger-policies-generator"/' coverage.xml
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          echo '## ranger-policies-generator coverage' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f .coverage ]; then
+            coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '_No coverage data available (tests may have failed)._' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: coverage-ranger-policies-generator
+          path: ranger-policies-generator/coverage.xml
+
+  coverage-report:
+    if: "!cancelled() && github.event_name == 'pull_request'"
+    needs: [test-data-iceberg-migrator, test-ranger-policies-generator]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: coverage-*
+          path: coverage
+
+      - name: Check for coverage data
+        id: check
+        run: |
+          if find coverage -name 'coverage.xml' 2>/dev/null | grep -q .; then
+            echo "has_data=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No coverage XML files found. Skipping report generation."
+            echo "has_data=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate report
+        if: steps.check.outputs.has_data == 'true'
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename: "coverage/**/coverage.xml"
+          badge: true
+          format: markdown
+          output: both
+          thresholds: "60 80"
+
+      - name: Post PR comment
+        if: steps.check.outputs.has_data == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          MARKER="<!-- coverage-report -->"
+          BODY="${MARKER}"$'\n'"$(cat code-coverage-results.md)"
+
+          EXISTING=$(gh api "repos/${REPO}/issues/${PR}/comments" \
+            --jq "[.[] | select(.body | startswith(\"${MARKER}\")) | .id] | first // empty")
+
+          if [ -n "$EXISTING" ]; then
+            gh api "repos/${REPO}/issues/comments/${EXISTING}" -X DELETE
+          fi
+          gh api "repos/${REPO}/issues/${PR}/comments" -f body="$BODY"
+

@@ -263,14 +263,21 @@ Both policies work together to provide secure, filtered access. You specify a ro
 
 ## Running Tests
 
-From the repo root, install dev dependencies and run the test suite with coverage:
+From the repo root, install dev dependencies:
 
 ```bash
-pip install pytest pytest-cov
-pytest ranger-policies-generator/tests/ --cov --cov-report=term-missing
+pip install ".[dev]"
 ```
 
-Coverage settings (source, omits, 80% threshold) are configured in `pyproject.toml`.
+Run the test suite from the project directory:
+
+```bash
+cd ranger-policies-generator
+pytest tests/           # fast, no coverage
+pytest tests/ --cov     # with coverage
+```
+
+Coverage settings (source, 80% threshold) are configured in `.coveragerc`.
 
 
 ## Notes for Dev

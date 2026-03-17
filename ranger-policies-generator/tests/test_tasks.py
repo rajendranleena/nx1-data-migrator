@@ -288,7 +288,7 @@ class TestFinalizePolicyRun:
         parsed, ranger, keycloak = self._make_inputs()
 
         with patch.object(dag_module, "get_config", return_value=_CONFIG):
-            result = fn("run_001", "dag_run_1", "s3a://b/f.xlsx", parsed, ranger, keycloak, spark)
+            fn("run_001", "dag_run_1", "s3a://b/f.xlsx", parsed, ranger, keycloak, spark)
 
         update_sql = spark.sql.call_args_list[0][0][0]
         assert "policy_tracking.tracking_ranger_policy_runs" in update_sql
@@ -390,9 +390,9 @@ class TestGeneratePolicyReport:
         spark = MagicMock()
         spark.sql.return_value.collect.return_value = []
 
-        with patch.object(dag_module, "get_config", return_value=_CONFIG):
-            with pytest.raises(ValueError, match="No run found"):
-                fn("run_missing", [], spark)
+        with (patch.object(dag_module, "get_config", return_value=_CONFIG),
+              pytest.raises(ValueError, match="No run found")):
+            fn("run_missing", [], spark)
 
 
 class TestSendPolicyReportEmail:

@@ -8,17 +8,17 @@ Usage:
     python spark_migration_scanner.py /path/to/project --output migration_report.md
 """
 
+import argparse
+import json
+import logging
 import os
 import re
-import json
-import argparse
-import logging
 import sys
-from dataclasses import dataclass, field, asdict
+from collections import defaultdict
+from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional
-from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(
@@ -431,11 +431,11 @@ SPARK_SQL_RULES = [
         pattern=re.compile(r"date_format\s*\([^)]*['\"][^'\"]*[YDHMS][^'\"]*['\"]", re.IGNORECASE),
         suggestion="Use Java 8 datetime patterns: 'yyyy-MM-dd' not 'YYYY-MM-DD'",
     ),
-    
+
     # ==========================================================================
     # HIVE SET COMMANDS AND PROPERTIES TO REMOVE
     # ==========================================================================
-    
+
     # Hive Execution Engine Properties
     ScanRule(
         rule_id="HIVE-001",
@@ -737,7 +737,7 @@ SPARK_SQL_RULES = [
         suggestion="Remove hive.resultset.* properties; not applicable to Spark",
         file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
     ),
-    
+
     # Generic Hive SET pattern (catch-all)
     ScanRule(
         rule_id="HIVE-099",
@@ -749,7 +749,7 @@ SPARK_SQL_RULES = [
         suggestion="Review and remove Hive-specific properties; migrate to Spark equivalents",
         file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
     ),
-    
+
     # MapReduce SET properties (often in legacy Hive scripts)
     ScanRule(
         rule_id="HIVE-100",
@@ -791,7 +791,7 @@ SPARK_SQL_RULES = [
         suggestion="Remove tez.* properties; Spark does not use Tez",
         file_extensions=(".sql", ".hql", ".py", ".scala", ".java")
     ),
-    
+
     # Additional Hive-specific SQL patterns
     ScanRule(
         rule_id="HIVE-110",
@@ -1076,7 +1076,7 @@ HDFS_TO_S3_RULES = [
         pattern=re.compile(r'["\'](?:/user/|/tmp/|/data/|/warehouse/)[^"\']*["\']'),
         suggestion="Use configurable base paths: s3a://bucket/user/, s3a://bucket/tmp/",
     ),
-    
+
     # S3-Specific Configurations
     ScanRule(
         rule_id="S3-010",
@@ -1115,7 +1115,7 @@ HDFS_TO_S3_RULES = [
         pattern=re.compile(r'dfs\.blocksize|dfs\.block\.size'),
         suggestion="Remove HDFS block size configs; use fs.s3a.block.size if needed",
     ),
-    
+
     # S3 Performance Considerations
     ScanRule(
         rule_id="S3-020",
@@ -1162,7 +1162,7 @@ HDFS_TO_S3_RULES = [
         pattern=re.compile(r'spark\.speculation\s*[=:]\s*true'),
         suggestion="Disable speculation or use idempotent committers with S3",
     ),
-    
+
     # S3 Consistency and Transactions
     ScanRule(
         rule_id="S3-030",
@@ -1182,7 +1182,7 @@ HDFS_TO_S3_RULES = [
         pattern=re.compile(r'\.exists\s*\([^)]+\)\s*(?:&&|\|\||if|then|and|or|and then)'),
         suggestion="Use conditional writes or external locking for atomic operations",
     ),
-    
+
     # Table Format Recommendations
     ScanRule(
         rule_id="S3-040",
@@ -1194,7 +1194,7 @@ HDFS_TO_S3_RULES = [
         suggestion="Consider Delta Lake, Iceberg, or Hudi for ACID transactions on S3",
         documentation_url="https://iceberg.apache.org/docs/latest/"
     ),
-    
+
     # Security and Auth
     ScanRule(
         rule_id="S3-050",
@@ -1413,7 +1413,7 @@ JDK_MIGRATION_RULES = [
         suggestion="Use container-based security, OS-level sandboxing, or module system",
         documentation_url="https://openjdk.org/jeps/411"
     ),
-    
+
     # Strong Encapsulation Issues
     ScanRule(
         rule_id="JDK-020",
@@ -1460,7 +1460,7 @@ JDK_MIGRATION_RULES = [
         pattern=re.compile(r'getDeclaredField|getDeclaredMethod|getDeclaredConstructor'),
         suggestion="Review reflective access; may need --add-opens for platform classes",
     ),
-    
+
     # JVM Flags and Options
     ScanRule(
         rule_id="JDK-030",
@@ -1564,7 +1564,7 @@ JDK_MIGRATION_RULES = [
         suggestion="Remove flag; biased locking provides minimal benefit on modern hardware",
         documentation_url="https://openjdk.org/jeps/374"
     ),
-    
+
     # API Changes
     ScanRule(
         rule_id="JDK-050",
@@ -1666,7 +1666,7 @@ JDK_MIGRATION_RULES = [
         pattern=re.compile(r'"""'),
         suggestion="Text blocks are production-ready in JDK 15+",
     ),
-    
+
     # Module System Issues
     ScanRule(
         rule_id="JDK-070",
@@ -1724,7 +1724,7 @@ PYTHON_MIGRATION_RULES = [
         suggestion="Use print(message, file=sys.stderr)",
         file_extensions=(".py",)
     ),
-    
+
     # Division
     ScanRule(
         rule_id="PY-010",
@@ -1736,7 +1736,7 @@ PYTHON_MIGRATION_RULES = [
         suggestion="Use // for integer division; verify / behavior is intended",
         file_extensions=(".py",)
     ),
-    
+
     # Unicode/Strings
     ScanRule(
         rule_id="PY-020",
@@ -1778,7 +1778,7 @@ PYTHON_MIGRATION_RULES = [
         suggestion="Explicitly specify encoding: .encode('utf-8')",
         file_extensions=(".py",)
     ),
-    
+
     # Iterators and Ranges
     ScanRule(
         rule_id="PY-030",
@@ -1840,7 +1840,7 @@ PYTHON_MIGRATION_RULES = [
         suggestion="Use functools.reduce() or rewrite with explicit loop",
         file_extensions=(".py",)
     ),
-    
+
     # Imports
     ScanRule(
         rule_id="PY-040",
@@ -1942,7 +1942,7 @@ PYTHON_MIGRATION_RULES = [
         suggestion="Use: import tkinter",
         file_extensions=(".py",)
     ),
-    
+
     # Exception Handling
     ScanRule(
         rule_id="PY-050",
@@ -1974,7 +1974,7 @@ PYTHON_MIGRATION_RULES = [
         suggestion="Use Exception as base class",
         file_extensions=(".py",)
     ),
-    
+
     # Comparisons
     ScanRule(
         rule_id="PY-060",
@@ -2006,7 +2006,7 @@ PYTHON_MIGRATION_RULES = [
         suggestion="Ensure type consistency in comparisons",
         file_extensions=(".py",)
     ),
-    
+
     # Classes
     ScanRule(
         rule_id="PY-070",
@@ -2048,7 +2048,7 @@ PYTHON_MIGRATION_RULES = [
         suggestion="Can simplify to super() in Python 3",
         file_extensions=(".py",)
     ),
-    
+
     # Builtins
     ScanRule(
         rule_id="PY-080",
@@ -2140,7 +2140,7 @@ PYTHON_MIGRATION_RULES = [
         suggestion="Use: sys.intern()",
         file_extensions=(".py",)
     ),
-    
+
     # File Handling
     ScanRule(
         rule_id="PY-090",
@@ -2162,7 +2162,7 @@ PYTHON_MIGRATION_RULES = [
         suggestion="Use 'rb', 'wb' for binary; 'r', 'w' for text with encoding",
         file_extensions=(".py",)
     ),
-    
+
     # Operators and Syntax
     ScanRule(
         rule_id="PY-100",
@@ -2194,7 +2194,7 @@ PYTHON_MIGRATION_RULES = [
         suggestion="Use 0o prefix for octal: 0o755 instead of 0755",
         file_extensions=(".py",)
     ),
-    
+
     # PySpark-Specific Python 3
     ScanRule(
         rule_id="PY-110",
@@ -2243,31 +2243,31 @@ ALL_RULES = (
 
 class SparkMigrationScanner:
     """Scanner for Spark 2.4 -> 3.5 and HDFS -> S3 migration issues."""
-    
+
     def __init__(self, rules: list[ScanRule] = None):
         self.rules = rules or ALL_RULES
         self.issues: list[Issue] = []
         self.files_scanned = 0
         self.lines_scanned = 0
-    
+
     def scan_file(self, file_path: Path) -> list[Issue]:
         """Scan a single file for migration issues."""
         issues = []
-        
+
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
         except Exception as e:
             logger.warning(f"Could not read {file_path}: {e}")
             return issues
-        
+
         self.lines_scanned += len(lines)
-        
+
         for rule in self.rules:
             # Check file extension
             if not str(file_path).endswith(rule.file_extensions):
                 continue
-            
+
             for line_num, line in enumerate(lines, 1):
                 if rule.pattern.search(line):
                     issue = Issue(
@@ -2283,39 +2283,39 @@ class SparkMigrationScanner:
                         documentation_url=rule.documentation_url
                     )
                     issues.append(issue)
-        
+
         return issues
-    
+
     def scan_directory(self, directory: Path, exclude_patterns: list[str] = None) -> list[Issue]:
         """Recursively scan a directory for migration issues."""
         exclude_patterns = exclude_patterns or [
             '__pycache__', '.git', 'node_modules', '.venv', 'venv',
             'target', 'build', 'dist', '.idea', '.vscode', '*.pyc'
         ]
-        
+
         all_issues = []
-        
+
         logger.debug(f"Scanning directory: {directory}")
         logger.debug(f"Exclude patterns: {exclude_patterns}")
-        
+
         for root, dirs, files in os.walk(directory):
             # Filter excluded directories
             dirs[:] = [d for d in dirs if not any(
                 d == pat or (pat.startswith('*') and d.endswith(pat[1:]))
                 for pat in exclude_patterns
             )]
-            
+
             for file in files:
                 file_path = Path(root) / file
-                
+
                 # Skip excluded files
                 if any(file == pat or (pat.startswith('*') and file.endswith(pat[1:]))
                        for pat in exclude_patterns):
                     continue
-                
+
                 # Check if file has scannable extension
-                if any(str(file_path).endswith(ext) 
-                       for ext in ('.py', '.scala', '.java', '.sql', '.conf', 
+                if any(str(file_path).endswith(ext)
+                       for ext in ('.py', '.scala', '.java', '.sql', '.conf',
                                    '.properties', '.xml', '.yaml', '.yml', '.sbt', '.gradle', '.hql')):
                     self.files_scanned += 1
                     logger.debug(f"Scanning file: {file_path}")
@@ -2323,11 +2323,11 @@ class SparkMigrationScanner:
                     all_issues.extend(issues)
                     if issues:
                         logger.debug(f"  Found {len(issues)} issues in {file_path}")
-        
+
         self.issues = all_issues
         logger.debug(f"Directory scan complete. Total issues: {len(all_issues)}")
         return all_issues
-    
+
     def scan_path(self, path: str) -> list[Issue]:
         """Scan a file or directory."""
         p = Path(path)
@@ -2339,16 +2339,16 @@ class SparkMigrationScanner:
             return self.scan_directory(p)
         else:
             raise ValueError(f"Path does not exist: {path}")
-    
+
     def get_summary(self) -> dict:
         """Get summary statistics of the scan."""
         severity_counts = defaultdict(int)
         category_counts = defaultdict(int)
-        
+
         for issue in self.issues:
             severity_counts[issue.severity.value] += 1
             category_counts[issue.category.value] += 1
-        
+
         return {
             "files_scanned": self.files_scanned,
             "lines_scanned": self.lines_scanned,
@@ -2356,11 +2356,11 @@ class SparkMigrationScanner:
             "by_severity": dict(severity_counts),
             "by_category": dict(category_counts)
         }
-    
+
     def to_markdown(self) -> str:
         """Generate markdown report."""
         summary = self.get_summary()
-        
+
         lines = [
             "# Spark Migration Scan Report",
             "",
@@ -2375,7 +2375,7 @@ class SparkMigrationScanner:
             "### Issues by Severity",
             "",
         ]
-        
+
         severity_order = ['critical', 'high', 'medium', 'low', 'info']
         severity_emoji = {
             'critical': '🔴',
@@ -2384,26 +2384,26 @@ class SparkMigrationScanner:
             'low': '🔵',
             'info': 'ℹ️'
         }
-        
+
         for sev in severity_order:
             count = summary['by_severity'].get(sev, 0)
             if count > 0:
                 lines.append(f"- {severity_emoji.get(sev, '')} **{sev.upper()}:** {count}")
-        
+
         lines.extend([
             "",
             "### Issues by Category",
             "",
         ])
-        
+
         for cat, count in sorted(summary['by_category'].items(), key=lambda x: -x[1]):
             lines.append(f"- **{cat}:** {count}")
-        
+
         # Group issues by category and severity
         issues_by_category = defaultdict(list)
         for issue in self.issues:
             issues_by_category[issue.category.value].append(issue)
-        
+
         lines.extend([
             "",
             "---",
@@ -2411,25 +2411,25 @@ class SparkMigrationScanner:
             "## Detailed Findings",
             "",
         ])
-        
+
         for category in Category:
             cat_issues = issues_by_category.get(category.value, [])
             if not cat_issues:
                 continue
-            
+
             lines.extend([
                 f"### {category.value}",
                 "",
             ])
-            
+
             # Sort by severity
             cat_issues.sort(key=lambda x: severity_order.index(x.severity.value))
-            
+
             # Group by rule
             issues_by_rule = defaultdict(list)
             for issue in cat_issues:
                 issues_by_rule[issue.rule_id].append(issue)
-            
+
             for rule_id, rule_issues in issues_by_rule.items():
                 first = rule_issues[0]
                 lines.extend([
@@ -2440,25 +2440,25 @@ class SparkMigrationScanner:
                     f"**Suggestion:** {first.suggestion}",
                     "",
                 ])
-                
+
                 if first.documentation_url:
                     lines.append(f"**Documentation:** [{first.documentation_url}]({first.documentation_url})")
                     lines.append("")
-                
+
                 lines.append("**Occurrences:**")
                 lines.append("")
-                
+
                 for issue in rule_issues[:20]:  # Limit to first 20 occurrences per rule
                     lines.append(f"- `{issue.file_path}:{issue.line_number}`")
-                    lines.append(f"  ```")
+                    lines.append("  ```")
                     lines.append(f"  {issue.line_content}")
-                    lines.append(f"  ```")
-                
+                    lines.append("  ```")
+
                 if len(rule_issues) > 20:
                     lines.append(f"- ... and {len(rule_issues) - 20} more occurrences")
-                
+
                 lines.append("")
-        
+
         # Add migration checklist
         lines.extend([
             "---",
@@ -2524,31 +2524,31 @@ class SparkMigrationScanner:
             "- [ ] Test sorting with None values",
             "",
         ])
-        
+
         return '\n'.join(lines)
-    
+
     def to_json(self) -> str:
         """Generate JSON report."""
         summary = self.get_summary()
-        
+
         issues_data = []
         for issue in self.issues:
             issue_dict = asdict(issue)
             issue_dict['severity'] = issue.severity.value
             issue_dict['category'] = issue.category.value
             issues_data.append(issue_dict)
-        
+
         report = {
             "summary": summary,
             "issues": issues_data
         }
-        
+
         return json.dumps(report, indent=2)
-    
+
     def to_html(self) -> str:
         """Generate HTML report."""
         summary = self.get_summary()
-        
+
         severity_colors = {
             'critical': '#dc3545',
             'high': '#fd7e14',
@@ -2556,7 +2556,7 @@ class SparkMigrationScanner:
             'low': '#17a2b8',
             'info': '#6c757d'
         }
-        
+
         html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2587,7 +2587,7 @@ class SparkMigrationScanner:
     <div class="container">
         <h1>🔍 Spark Migration Scan Report</h1>
         <p><strong>Generated:</strong> {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-        
+
         <div class="summary">
             <div class="stat-card">
                 <div class="number">{summary['files_scanned']:,}</div>
@@ -2602,53 +2602,53 @@ class SparkMigrationScanner:
                 <div class="label">Issues Found</div>
             </div>
         </div>
-        
+
         <h2>Issues by Severity</h2>
         <table>
             <tr><th>Severity</th><th>Count</th></tr>
 '''
-        
+
         for sev in ['critical', 'high', 'medium', 'low', 'info']:
             count = summary['by_severity'].get(sev, 0)
             color = severity_colors.get(sev, '#666')
             html += f'            <tr><td><span class="severity-badge" style="background:{color}">{sev.upper()}</span></td><td>{count}</td></tr>\n'
-        
+
         html += '''        </table>
-        
+
         <h2>Issues by Category</h2>
         <table>
             <tr><th>Category</th><th>Count</th></tr>
 '''
-        
+
         for cat, count in sorted(summary['by_category'].items(), key=lambda x: -x[1]):
             html += f'            <tr><td>{cat}</td><td>{count}</td></tr>\n'
-        
+
         html += '''        </table>
-        
+
         <h2>Detailed Findings</h2>
 '''
-        
+
         # Group by category
         issues_by_category = defaultdict(list)
         for issue in self.issues:
             issues_by_category[issue.category.value].append(issue)
-        
+
         for category in Category:
             cat_issues = issues_by_category.get(category.value, [])
             if not cat_issues:
                 continue
-            
+
             html += f'        <h3>{category.value} ({len(cat_issues)} issues)</h3>\n'
-            
+
             # Group by rule
             issues_by_rule = defaultdict(list)
             for issue in cat_issues:
                 issues_by_rule[issue.rule_id].append(issue)
-            
+
             for rule_id, rule_issues in issues_by_rule.items():
                 first = rule_issues[0]
                 color = severity_colors.get(first.severity.value, '#666')
-                
+
                 html += f'''        <div class="issue" style="border-color:{color}">
             <strong><span class="severity-badge" style="background:{color}">{first.severity.value.upper()}</span> [{rule_id}] {first.title}</strong>
             <p>{first.description}</p>
@@ -2658,18 +2658,18 @@ class SparkMigrationScanner:
 '''
                 for issue in rule_issues[:10]:
                     html += f'                <li><code>{issue.file_path}:{issue.line_number}</code><pre>{issue.line_content}</pre></li>\n'
-                
+
                 if len(rule_issues) > 10:
                     html += f'                <li><em>... and {len(rule_issues) - 10} more</em></li>\n'
-                
+
                 html += '''            </ul>
         </div>
 '''
-        
+
         html += '''    </div>
 </body>
 </html>'''
-        
+
         return html
 
 
@@ -2690,51 +2690,51 @@ def main():
                         help='Enable verbose/debug logging')
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Suppress info messages, only show warnings and errors')
-    
+
     args = parser.parse_args()
-    
+
     # Configure logging level based on arguments
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     elif args.quiet:
         logging.getLogger().setLevel(logging.WARNING)
-    
+
     # Filter rules if specified
     rules = ALL_RULES
-    
+
     if args.severity:
         severity_order = ['critical', 'high', 'medium', 'low', 'info']
         min_idx = severity_order.index(args.severity)
         rules = [r for r in rules if severity_order.index(r.severity.value) <= min_idx]
         logger.debug(f"Filtered to {len(rules)} rules with severity >= {args.severity}")
-    
+
     if args.category:
         rules = [r for r in rules if r.category.value in args.category]
         logger.debug(f"Filtered to {len(rules)} rules in categories: {args.category}")
-    
+
     # Run scanner
     scanner = SparkMigrationScanner(rules)
-    
+
     logger.info(f"Scanning {args.path}...")
-    
+
     try:
         scanner.scan_path(args.path)
     except ValueError as e:
         logger.error(str(e))
         sys.exit(1)
-    
+
     summary = scanner.get_summary()
     logger.info("Scan complete!")
     logger.info(f"  Files scanned: {summary['files_scanned']:,}")
     logger.info(f"  Lines scanned: {summary['lines_scanned']:,}")
     logger.info(f"  Issues found:  {summary['total_issues']:,}")
-    
+
     # Log severity breakdown at debug level
     if summary['by_severity']:
         logger.debug("Issues by severity:")
         for sev, count in sorted(summary['by_severity'].items()):
             logger.debug(f"    {sev}: {count}")
-    
+
     # Generate report
     if args.format == 'md':
         report = scanner.to_markdown()
@@ -2742,7 +2742,7 @@ def main():
         report = scanner.to_json()
     else:
         report = scanner.to_html()
-    
+
     # Output
     if args.output:
         try:

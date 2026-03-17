@@ -7,16 +7,14 @@ Generates an HTML report matching the project's existing report style.
 """
 
 import argparse
-import ast
 import os
 import re
-import sys
 import shutil
-from dataclasses import dataclass, field
+import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-
 
 # ---------------------------------------------------------------------------
 # Migration Rule Definitions
@@ -865,23 +863,26 @@ class Airflow3MigrationScanner:
                 severity="BREAKING",
                 old_code=stripped,
                 new_code=new_code,
-                description=f"days_ago() removed; use pendulum",
+                description="days_ago() removed; use pendulum",
             ))
 
     def _check_dataset_usage(self, file: str, line_num: int, stripped: str, original: str):
         # Check for Dataset( instantiation (not in import lines)
-        if not stripped.startswith("from ") and not stripped.startswith("import "):
-            if re.search(r"\bDataset\s*\(", stripped):
-                new_code = re.sub(r"\bDataset\b", "Asset", stripped)
-                self.findings.append(MigrationFinding(
-                    file=file,
-                    line=line_num,
-                    category="Assets Rename",
-                    severity="BREAKING",
-                    old_code=stripped,
-                    new_code=new_code,
-                    description="Dataset renamed to Asset in Airflow 3",
-                ))
+        if (
+            not stripped.startswith("from ")
+            and not stripped.startswith("import ")
+            and re.search(r"\bDataset\s*\(", stripped)
+        ):
+            new_code = re.sub(r"\bDataset\b", "Asset", stripped)
+            self.findings.append(MigrationFinding(
+                file=file,
+                line=line_num,
+                category="Assets Rename",
+                severity="BREAKING",
+                old_code=stripped,
+                new_code=new_code,
+                description="Dataset renamed to Asset in Airflow 3",
+            ))
 
     def _check_use_dill(self, file: str, line_num: int, stripped: str, original: str):
         if re.search(r"\buse_dill\s*=", stripped):
@@ -1083,7 +1084,6 @@ def generate_html_report(
     applied = sum(1 for f in findings if f.applied)
 
     category_counts = Counter(f.category for f in findings)
-    severity_counts = Counter(f.severity for f in findings)
     file_counts = Counter(f.file for f in findings)
 
     mode_label = "DRY RUN" if dry_run else "MIGRATION APPLIED"
