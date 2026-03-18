@@ -1,0 +1,6 @@
+[run]
+source = migration_dags_combined
+
+[report]
+fail_under = 80
+show_missing = true

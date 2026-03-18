@@ -58,11 +58,11 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 
 ## DAG Parameter Details
 
-| DAG   | Parameter         | Required | Description               | Example                                      |
-| ----- | ----------------- | -------- | ------------------------- | -------------------------------------------- |
-| DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config   | `s3a://config-bucket/migration.xlsx`         |
-| DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config | `s3a://config-bucket/iceberg_migration.xlsx` |
-| DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config | `s3a://config-bucket/folder_copy.xlsx`   |
+| DAG   | Parameter         | Required | Description                   | Example                                      |
+| ----- | ----------------- | -------- | ----------------------------- | -------------------------------------------- |
+| DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config       | `s3a://config-bucket/migration.xlsx`         |
+| DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config     | `s3a://config-bucket/iceberg_migration.xlsx` |
+| DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config | `s3a://config-bucket/folder_copy.xlsx`       |
 
 ---
 
@@ -958,11 +958,11 @@ Copies raw folders from MapR-FS/HDFS to S3 using Hadoop DistCp via SSH, with no 
 
 **Required Columns:**
 
-| Column          | Required | Description                                             | Example                        |
-| --------------- | -------- | ------------------------------------------------------- | ------------------------------ |
-| `source_path`   | **Yes**  | Full MapR/HDFS source path                              | `/mapr/cluster1/data/raw/sales` |
-| `target_bucket` | **Yes**  | S3 bucket — normalised to `s3a://`                      | `s3a://data-lake`              |
-| `dest_folder`   | No       | Destination folder inside the bucket; defaults to the basename of `source_path` if not specified | `sales` |
+| Column          | Required | Description                                                                                      | Example                         |
+| --------------- | -------- | ------------------------------------------------------------------------------------------------ | ------------------------------- |
+| `source_path`   | **Yes**  | Full MapR/HDFS source path                                                                       | `/mapr/cluster1/data/raw/sales` |
+| `target_bucket` | **Yes**  | S3 bucket — normalised to `s3a://`                                                               | `s3a://data-lake`               |
+| `dest_folder`   | No       | Destination folder inside the bucket; defaults to the basename of `source_path` if not specified | `sales`                         |
 
 **Default Behaviour:**
 
@@ -1043,6 +1043,22 @@ send_data_copy_report_email
 
 #### Step 2 - `init_folder_copy_tracking_tables`
 
+**Type:** SSH
+**Purpose:** Validate SSH connectivity and Hadoop tooling before starting the folder copy
+
+- Connects to the cluster edge node via SSH
+- Runs three sequential checks:
+  1. **SSH Connectivity** — verifies SSH connection with a simple echo command
+  2. **Hadoop DistCp** — checks `hadoop distcp` is available on the edge node
+  3. **Hadoop FS** — verifies `hadoop fs -ls /` executes successfully
+- Sources `~/.profile` before each check to ensure environment variables are loaded
+- If **all checks pass**, returns a `checks` dict and proceeds
+- If **any check fails**, raises an exception with a detailed summary, halting the DAG before any tracking tables or run records are created
+
+---
+
+#### Step 2 - `init_folder_copy_tracking_tables`
+
 **Type:** PySpark
 **Purpose:** Create `data_copy_runs` and `data_copy_status` Iceberg tables if they do not exist
 
@@ -1074,6 +1090,14 @@ send_data_copy_report_email
 
 **Type:** SSH
 **Purpose:** Authenticate with the cluster edge node and set up the session environment
+
+- Receives the tracking `run_id` (same pattern as DAG 1 and DAG 2)
+- Performs cluster authentication using the configured `auth_method` (`mapr`, `kinit`, or `none`)
+- Returns a `cluster_setup` dict consumed by downstream SSH tasks
+
+---
+
+#### Step 6 - `run_folder_distcp_ssh`
 
 - Receives the tracking `run_id` (same pattern as DAG 1 and DAG 2)
 - Performs cluster authentication using the configured `auth_method` (`mapr`, `kinit`, or `none`)
@@ -1172,13 +1196,161 @@ COMPLETED_WITH_ERRORS
 
 **Per-folder statuses (data_copy_status):**
 
-| Status               | Meaning                                              |
-| -------------------- | ---------------------------------------------------- |
-| `COMPLETED`          | DistCp succeeded (before validation)                 |
-| `VALIDATED`          | Destination verified — file count and size match     |
-| `VALIDATION_FAILED`  | Destination exists but file count or size mismatch   |
-| `VALIDATION_SKIPPED` | Copy step failed — validation not attempted          |
-| `FAILED`             | DistCp failed                                        |
+| Status               | Meaning                                            |
+| -------------------- | -------------------------------------------------- |
+| `COMPLETED`          | DistCp succeeded (before validation)               |
+| `VALIDATED`          | Destination verified — file count and size match   |
+| `VALIDATION_FAILED`  | Destination exists but file count or size mismatch |
+| `VALIDATION_SKIPPED` | Copy step failed — validation not attempted        |
+| `FAILED`             | DistCp failed                                      |
+
+---
+
+## Notes for Dev
+
+Env files are loaded from `/opt/airflow/utils/migration_configs/`:
+
+- `env.shared` — shared config (S3, SSH, Spark credentials, etc.)
+- `env.<dag_stem>` — per-developer overrides (e.g. `env.migration_dags_combined`)
+
+Copy the `env.*.example` files there, drop the `.example` suffix, and fill in your values. If the directory doesn't exist the DAG logs a warning and falls back to Airflow Variables / defaults.
+
+Config resolution: Airflow Variable → `os.getenv()` → hardcoded default in `get_config()`.
+
+---
+
+## Unit Tests
+
+### Running Tests
+
+**Install test dependencies (from repo root):**
+
+```bash
+pip install ".[dev]"
+```
+
+**Run the full suite:**
+
+```bash
+pytest tests/
+```
+
+**Run a specific test file:**
+
+```bash
+pytest tests/test_dag1_tasks.py
+pytest tests/test_dag2_tasks.py
+pytest tests/test_dag3_tasks.py
+pytest tests/test_dag_integrity.py
+pytest tests/test_utils.py
+```
+
+**Run with coverage report:**
+
+```bash
+pytest tests/ --cov
+```
+
+---
+
+### Test Dependencies
+
+All test dependencies are in the `dev` extra of the root `pyproject.toml`. No Airflow, PySpark, or Java installation is needed.
+
+| Package          | Purpose                                     |
+| ---------------- | ------------------------------------------- |
+| `pytest>=7.4.0`  | Test runner                                 |
+| `pytest-cov`     | Coverage reporting                          |
+| `pytest-mock`    | Mock utilities                              |
+| `pytest-timeout` | Per-test 60-second timeout                  |
+| `openpyxl`       | Excel parsing (used by DAG and parse tests) |
+| `python-dotenv`  | Environment config (stubbed in tests)       |
+
+---
+
+### Test Files
+
+| File                     | Tests  | Covers                                                                                                                                                                        |
+| ------------------------ | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_dag1_tasks.py`     | 37     | All DAG 1 task functions: prerequisites, tracking init, run creation, Excel parsing, SSH login, table discovery via SSH/Spark, DistCp, Hive table creation, validation, reporting, email, finalize |
+| `test_dag2_tasks.py`     | 22     | All DAG 2 task functions: tracking init, run creation, Excel parsing, Hive discovery, Iceberg migration (snapshot + inplace), validation, reporting, email, finalize           |
+| `test_dag3_tasks.py`     | 22     | All DAG 3 task functions: prerequisites, tracking init, run creation, folder Excel parsing, folder DistCp, status recording, validation, reporting, email, finalize            |
+| `test_dag_integrity.py`  | 6      | DAG IDs and params for all three DAGs (verifies module loads without import errors)                                                                                            |
+| `test_utils.py`          | 5      | `get_config()`, `@track_duration` decorator, `execute_with_iceberg_retry()`                                                                                                   |
+| **Total**                | **90** |                                                                                                                                                                               |
+
+---
+
+### Test Classes
+
+**`test_dag1_tasks.py`**
+
+| Class                           | What it tests                                                       |
+| ------------------------------- | ------------------------------------------------------------------- |
+| `TestValidatePrerequisites`     | SSH checks pass/fail                                                |
+| `TestInitTrackingTables`        | Database and table creation DDL                                     |
+| `TestCreateMigrationRun`        | Run ID format, INSERT with RUNNING status                           |
+| `TestParseExcel`                | Column parsing, bucket normalisation, wildcard handling, tokenising |
+| `TestClusterLoginSetup`         | Temp dir creation, exit code and marker failure handling             |
+| `TestDiscoverTablesViaSshSpark` | SSH/SFTP/PySpark discovery, JSON parsing, error handling             |
+| `TestRecordDiscoveredTables`    | INSERT vs UPDATE based on existing record count                     |
+| `TestRunDistcpSsh`              | Successful copy, incremental detection, failure path                |
+| `TestUpdateDistcpStatus`        | COPIED status on success, FAILED on error                           |
+| `TestCreateHiveTables`          | New table creation vs existing table REPAIR                         |
+| `TestUpdateTableCreateStatus`   | TABLE_CREATED status tracking                                       |
+| `TestValidateDestinationTables` | Row count match/mismatch, schema comparison                         |
+| `TestUpdateValidationStatus`    | VALIDATED vs VALIDATION_FAILED determination                        |
+| `TestGenerateHtmlReport`        | Report path, S3 write                                               |
+| `TestSendMigrationReportEmail`  | Email delivery, skip when no recipients                              |
+| `TestFinalizeRun`               | Stats aggregation, COMPLETED status                                  |
+
+**`test_dag2_tasks.py`**
+
+| Class                               | What it tests                                         |
+| ----------------------------------- | ----------------------------------------------------- |
+| `TestInitIcebergTrackingTables`     | Database and Iceberg tracking table DDL               |
+| `TestCreateIcebergMigrationRun`     | Run ID format, INSERT with RUNNING status             |
+| `TestParseIcebergExcel`             | Snapshot default, inplace flag, custom dest database  |
+| `TestDiscoverHiveTables`            | Wildcard and pattern-based table discovery            |
+| `TestMigrateTablesToIceberg`        | Snapshot and inplace migration, failure handling      |
+| `TestUpdateMigrationDurations`      | Duration tracking update                              |
+| `TestValidateIcebergTables`         | Schema match/mismatch between Hive and Iceberg        |
+| `TestUpdateIcebergValidationStatus` | VALIDATED vs VALIDATION_FAILED status                 |
+| `TestGenerateIcebergHtmlReport`     | Report path, S3 write                                 |
+| `TestSendIcebergReportEmail`        | Email delivery, skip when no recipients               |
+| `TestFinalizeIcebergRun`            | Stats aggregation, COMPLETED status                   |
+
+**`test_dag3_tasks.py`**
+
+| Class                               | What it tests                                           |
+| ----------------------------------- | ------------------------------------------------------- |
+| `TestValidatePrerequisitesFolderCopy` | SSH, DistCp, Hadoop FS availability checks            |
+| `TestInitFolderCopyTrackingTables`  | Database and folder copy tracking table DDL              |
+| `TestCreateDataCopyRun`             | Run ID format, INSERT with RUNNING status                |
+| `TestParseFolderCopyExcel`          | Row parsing, bucket normalisation, basename defaulting   |
+| `TestRunFolderDistcpSsh`            | Successful copy, mismatch detection, failure paths       |
+| `TestRecordDataCopyStatus`          | Tracking insert for completed and failed copies          |
+| `TestValidateDataCopy`              | Post-copy validation: match, missing dest, mismatch      |
+| `TestUpdateDataCopyValidation`      | VALIDATED and VALIDATION_FAILED status updates           |
+| `TestFinalizeDataCopyRun`           | COMPLETED vs COMPLETED_WITH_ERRORS determination         |
+| `TestGenerateDataCopyHtmlReport`    | Report path, S3 write                                    |
+| `TestSendDataCopyReportEmail`       | Skip when no recipients configured                       |
+
+**`test_dag_integrity.py`**
+
+| Class                          | What it tests                                |
+| ------------------------------ | -------------------------------------------- |
+| `TestMaprToS3DagIntegrity`     | DAG ID and excel_file_path param             |
+| `TestIcebergDagIntegrity`      | DAG ID and excel_file_path param             |
+| `TestFolderCopyDagIntegrity`   | DAG ID and excel_file_path param             |
+
+**`test_utils.py`**
+
+| Class                         | What it tests                                       |
+| ----------------------------- | --------------------------------------------------- |
+| `TestGetConfig`               | Variable values used, fallback to default            |
+| `TestTrackDuration`           | Duration added to result, args/kwargs preserved      |
+| `TestExecuteWithIcebergRetry` | Immediate and retry success, exhaustion after 6 tries |
 
 ---
 
