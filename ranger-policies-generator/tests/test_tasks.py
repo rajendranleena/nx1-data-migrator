@@ -498,9 +498,8 @@ class TestGeneratePolicyReport:
         spark = MagicMock()
         spark.sql.return_value.collect.return_value = []
 
-        with patch.object(dag_module, "get_config", return_value=_CONFIG):
-            with pytest.raises(ValueError, match="No run found"):
-                fn("run_missing", spark)
+        with patch.object(dag_module, "get_config", return_value=_CONFIG), pytest.raises(ValueError, match="No run found"):
+            fn("run_missing", spark)
 
 
 class TestSendPolicyReportEmail:

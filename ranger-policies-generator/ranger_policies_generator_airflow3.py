@@ -350,7 +350,7 @@ def parse_excel_rows(df) -> Dict[str, Any]:
 
         if not is_empty_like(url) and url != '-' and url != '*':
             policy_name  = url
-            policy_label = [l.strip() for l in policy_label_override.split(',') if l.strip()] if policy_label_override else None
+            policy_label = [lbl.strip() for lbl in policy_label_override.split(',') if lbl.strip()] if policy_label_override else None
             if policy_name not in policies:
                 policies[policy_name] = {'type': 'url', 'url': url, 'roles': [], 'label': policy_label}
             for binding in effective_role_bindings:
@@ -368,7 +368,7 @@ def parse_excel_rows(df) -> Dict[str, Any]:
                 for table in table_list:
                     for column in column_list:
                         policy_name  = build_policy_name('iceberg', database, table, column)
-                        policy_label = [l.strip() for l in policy_label_override.split(',') if l.strip()] if policy_label_override else None
+                        policy_label = [lbl.strip() for lbl in policy_label_override.split(',') if lbl.strip()] if policy_label_override else None
                         if policy_name not in policies:
                             policies[policy_name] = {
                                 'type':    'table',
