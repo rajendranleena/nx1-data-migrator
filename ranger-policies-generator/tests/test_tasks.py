@@ -395,7 +395,7 @@ class TestFinalizePolicyRun:
         run_metrics = self._make_run_metrics()
 
         with patch.object(dag_module, "get_config", return_value=_CONFIG):
-            result = fn("run_001", "dag_run_1", "s3a://b/f.xlsx", run_metrics, spark)
+            fn("run_001", "dag_run_1", "s3a://b/f.xlsx", run_metrics, spark)
 
         update_sql = spark.sql.call_args_list[0][0][0]
         assert "policy_tracking.tracking_ranger_policy_runs" in update_sql

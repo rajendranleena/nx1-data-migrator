@@ -6,6 +6,7 @@ do not require the apache_ranger / keycloak packages to be installed.
 """
 import sys
 from unittest.mock import MagicMock, patch
+
 import pytest
 
 
@@ -1069,15 +1070,14 @@ class TestKeycloakRoleManagerInit:
         """All retry attempts fail → raises ConnectionError."""
         keycloak_mock = MagicMock()
         keycloak_mock.KeycloakAdmin.side_effect = Exception("Connection refused")
-        with patch.dict(sys.modules, {"keycloak": keycloak_mock}):
-            with pytest.raises(ConnectionError):
-                ranger_utils_module.KeycloakRoleManager(
-                    server_url="https://kc:8080",
-                    realm_name="test",
-                    client_id="client",
-                    client_secret="secret",
-                    max_retries=1,
-                )
+        with patch.dict(sys.modules, {"keycloak": keycloak_mock}), pytest.raises(ConnectionError):
+            ranger_utils_module.KeycloakRoleManager(
+                server_url="https://kc:8080",
+                realm_name="test",
+                client_id="client",
+                client_secret="secret",
+                max_retries=1,
+            )
 
 
 # ---------------------------------------------------------------------------
