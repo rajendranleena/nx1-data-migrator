@@ -122,9 +122,54 @@ jobs:
           name: coverage-ranger-policies-generator
           path: ranger-policies-generator/coverage.xml
 
+  test-code-scanner:
+    needs: lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: code-scanner
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: Run tests
+        run: >
+          pytest tests/
+          --cov
+          --cov-report=term-missing
+          --cov-report=xml:coverage.xml
+
+      - name: Label coverage package
+        if: always()
+        run: sed -i 's/package name=\"\.\"/package name=\"code-scanner\"/' coverage.xml
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          echo '## code-scanner coverage' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f .coverage ]; then
+            coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '_No coverage data available (tests may have failed)._' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: coverage-code-scanner
+          path: code-scanner/coverage.xml
+
   coverage-report:
     if: "!cancelled() && github.event_name == 'pull_request'"
-    needs: [test-data-iceberg-migrator, test-ranger-policies-generator]
+    needs: [test-data-iceberg-migrator, test-ranger-policies-generator, test-code-scanner]
     runs-on: ubuntu-latest
     permissions:
       contents: read

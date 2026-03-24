@@ -1,0 +1,6 @@
+# .coveragerc
+[run]
+include = code-scanner.py
+
+[report]
+fail_under = 80
