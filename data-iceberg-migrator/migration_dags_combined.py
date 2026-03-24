@@ -396,25 +396,6 @@ def init_tracking_tables(spark) -> dict:
             LOCATION '{tracking_loc}/migration_table_status'
         """)
 
-    spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS {tracking_db}.validation_results (
-            run_id STRING,
-            validation_run_timestamp TIMESTAMP,
-            total_tables_validated INT,
-            tables_passed_validation INT,
-            tables_failed_validation INT,
-            total_row_count_mismatches INT,
-            total_partition_count_mismatches INT,
-            total_schema_mismatches INT,
-            total_file_size_mismatches INT,
-            total_file_count_mismatches INT,
-            validation_summary_json STRING,
-            created_at TIMESTAMP
-        )
-        USING iceberg
-        LOCATION '{tracking_loc}/validation_results'
-    """)
-
     return {'status': 'initialized', 'database': tracking_db}
 
 
@@ -712,7 +693,7 @@ for tbl in table_list:
                 loc = data_type
             elif col_name in ("type", "table type"):
                 table_type = data_type.replace("_TABLE", "")
-            elif col_name == "inputformat:":
+            elif col_name == "inputformat":
                 input_format = data_type
 
         source_total_size = 0
@@ -1773,35 +1754,12 @@ def update_validation_status(validation_result: dict, spark) -> dict:
 
     validation_duration = validation_result.get('_task_duration', 0.0)
 
-    total_validated = 0
-    passed_validation = 0
-    failed_validation = 0
-    row_mismatches = 0
-    partition_mismatches = 0
-    schema_mismatches = 0
-
     for v in validation_result.get('validation_results', []):
         if v['status'] != 'COMPLETED':
             continue
 
-        total_validated += 1
-
         error_msg = (v.get('error', '') or '').replace("'", "''")[:2000]
         schema_diffs = (v.get('schema_differences', '') or '').replace("'", "''")[:2000]
-
-        if not v.get('row_count_match', False):
-            row_mismatches += 1
-        if not v.get('partition_count_match', True):
-            partition_mismatches += 1
-        if not v.get('schema_match', False):
-            schema_mismatches += 1
-
-        if (v.get('row_count_match', True) and
-            v.get('partition_count_match', True) and
-            v.get('schema_match', True)):
-            passed_validation += 1
-        else:
-            failed_validation += 1
 
         is_validated = (
             v.get('row_count_match', False) and
@@ -1853,52 +1811,6 @@ def update_validation_status(validation_result: dict, spark) -> dict:
               AND source_table = '{v['source_table']}'
         """,
         task_label=f"update_validation_status:{v['source_table']}")
-
-    if total_validated > 0:
-        file_metrics = spark.sql(f"""
-            SELECT
-                SUM(CASE WHEN file_size_match = false THEN 1 ELSE 0 END) as size_mismatches,
-                SUM(CASE WHEN file_count_match = false THEN 1 ELSE 0 END) as count_mismatches
-            FROM {tracking_db}.migration_table_status
-            WHERE run_id = '{run_id}'
-        """).collect()[0]
-
-        size_mismatches = file_metrics['size_mismatches'] or 0
-        count_mismatches = file_metrics['count_mismatches'] or 0
-
-        validation_summary = {
-            'run_id': run_id,
-            'total_validated': total_validated,
-            'passed': passed_validation,
-            'failed': failed_validation,
-            'row_mismatches': row_mismatches,
-            'partition_mismatches': partition_mismatches,
-            'schema_mismatches': schema_mismatches,
-            'file_size_mismatches': size_mismatches,
-            'file_count_mismatches': count_mismatches
-        }
-
-        summary_json = json.dumps(validation_summary).replace("'", "''")
-        execute_with_iceberg_retry(spark, f"DELETE FROM {tracking_db}.validation_results WHERE run_id = '{run_id}'", task_label="update_validation_status:delete_summary")
-
-        execute_with_iceberg_retry(spark, f"""
-            INSERT INTO {tracking_db}.validation_results
-            VALUES (
-                '{run_id}',
-                current_timestamp(),
-                {total_validated},
-                {passed_validation},
-                {failed_validation},
-                {row_mismatches},
-                {partition_mismatches},
-                {schema_mismatches},
-                {size_mismatches},
-                {count_mismatches},
-                '{summary_json}',
-                current_timestamp()
-            )
-        """,
-        task_label="update_validation_status:insert_summary")
 
     for v in validation_result.get('validation_results', []):
         if v.get('status') == 'FAILED' and v.get('error'):
@@ -2218,6 +2130,7 @@ def generate_html_report(run_id: str, spark) -> str:
                     <th>DistCp</th>
                     <th>Table Create</th>
                     <th>Validation</th>
+                    <th>Format</th>
                     <th>Total Duration</th>
                 </tr>
             </thead>
@@ -2253,6 +2166,7 @@ def generate_html_report(run_id: str, spark) -> str:
                     <td class="duration">{distcp_dur}{distcp_detail}</td>
                     <td class="duration">{table_dur}</td>
                     <td class="duration">{val_dur}</td>
+                    <td>{t.file_format or 'N/A'}</td>
                     <td class="metric">{total_dur:.1f}s</td>
                 </tr>
 """

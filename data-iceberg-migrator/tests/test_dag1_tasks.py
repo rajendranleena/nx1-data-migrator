@@ -43,9 +43,9 @@ class TestInitTrackingTables:
     def test_creates_database_and_all_tables(self, mock_spark):
         result = m.init_tracking_tables.function(spark=mock_spark)
         assert result == {'status': 'initialized', 'database': 'migration_tracking'}
-        assert mock_spark.sql.call_count >= 4
+        assert mock_spark.sql.call_count >= 3
         all_sql = ' '.join(str(c) for c in mock_spark.sql.call_args_list).lower()
-        for table in ['migration_runs', 'migration_table_status', 'validation_results']:
+        for table in ['migration_runs', 'migration_table_status']:
             assert table in all_sql
 
 
@@ -396,20 +396,11 @@ class TestValidateDestinationTables:
 
 class TestUpdateValidationStatus:
 
-    def _setup_metrics(self, mock_spark):
-        metrics_row = MagicMock()
-        metrics_row.__getitem__ = lambda self, k: 0
-        df = MagicMock()
-        df.collect.return_value = [metrics_row]
-        mock_spark.sql.return_value = df
-
     def test_sets_validated_on_match(self, mock_spark, sample_validation_result, mock_iceberg_retry):
-        self._setup_metrics(mock_spark)
         m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
         assert any('VALIDATED' in str(c) for c in mock_iceberg_retry.call_args_list)
 
     def test_sets_validation_failed_on_mismatch(self, mock_spark, sample_validation_result, mock_iceberg_retry):
-        self._setup_metrics(mock_spark)
         sample_validation_result['validation_results'][0]['row_count_match'] = False
         m.update_validation_status.function(validation_result=sample_validation_result, spark=mock_spark)
         assert any('VALIDATION_FAILED' in str(c) for c in mock_iceberg_retry.call_args_list)
@@ -435,6 +426,7 @@ class TestGenerateHtmlReport:
             s3_file_count_before=0, s3_file_count_after=5,
             s3_files_transferred=5, file_count_match=True,
             distcp_status='COMPLETED',
+            file_format='PARQUET',
         )
         vs_row = MagicMock()
         vs_row.__getitem__ = lambda self, k: 1
