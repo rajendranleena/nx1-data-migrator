@@ -141,6 +141,9 @@ def build_policy_name(catalog: str, database: str, table: str, column: str) -> s
     If database is '*', policy name is just <catalog>
     Otherwise, it's a dot-separated string of non-wildcard parts:
     iceberg.${database}.${table if not *}.${column if not *}
+    When table is '*' but column is specific, both are included so that
+    column-scoped wildcard-table policies get unique, descriptive names
+    (e.g. iceberg.finance_db.*.amount instead of iceberg.finance_db).
     """
     if database == '*':
         return catalog
@@ -149,52 +152,129 @@ def build_policy_name(catalog: str, database: str, table: str, column: str) -> s
         parts.append(table)
         if column and column != '*':
             parts.append(column)
+    elif column and column != '*':
+        # table is a wildcard but column is specific — include both so the
+        # name is unique and reflects the actual resource scope.
+        parts.append('*')
+        parts.append(column)
     return '.'.join(parts)
 
 
 def parse_excel_rows(df) -> Dict[str, Any]:
     """Parse Excel DataFrame rows into policies, role_principals, and skipped_rows."""
+    VALID_ITEM_TYPES = {'allow', 'allow_exception', 'deny', 'deny_exception'}
+
     policies = {}
     role_principals = {}
     skipped_rows = []
+
+    # Fill-down state for resource-level columns.
+    # tables/columns only fill down when database is also blank (same resource block).
+    fd_database = ''
+    fd_tables   = '*'
+    fd_columns  = '*'
+    fd_url      = ''
+    fd_label    = ''
 
     for idx, row in df.iterrows():
         role = str(row.get('role', '')).strip()
         if is_empty_like(role):
             role = ''
             logger.debug(f"Row {idx}: Role field was empty/null-like, treating as empty")
-        databases = str(row.get('database', '')).strip()
-        tables = str(row.get('tables', '*')).strip() or '*'
-        columns = str(row.get('columns', '*')).strip() or '*'
-        url = str(row.get('url', '')).strip()
+
+        # --- Resource columns with fill-down ---
+        raw_database = str(row.get('database', '')).strip()
+        raw_url      = str(row.get('url', '')).strip()
+        raw_label    = str(row.get('policy_label', '')).strip()
+
+        new_database_row = not is_empty_like(raw_database)
+        new_url_row      = not (is_empty_like(raw_url) or raw_url in {'-', '*'})
+
+        if new_database_row:
+            # New resource block: tables/columns read from this row; blank = default *
+            # Entering table context — clear any stale URL fill-down state.
+            fd_database = raw_database
+            fd_url = ''
+            raw_tables  = str(row.get('tables', '')).strip()
+            raw_columns = str(row.get('columns', '')).strip()
+            fd_tables  = raw_tables  if not is_empty_like(raw_tables)  else '*'
+            fd_columns = raw_columns if not is_empty_like(raw_columns) else '*'
+            databases = fd_database
+            tables    = fd_tables
+            columns   = fd_columns
+        elif not is_empty_like(fd_database):
+            # Continuing same resource block: fill down tables/columns (or override if specified)
+            raw_tables  = str(row.get('tables', '')).strip()
+            raw_columns = str(row.get('columns', '')).strip()
+            tables  = raw_tables  if not is_empty_like(raw_tables)  else fd_tables
+            columns = raw_columns if not is_empty_like(raw_columns) else fd_columns
+            fd_tables  = tables
+            fd_columns = columns
+            databases  = fd_database
+        else:
+            databases = ''
+            tables    = str(row.get('tables', '')).strip()  or '*'
+            columns   = str(row.get('columns', '')).strip() or '*'
+
+        if new_url_row:
+            fd_url = raw_url
+            if not new_database_row:
+                # Entering URL context from a row that has no explicit database.
+                # Clear any stale database fill-down state so the
+                # "must have either database or url" validation does not false-positive.
+                # (When both are *explicitly* set on the same row, we leave them — the
+                # validation will correctly reject that row as ambiguous.)
+                fd_database = ''
+                databases   = ''
+        url = raw_url if new_url_row else fd_url
+
+        if not is_empty_like(raw_label):
+            fd_label = raw_label
+        policy_label_override = fd_label
+
+        # --- Item-level columns (never fill down) ---
         permissions = str(row.get('permissions', 'read')).strip()
-        groups = str(row.get('groups', '')).strip()
-        users = str(row.get('users', '')).strip()
-        rowfilter = str(row.get('rowfilter', '')).strip()
-        policy_label_override = str(row.get('policy_label', '')).strip()
+        groups      = str(row.get('groups', '')).strip()
+        users       = str(row.get('users', '')).strip()
+        rowfilter   = str(row.get('rowfilter', '')).strip()
         if is_empty_like(rowfilter):
             rowfilter = ''
             logger.debug(f"Row {idx}: Rowfilter field was empty/null-like, treating as empty")
-        # Enforce: Either database or url must be provided, not both or neither
-        has_db = not is_empty_like(databases)
+
+        raw_item_type = str(row.get('item_type', '')).strip().lower()
+        item_type = raw_item_type if raw_item_type in VALID_ITEM_TYPES else 'allow'
+
+        # --- Validation ---
+        has_db  = not is_empty_like(databases)
         has_url = bool(not is_empty_like(url) and url != '-' and url != '*')
         if (has_db and has_url) or (not has_db and not has_url):
             reason = f"Row must have either database or url (but not both/neither). Skipped. role={role}, database={databases}, url={url}"
             logger.error(reason)
             skipped_rows.append({'row_index': idx, 'role': role, 'database': databases, 'url': url, 'reason': reason})
             continue
-        # Validate: Rowfilters are only valid for database policies, not URL policies
+
         if has_url and rowfilter:
             reason = f"Rowfilters are not supported for URL-based policies. Skipped. url={url}, rowfilter={rowfilter}"
             logger.error(reason)
             skipped_rows.append({'row_index': idx, 'role': role, 'database': databases, 'url': url, 'reason': reason})
             continue
+
+        if rowfilter and item_type != 'allow':
+            reason = f"Rowfilters are only valid for item_type=allow; ignoring rowfilter for item_type={item_type}. row={idx}"
+            logger.warning(reason)
+            skipped_rows.append({'row_index': idx, 'role': role, 'database': databases, 'url': url, 'reason': reason})
+            rowfilter = ''
+
         group_list = parse_csv_field(groups)
-        user_list = parse_csv_field(users)
+        user_list  = parse_csv_field(users)
+
+        # KC realm role == Ranger group — provisioning is required for all item types
+        # (allow, allow_exception, deny, deny_exception) before the group can be placed
+        # in any Ranger policy item list.
         if role:
             role_principals.setdefault(role, {'groups': [], 'users': []})
         if group_list:
-            if not role: # If group input is present, role is mandatory
+            if not role:
                 reason = f"Row with groups {group_list} must have a role. Skipping row."
                 logger.error(reason)
                 skipped_rows.append({'row_index': idx, 'role': role, 'database': databases, 'url': url, 'reason': reason})
@@ -206,7 +286,6 @@ def parse_excel_rows(df) -> Dict[str, Any]:
             for u in user_list:
                 if u not in role_principals[role]['users']:
                     role_principals[role]['users'].append(u)
-        # If only users are present and no group, and no role is specified, create role_<username> for each user
         if user_list and not group_list and is_empty_like(role):
             for u in user_list:
                 user_role = f"role_{u}"
@@ -238,70 +317,73 @@ def parse_excel_rows(df) -> Dict[str, Any]:
 
         perm_list = parse_permission_string(permissions)
 
+        def _merge_role_into_policy(policy_roles, eff_role, eff_users, perm_list, group_list, rowfilter, item_type):
+            """Merge a role entry into the policy roles list, keyed by (role, item_type)."""
+            existing_idx = next(
+                (i for i, r in enumerate(policy_roles)
+                 if r['role'] == eff_role and r.get('item_type', 'allow') == item_type),
+                None
+            )
+            if existing_idx is None:
+                policy_roles.append({
+                    'role':        eff_role,
+                    'permissions': list(perm_list),
+                    'groups':      list(group_list),
+                    'users':       list(eff_users),
+                    'rowfilter':   rowfilter,
+                    'item_type':   item_type,
+                })
+            else:
+                r = policy_roles[existing_idx]
+                for p in perm_list:
+                    if p not in r['permissions']:
+                        r['permissions'].append(p)
+                r['groups'] = list(set(r.get('groups', []) + group_list))
+                r['users']  = list(set(r.get('users',  []) + eff_users))
+                if rowfilter:
+                    if r.get('rowfilter') and r['rowfilter'] != rowfilter:
+                        raise ValueError(
+                            f"Conflicting rowfilters for role {eff_role} ({item_type}): "
+                            f"{r['rowfilter']} vs {rowfilter}"
+                        )
+                    r['rowfilter'] = rowfilter
+
         if not is_empty_like(url) and url != '-' and url != '*':
-            policy_name = url
-            policy_label = policy_label_override if policy_label_override else None
+            policy_name  = url
+            policy_label = [lbl.strip() for lbl in policy_label_override.split(',') if lbl.strip()] if policy_label_override else None
             if policy_name not in policies:
                 policies[policy_name] = {'type': 'url', 'url': url, 'roles': [], 'label': policy_label}
             for binding in effective_role_bindings:
-                effective_role = binding['role']
-                effective_users = binding['users']
-                existing_roles = [r['role'] for r in policies[policy_name]['roles']]
-                if effective_role not in existing_roles:
-                    policies[policy_name]['roles'].append({'role': effective_role, 'permissions': perm_list, 'groups': group_list, 'users': effective_users, 'rowfilter': rowfilter})
-                else:
-                    for r in policies[policy_name]['roles']:
-                        if r['role'] == effective_role:
-                            for p in perm_list:
-                                if p not in r['permissions']:
-                                    r['permissions'].append(p)
-                            # Merge groups, users, rowfilter
-                            r['groups'] = list(set(r.get('groups', []) + group_list))
-                            r['users'] = list(set(r.get('users', []) + effective_users))
-                            if rowfilter:
-                                if r.get('rowfilter') and r['rowfilter'] != rowfilter:
-                                    raise ValueError(
-                                        f"Conflicting rowfilters for role {effective_role} in policy {policy_name}: "
-                                        f"{r['rowfilter']} vs {rowfilter}")
-                                r['rowfilter'] = rowfilter
+                _merge_role_into_policy(
+                    policies[policy_name]['roles'],
+                    binding['role'], binding['users'], perm_list, group_list, rowfilter, item_type
+                )
         else:
-            db_list = parse_csv_field(databases)
-            table_list = parse_csv_field(tables) or ['*']
+            db_list     = parse_csv_field(databases)
+            table_list  = parse_csv_field(tables)  or ['*']
             column_list = parse_csv_field(columns) or ['*']
             for database in db_list:
                 if is_empty_like(database):
                     continue
                 for table in table_list:
                     for column in column_list:
-                        policy_name = build_policy_name('iceberg', database, table, column)
-                        policy_label = policy_label_override if policy_label_override else None
+                        policy_name  = build_policy_name('iceberg', database, table, column)
+                        policy_label = [lbl.strip() for lbl in policy_label_override.split(',') if lbl.strip()] if policy_label_override else None
                         if policy_name not in policies:
                             policies[policy_name] = {
-                                'type': 'table',
+                                'type':    'table',
                                 'catalog': 'iceberg',
-                                'schema': database,
-                                'table': table or '*',
-                                'column': column or '*',
-                                'roles': [],
-                                'label': policy_label
+                                'schema':  database,
+                                'table':   table  or '*',
+                                'column':  column or '*',
+                                'roles':   [],
+                                'label':   policy_label,
                             }
                         for binding in effective_role_bindings:
-                            effective_role = binding['role']
-                            effective_users = binding['users']
-                            existing_roles = [r['role'] for r in policies[policy_name]['roles']]
-                            if effective_role not in existing_roles:
-                                policies[policy_name]['roles'].append({'role': effective_role, 'permissions': perm_list, 'groups': group_list, 'users': effective_users, 'rowfilter': rowfilter})
-                            else:
-                                for r in policies[policy_name]['roles']:
-                                    if r['role'] == effective_role:
-                                        for p in perm_list:
-                                            if p not in r['permissions']:
-                                                r['permissions'].append(p)
-                                        # Merge groups, users, rowfilter
-                                        r['groups'] = list(set(r.get('groups', []) + group_list))
-                                        r['users'] = list(set(r.get('users', []) + effective_users))
-                                        if rowfilter:
-                                            r['rowfilter'] = rowfilter
+                            _merge_role_into_policy(
+                                policies[policy_name]['roles'],
+                                binding['role'], binding['users'], perm_list, group_list, rowfilter, item_type
+                            )
 
     logger.info(f"Parsed {len(policies)} policies and {len(role_principals)} role-principal mappings, {len(skipped_rows)} rows skipped")
     return {'policies': policies, 'role_principals': role_principals, 'skipped_rows': skipped_rows}
@@ -341,17 +423,17 @@ def patch_policies_with_keycloak(
 
             users = r.get('users', []) or []
             groups = r.get('groups', []) or []
+            kc_summary = keycloak_result.get('summary', {})
+            kc_all_mappings = kc_summary.get('created_mappings', []) + kc_summary.get('existing_mappings', [])
             # Find successfully mapped groups
             mapped_groups = [
                 g for g in groups
-                if {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('created_mappings', [])
-                or {'role': role_name, 'principal': g, 'type': 'group'} in keycloak_result.get('summary', {}).get('existing_mappings', [])
+                if {'role': role_name, 'principal': g, 'type': 'group'} in kc_all_mappings
             ]
             # Find successfully mapped users
             mapped_users = [
                 u for u in users
-                if {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('created_mappings', [])
-                or {'role': role_name, 'principal': u, 'type': 'user'} in keycloak_result.get('summary', {}).get('existing_mappings', [])
+                if {'role': role_name, 'principal': u, 'type': 'user'} in kc_all_mappings
             ]
             if not mapped_groups and not mapped_users:
                 logger.error(
@@ -583,19 +665,27 @@ def build_keycloak_success_statuses(result: Dict[str, Any], tracking_run_id: str
             "completed_at": dt.now(timezone.utc)
         })
 
-    # Process failures
+    # Process failures — branch on operation type so role creation failures
+    # are recorded as object_type="role" rather than "mapping".
     for entry in result.get('failed', []):
         if isinstance(entry, dict):
-            principal = entry.get('principal', entry.get('group', entry.get('user', '')))
-            mtype = entry.get('type', 'group' if 'group' in entry else 'user')
-            name = f"{entry.get('role', '')}->{principal} ({mtype})"
+            operation = entry.get('operation', '')
             error = entry.get('error', '')
+            if operation == 'create_role':
+                obj_type = 'role'
+                name = entry.get('role', '')
+            else:  # assign_role / assign_role_user
+                principal = entry.get('principal', '')
+                mtype = entry.get('type', 'group')
+                name = f"{entry.get('role', '')}->{principal} ({mtype})"
+                obj_type = 'mapping'
         else:
+            obj_type = 'mapping'
             name = str(entry)
             error = ''
         statuses.append({
             "run_id": tracking_run_id,
-            "object_type": "mapping",
+            "object_type": obj_type,
             "object_name": name,
             "status": "FAILED",
             "error_message": error,
@@ -661,6 +751,7 @@ def compute_run_metrics(
 def build_report_html(run_info, objects, policy_statuses, skipped_rows, tracking_run_id: str) -> str:
     """Build HTML report string from query results."""
     from collections import Counter
+    from html import escape as _escape
 
     total_objects = len(objects)
     successful_objects = sum(1 for o in objects if o.status in ["CREATED", "UPDATED", "ALREADY_EXISTS"])
@@ -670,13 +761,21 @@ def build_report_html(run_info, objects, policy_statuses, skipped_rows, tracking
     # Determine status class for run
     run_status_class = 'status-success' if run_info.status == 'COMPLETED' else 'status-failed'
 
+    # Pre-escape user-controlled values to prevent XSS
+    _run_id = _escape(str(tracking_run_id))
+    _dag_run_id = _escape(str(run_info.dag_run_id))
+    _excel_path = _escape(str(run_info.excel_file_path))
+    _started_at = _escape(str(run_info.started_at))
+    _completed_at = _escape(str(run_info.completed_at))
+    _run_status = _escape(str(run_info.status))
+
     # Build HTML
     html = f"""
     <!DOCTYPE html>
     <html lang=\"en\">
     <head>
         <meta charset=\"UTF-8\">
-        <title>Ranger Policy Run Report - {tracking_run_id}</title>
+        <title>Ranger Policy Run Report - {_run_id}</title>
         <style>
             body {{ font-family: Arial, sans-serif; background: #f5f5f5; padding: 20px; }}
             .container {{ background: #fff; padding: 20px; border-radius: 8px; max-width: 1400px; margin: 0 auto; }}
@@ -706,12 +805,12 @@ def build_report_html(run_info, objects, policy_statuses, skipped_rows, tracking
             <h1>Ranger Policy Run Report</h1>
 
             <div class=\"run-info\">
-                <p><strong>Run ID:</strong> {tracking_run_id}</p>
-                <p><strong>DAG Run:</strong> {run_info.dag_run_id}</p>
-                <p><strong>Excel Path:</strong> {run_info.excel_file_path}</p>
-                <p><strong>Started At:</strong> {run_info.started_at}</p>
-                <p><strong>Completed At:</strong> {run_info.completed_at}</p>
-                <p><strong>Status:</strong> <span class=\"status-badge {run_status_class}\">{run_info.status}</span></p>
+                <p><strong>Run ID:</strong> {_run_id}</p>
+                <p><strong>DAG Run:</strong> {_dag_run_id}</p>
+                <p><strong>Excel Path:</strong> {_excel_path}</p>
+                <p><strong>Started At:</strong> {_started_at}</p>
+                <p><strong>Completed At:</strong> {_completed_at}</p>
+                <p><strong>Status:</strong> <span class=\"status-badge {run_status_class}\">{_run_status}</span></p>
             </div>
 
             <h2>Summary</h2>
@@ -746,7 +845,7 @@ def build_report_html(run_info, objects, policy_statuses, skipped_rows, tracking
             <ul>
     """
     for obj_type, count in type_counts.items():
-        html += f"<li><strong>{obj_type}:</strong> {count}</li>"
+        html += f"<li><strong>{_escape(str(obj_type))}:</strong> {count}</li>"
 
     html += """
             </ul>
@@ -774,22 +873,22 @@ def build_report_html(run_info, objects, policy_statuses, skipped_rows, tracking
             else "status-failed" if getattr(p, 'status', None) == "FAILED"
             else "status-partial"
         )
-        users = ', '.join(getattr(p, 'users', []) or [])
-        groups = ', '.join(getattr(p, 'groups', []) or [])
-        permissions = ', '.join(getattr(p, 'permissions', []) or [])
-        rowfilter = getattr(p, 'rowfilter', '') or ''
-        error_display = getattr(p, 'error_message', '') or ''
+        users = _escape(', '.join(getattr(p, 'users', []) or []))
+        groups = _escape(', '.join(getattr(p, 'groups', []) or []))
+        permissions = _escape(', '.join(getattr(p, 'permissions', []) or []))
+        rowfilter = _escape(getattr(p, 'rowfilter', '') or '')
+        error_display = _escape(getattr(p, 'error_message', '') or '')
         html += f"""
                     <tr>
-                        <td>{getattr(p, 'policy_name', '')}</td>
+                        <td>{_escape(str(getattr(p, 'policy_name', '')))}</td>
                         <td>{users}</td>
                         <td>{groups}</td>
                         <td>{permissions}</td>
                         <td>{rowfilter}</td>
-                        <td><span class=\"status-badge {status_class}\">{getattr(p, 'status', '')}</span></td>
+                        <td><span class=\"status-badge {status_class}\">{_escape(str(getattr(p, 'status', '')))}</span></td>
                         <td class=\"error-cell\">{error_display}</td>
-                        <td>{getattr(p, 'created_at', '')}</td>
-                        <td>{getattr(p, 'updated_at', '')}</td>
+                        <td>{_escape(str(getattr(p, 'created_at', '')))}</td>
+                        <td>{_escape(str(getattr(p, 'updated_at', '')))}</td>
                     </tr>
         """
 
@@ -810,11 +909,11 @@ def build_report_html(run_info, objects, policy_statuses, skipped_rows, tracking
                 <tbody>
     """
     for row in skipped_rows:
-        row_index = row['row_index'] if row['row_index'] is not None else ''
-        role = row['role'] or ''
-        database = row['database'] or ''
-        url = row['url'] or ''
-        reason = row['reason'] or ''
+        row_index = str(row['row_index']) if row['row_index'] is not None else ''
+        role = _escape(row['role'] or '')
+        database = _escape(row['database'] or '')
+        url = _escape(row['url'] or '')
+        reason = _escape(row['reason'] or '')
         html += f"""
                             <tr>
                                 <td>{row_index}</td>
@@ -851,20 +950,20 @@ def build_report_html(run_info, objects, policy_statuses, skipped_rows, tracking
             else "status-failed" if o.status == "FAILED"
             else "status-partial"
         )
-        error_display = o.error_message or ''
-        policy_name_display = getattr(o, 'policy_name', '') or ''
-        policy_id_display = getattr(o, 'policy_id', '') or ''
+        error_display = _escape(o.error_message or '')
+        policy_name_display = _escape(getattr(o, 'policy_name', '') or '')
+        policy_id_display = _escape(getattr(o, 'policy_id', '') or '')
         html += f"""
                     <tr>
-                        <td>{o.object_type}</td>
-                        <td>{o.object_name}</td>
+                        <td>{_escape(str(o.object_type))}</td>
+                        <td>{_escape(str(o.object_name))}</td>
                         <td>{policy_name_display}</td>
                         <td>{policy_id_display}</td>
-                        <td><span class=\"status-badge {status_class}\">{o.status}</span></td>
+                        <td><span class=\"status-badge {status_class}\">{_escape(str(o.status))}</span></td>
                         <td class=\"error-cell\">{error_display}</td>
                         <td>{o.attempt}</td>
-                        <td>{o.started_at}</td>
-                        <td>{o.completed_at or ''}</td>
+                        <td>{_escape(str(o.started_at))}</td>
+                        <td>{_escape(str(o.completed_at or ''))}</td>
                     </tr>
         """
 
@@ -1192,18 +1291,24 @@ with DAG(
         groups_result = manager.ensure_groups_exist(list(all_roles))
 
         for g, created in groups_result.items():
-            if created:
+            if created is True:
                 groups_created.append(g)
                 status = "CREATED"
-            else:
+                error_message = ""
+            elif created is False:
                 groups_existing.append(g)
                 status = "ALREADY_EXISTS"
+                error_message = ""
+            else:  # None — creation attempt threw an exception
+                status = "FAILED"
+                error_message = f"Ranger group '{g}' could not be created; check Ranger logs."
+                logger.error(f"Ranger group '{g}' recorded as FAILED in tracking table.")
             statuses.append({
                 "run_id": tracking_run_id,
                 "object_type": "ranger_group",
                 "object_name": g,
                 "status": status,
-                "error_message": "",
+                "error_message": error_message,
                 "attempt": 1,
                 "started_at": dt.now(timezone.utc),
                 "completed_at": dt.now(timezone.utc)
@@ -1329,7 +1434,7 @@ with DAG(
 
         cfg = get_config()
         try:
-            # Initialize manager to verify connectivity (constructor connects and calls get_realm)
+            # Try to initialize manager with timeout and retries
             KeycloakRoleManager(
                 server_url=cfg["keycloak_url"],
                 realm_name=cfg["keycloak_realm"],
@@ -1353,7 +1458,7 @@ with DAG(
             raise
 
     @task(retries=4, retry_delay=timedelta(minutes=2))
-    def create_keycloak_roles(parsed_data: Dict[str, Any], tracking_run_id: str, health_check: Dict[str, Any], context=None) -> Dict[str, Any]:
+    def create_keycloak_roles(parsed_data: Dict[str, Any], tracking_run_id: str, health_check: Dict[str, Any]) -> Dict[str, Any]:
         """
         Create Keycloak roles and group mappings.
         Returns both summary (for finalize) and statuses (for tracking).
@@ -1364,8 +1469,12 @@ with DAG(
 
         # Get current attempt number from Airflow context for tracking retries
         attempt_num = 1
-        if context and 'ti' in context:
-            attempt_num = context['ti'].try_number
+        try:
+            from airflow.operators.python import get_current_context
+            _ctx = get_current_context()
+            attempt_num = int(_ctx['ti'].try_number)
+        except Exception:
+            pass
 
         # Extract role principals BEFORE attempting connection so we can track failed attempts
         filtered_role_principals = {k: v for k, v in parsed_data['role_principals'].items()}
@@ -1405,44 +1514,6 @@ with DAG(
         }
 
 
-    @task(trigger_rule=TriggerRule.ALL_DONE)
-    def debug_list_policies() -> Dict[str, Any]:
-        """
-        Debug task: Query Ranger backend to verify policies actually exist.
-        This runs during DAG execution and logs all policies for the service.
-        """
-        from ranger_utils import RangerPolicyManager
-
-        cfg = get_config()
-        manager = RangerPolicyManager(
-            ranger_url=cfg["ranger_url"],
-            ranger_username=cfg["ranger_username"],
-            ranger_password=cfg["ranger_password"],
-            service_name=cfg["service_name"]
-        )
-
-        try:
-            # Query all policies for the service
-            all_policies = manager.get_all_policies()
-            policy_names = [p.get('name', 'UNKNOWN') for p in all_policies]
-
-            logger.info(f"DEBUG: Found {len(all_policies)} policies in Ranger service '{cfg['service_name']}'")
-            logger.info(f"DEBUG: Policy names: {policy_names}")
-
-            return {
-                "status": "success",
-                "total_policies": len(all_policies),
-                "policy_names": policy_names,
-                "all_policies": all_policies
-            }
-        except Exception as e:
-            logger.error(f"DEBUG: Error querying Ranger policies: {e}", exc_info=True)
-            return {
-                "status": "error",
-                "error": str(e),
-                "total_policies": 0,
-                "policy_names": []
-            }
     @task
     def extract_statuses(ranger_result: Dict[str, Any], keycloak_result: Dict[str, Any]) -> List[Dict]:
         """Combine statuses from both Ranger and Keycloak results."""
@@ -1451,40 +1522,64 @@ with DAG(
         all_statuses.extend(keycloak_result.get("statuses", []))
         return all_statuses
 
+    @task
+    def compute_finalize_metrics(
+        parsed_data: Dict[str, Any],
+        ranger_result: Dict[str, Any],
+        keycloak_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Reduce large XCom dicts to scalar metrics so finalize_policy_run avoids XCom bloat."""
+        metrics = compute_run_metrics(parsed_data, ranger_result, keycloak_result)
+        return {
+            "total_policies_parsed": len(parsed_data.get('policies', {})),
+            "total_role_mappings_parsed": len(parsed_data.get('role_principals', {})),
+            "groups_created": metrics["groups_created"],
+            "groups_existing": metrics["groups_existing"],
+            "policies_created": metrics["policies_created"],
+            "policies_updated": metrics["policies_updated"],
+            "policies_failed": metrics["policies_failed"],
+            "roles_created": metrics["roles_created"],
+            "roles_existing": metrics["roles_existing"],
+            "mappings_created": metrics["mappings_created"],
+            "mappings_existing": metrics["mappings_existing"],
+            "total_objects": metrics["total_objects"],
+            "successful_objects": metrics["successful_objects"],
+            "failed_objects": metrics["failed_objects"],
+            "overall_status": metrics["overall_status"],
+        }
+
     @task.pyspark(conn_id="spark_default")
     def finalize_policy_run(
         tracking_run_id: str,
         dag_run_identifier: str,
         excel_file_path: str,
-        parsed_data: Dict[str, Any],
-        ranger_result: Dict[str, Any],
-        keycloak_result: Dict[str, Any],
+        run_metrics: Dict[str, Any],
         spark=None,
         sc=None
     ) -> Dict:
         """
-        Finalize the policy run: compute metrics from parsed data and task results,
-        update the tracking_ranger_policy_runs table, and return summary.
+        Finalize the policy run: write metrics to the tracking table and return summary.
+        Accepts pre-computed scalar metrics from compute_finalize_metrics to avoid
+        deserialising large XCom payloads inside this Spark task.
         """
         cfg = get_config()
         db = cfg["tracking_database"]
 
-        metrics = compute_run_metrics(parsed_data, ranger_result, keycloak_result)
-        groups_created = metrics["groups_created"]
-        groups_existing = metrics["groups_existing"]
-        policies_created = metrics["policies_created"]
-        policies_updated = metrics["policies_updated"]
-        policies_failed = metrics["policies_failed"]
-        roles_created = metrics["roles_created"]
-        roles_existing = metrics["roles_existing"]
-        mappings_created = metrics["mappings_created"]
-        mappings_existing = metrics["mappings_existing"]
-        total_objects = metrics["total_objects"]
-        successful_objects = metrics["successful_objects"]
-        failed_objects = metrics["failed_objects"]
-        overall_status = metrics["overall_status"]
-        ranger_summary = metrics["ranger_summary"]
-        keycloak_summary = metrics["keycloak_summary"]
+        groups_created = run_metrics["groups_created"]
+        groups_existing = run_metrics["groups_existing"]
+        policies_created = run_metrics["policies_created"]
+        policies_updated = run_metrics["policies_updated"]
+        policies_failed = run_metrics["policies_failed"]
+        roles_created = run_metrics["roles_created"]
+        roles_existing = run_metrics["roles_existing"]
+        mappings_created = run_metrics["mappings_created"]
+        mappings_existing = run_metrics["mappings_existing"]
+        total_objects = run_metrics["total_objects"]
+        successful_objects = run_metrics["successful_objects"]
+        failed_objects = run_metrics["failed_objects"]
+        overall_status = run_metrics["overall_status"]
+        total_policies_parsed = run_metrics["total_policies_parsed"]
+        total_role_mappings_parsed = run_metrics["total_role_mappings_parsed"]
 
         safe_overall_status = sql_str(overall_status)
         safe_tracking_run_id = sql_str(tracking_run_id)
@@ -1497,8 +1592,8 @@ with DAG(
                 total_objects = {total_objects},
                 successful_objects = {successful_objects},
                 failed_objects = {failed_objects},
-                total_policies_parsed = {len(parsed_data.get('policies', {}))},
-                total_role_mappings_parsed = {len(parsed_data.get('role_principals', {}))},
+                total_policies_parsed = {total_policies_parsed},
+                total_role_mappings_parsed = {total_role_mappings_parsed},
                 groups_created = {groups_created},
                 groups_existing = {groups_existing},
                 policies_created = {policies_created},
@@ -1715,13 +1810,11 @@ with DAG(
             "failed_objects": failed_objects,
             "dag_run_id": dag_run_identifier,
             "excel_file_path": excel_file_path,
-            "ranger_summary": ranger_summary,
-            "keycloak_summary": keycloak_summary
         }
 
 
     @task.pyspark(conn_id="spark_default")
-    def generate_policy_report(tracking_run_id: str, skipped_rows: list, spark) -> Dict[str, str]:
+    def generate_policy_report(tracking_run_id: str, spark) -> Dict[str, str]:
         """
         Generate a multi-row formatted HTML report for Ranger & Keycloak policy run.
         Includes object counts, status badges, and error messages.
@@ -1780,11 +1873,10 @@ with DAG(
         logger.info(f"Report generated at: {report_path}")
         return {
             "report_path": report_path,
-            "html_content": html,
         }
 
-    @task.pyspark(conn_id='spark_default')
-    def send_policy_report_email(report_result: Dict[str, Any], tracking_run_id: str, spark) -> Dict[str, Any]:
+    @task
+    def send_policy_report_email(report_result: Dict[str, Any], tracking_run_id: str) -> Dict[str, Any]:
         """Send HTML policy report via email using SMTP."""
         cfg = get_config()
         smtp_conn_id = cfg.get('smtp_conn_id', 'smtp_default')
@@ -1795,14 +1887,24 @@ with DAG(
             return {'sent': False, 'reason': 'no_recipients'}
 
         recipients = [r.strip() for r in recipients_str.split(',') if r.strip()]
-        html_content = report_result.get('html_content', '')
         report_path = report_result.get('report_path', '')
 
         try:
             import os
             import tempfile
+            from urllib.parse import urlparse
 
+            import boto3
             from airflow.utils.email import send_email
+
+            # Read the HTML report from storage.
+            # Normalise Hadoop-style schemes (s3a:// / s3n://) to s3:// for boto3.
+            read_path = report_path.replace('s3a://', 's3://', 1).replace('s3n://', 's3://', 1)
+            parsed_url = urlparse(read_path)
+            html_content = boto3.client('s3').get_object(
+                Bucket=parsed_url.netloc,
+                Key=parsed_url.path.lstrip('/')
+            )['Body'].read().decode('utf-8')
 
             tmp = tempfile.NamedTemporaryFile(
                 mode='w',
@@ -2057,21 +2159,19 @@ with DAG(
     write_final_policy_statuses = write_policy_statuses.override(
                             task_id="write_final_policy_statuses",
                             trigger_rule=TriggerRule.ALL_DONE)(final_policy_statuses)
-    debug_result = debug_list_policies()
     all_statuses = extract_statuses(ranger_result, keycloak_result)
     write_statuses = write_policy_object_statuses(all_statuses)
 
+    run_metrics = compute_finalize_metrics(parsed_data, ranger_result, keycloak_result)
     finalize = finalize_policy_run(
         tracking_run_id=tracking_run_id,
         dag_run_identifier=dag_run_identifier,
         excel_file_path=excel_path,
-        parsed_data=parsed_data,
-        ranger_result=ranger_result,
-        keycloak_result=keycloak_result,
+        run_metrics=run_metrics,
     )
 
 
-    report_result = generate_policy_report(tracking_run_id, parsed_data['skipped_rows'])
+    report_result = generate_policy_report(tracking_run_id)
     send_email_result = send_policy_report_email(report_result, tracking_run_id)
 
     init_tables >> tracking_run_id
@@ -2082,10 +2182,10 @@ with DAG(
     keycloak_health >> keycloak_result
     [parsed_data, keycloak_result] >> ranger_result
     initial_policy_statuses >> write_initial_policy_statuses
-    ranger_result >> [debug_result, final_policy_statuses]
+    ranger_result >> final_policy_statuses
     final_policy_statuses >> write_final_policy_statuses
     write_initial_policy_statuses >> write_final_policy_statuses
     [ranger_result, keycloak_result] >> all_statuses
     all_statuses >> write_statuses
-    [write_statuses, write_final_policy_statuses] >> finalize
+    [write_skipped, write_statuses, write_final_policy_statuses] >> finalize
     finalize >> report_result >> send_email_result

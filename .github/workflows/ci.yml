@@ -156,7 +156,7 @@ jobs:
           thresholds: "60 80"
 
       - name: Post PR comment
-        if: steps.check.outputs.has_data == 'true'
+        if: steps.check.outputs.has_data == 'true' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
