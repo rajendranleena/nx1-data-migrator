@@ -1108,14 +1108,11 @@ class TestKeycloakEnsureRealmRoleExists:
 # ---------------------------------------------------------------------------
 
 class TestKeycloakEnsureGroupExists:
-    def test_creates_new_group(self, kc_manager):
-        kc_manager.keycloak_admin.get_groups.side_effect = [
-            [],  # first call: group absent
-            [{"name": "new_group", "id": "g1"}],  # second call: after create
-        ]
-        group_id, created = kc_manager.ensure_group_exists("new_group")
-        assert created is True
-        assert group_id == "g1"
+    def test_raises_when_group_missing(self, kc_manager):
+        kc_manager.keycloak_admin.get_groups.return_value = []
+        with pytest.raises(ValueError, match="does not exist in Keycloak"):
+            kc_manager.ensure_group_exists("nonexistent_grp")
+        kc_manager.keycloak_admin.create_group.assert_not_called()
 
     def test_returns_existing_group(self, kc_manager):
         kc_manager.keycloak_admin.get_groups.return_value = [
@@ -1124,6 +1121,7 @@ class TestKeycloakEnsureGroupExists:
         group_id, created = kc_manager.ensure_group_exists("existing_group")
         assert created is False
         assert group_id == "g2"
+        kc_manager.keycloak_admin.create_group.assert_not_called()
 
     def test_raises_on_exception(self, kc_manager):
         kc_manager.keycloak_admin.get_groups.side_effect = Exception("network")
@@ -1211,6 +1209,47 @@ class TestKeycloakSyncRolesAndPrincipals:
             {"role1": {"groups": ["g1"], "users": []}}
         )
         assert "g1" in result["existing_groups"]
+
+    def test_missing_group_skips_mapping(self, kc_manager):
+        kc_manager.keycloak_admin.get_realm_roles.return_value = []
+        kc_manager.keycloak_admin.get_groups.return_value = []
+        result = kc_manager.sync_roles_and_principals(
+            {"role_a": {"groups": ["missing_grp"], "users": []}}
+        )
+        assert result["missing_groups"] == ["missing_grp"]
+        assert result["created_mappings"] == []
+        assert any(
+            f["principal"] == "missing_grp" and f["type"] == "group"
+            for f in result["failed"]
+        )
+
+    def test_same_missing_group_looked_up_once(self, kc_manager):
+        """Two roles reference the same missing group: one lookup, one missing entry, two failures."""
+        kc_manager.keycloak_admin.get_realm_roles.return_value = []
+        kc_manager.keycloak_admin.get_groups.return_value = []
+        result = kc_manager.sync_roles_and_principals({
+            "role_a": {"groups": ["shared_grp"], "users": []},
+            "role_b": {"groups": ["shared_grp"], "users": []},
+        })
+        assert kc_manager.keycloak_admin.get_groups.call_count == 1
+        assert result["missing_groups"] == ["shared_grp"]
+        failed = [f for f in result["failed"] if f["principal"] == "shared_grp"]
+        assert len(failed) == 2
+        assert {f["role"] for f in failed} == {"role_a", "role_b"}
+
+    def test_existing_group_mapped_missing_group_fails(self, kc_manager):
+        """One group exists, one doesn't: good group gets a mapping, bad group tracked as failed."""
+        kc_manager.keycloak_admin.get_realm_roles.return_value = []
+        kc_manager.keycloak_admin.get_groups.return_value = [{"name": "good_grp", "id": "uuid-good"}]
+        kc_manager.keycloak_admin.get_realm_role.return_value = {"name": "role_a"}
+        kc_manager.keycloak_admin.get_group_realm_roles.return_value = []
+        result = kc_manager.sync_roles_and_principals({
+            "role_a": {"groups": ["good_grp", "bad_grp"], "users": []},
+        })
+        assert "good_grp" in result["existing_groups"]
+        assert "bad_grp" in result["missing_groups"]
+        assert any(m["principal"] == "good_grp" for m in result["created_mappings"])
+        assert any(f["principal"] == "bad_grp" for f in result["failed"])
 
 
 class TestGetExistingPolicyNoneResponse:

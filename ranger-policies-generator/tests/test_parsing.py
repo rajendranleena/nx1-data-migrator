@@ -149,6 +149,44 @@ class TestPatchPoliciesWithKeycloak:
         assert "good_role" in result["applied_roles"]["p1"]
         assert "bad_role" in result["excluded_roles"]["p1"]
 
+    def test_missing_group_cascades_to_policy_failure(self, dag_module):
+        policies = {
+            "iceberg.db1.t1": {
+                "type": "table",
+                "roles": [{"role": "analyst", "permissions": ["read"], "groups": ["missing_grp"], "users": [], "rowfilter": ""}],
+            }
+        }
+        kc = self._keycloak_result(
+            created_mappings=[],
+            existing_mappings=[],
+        )
+        result = dag_module.patch_policies_with_keycloak(policies, kc, "run1")
+
+        assert "iceberg.db1.t1" not in result["patched_policies"]
+        assert len(result["failure_statuses"]) == 1
+        assert result["failure_statuses"][0]["status"] == "FAILED"
+        assert "analyst" in result["excluded_roles"].get("iceberg.db1.t1", [])
+
+    def test_mixed_existing_and_missing_groups_partial_success(self, dag_module):
+        """Role with one mapped group and one missing group: policy created with the mapped group only."""
+        policies = {
+            "iceberg.db1.t1": {
+                "type": "table",
+                "roles": [{"role": "analyst", "permissions": ["read"],
+                            "groups": ["existing_grp", "missing_grp"], "users": [], "rowfilter": ""}],
+            }
+        }
+        kc = self._keycloak_result(
+            created_mappings=[{"role": "analyst", "principal": "existing_grp", "type": "group"}],
+        )
+        result = dag_module.patch_policies_with_keycloak(policies, kc, "run1")
+
+        assert "iceberg.db1.t1" in result["patched_policies"]
+        patched_role = result["patched_policies"]["iceberg.db1.t1"]["roles"][0]
+        assert patched_role["groups"] == ["existing_grp"]
+        assert "analyst" in result["applied_roles"]["iceberg.db1.t1"]
+        assert len(result["failure_statuses"]) == 0
+
     def test_user_only_role_excluded_when_user_mapping_failed(self, dag_module):
         # KC realm role was created but alice is not in KC → assignment failed → no mapping.
         # Policy must NOT proceed; a broken Ranger policy with an empty group is worse than no policy.

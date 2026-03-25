@@ -1106,19 +1106,21 @@ class KeycloakRoleManager:
             f"after {max_retries} attempts. Last error: {str(last_error)}"
         )
 
-    def _assign_role_to_principal(self, role_name: str, principal_name: str, principal_type: str) -> bool:
+    def _assign_role_to_principal(self, role_name: str, principal_name: str, principal_type: str, group_id: Optional[str] = None) -> bool:
         """
         Assign a realm role to a group or user.
         Args:
             role_name: Name of the role to assign
             principal_name: Name of the group or user
             principal_type: 'group' or 'user'
+            group_id: Pre-resolved Keycloak group ID (avoids redundant lookup when caller already has it)
         Returns:
             True if assignment was made, False if already assigned
         """
         try:
             if principal_type == 'group':
-                group_id, _ = self.ensure_group_exists(principal_name)  # Unpack tuple, ignore created flag
+                if not group_id:
+                    group_id, _ = self.ensure_group_exists(principal_name)
                 role = self.keycloak_admin.get_realm_role(role_name)
                 group_roles = self.keycloak_admin.get_group_realm_roles(group_id)
                 group_role_names = {r['name'] for r in group_roles}
@@ -1188,27 +1190,32 @@ class KeycloakRoleManager:
 
     def ensure_group_exists(self, group_name: str) -> tuple:
         """
-        Ensure a group exists, creating it if necessary.
+        Verify a group exists in Keycloak and return its ID.
+        Raises ValueError if the group does not exist.
 
         Args:
             group_name: Name of the group
 
         Returns:
-            Tuple of (group_id, created) where created=True if group was newly created, False if already existed
+            Tuple of (group_id, False) — the boolean is always False (group was not created)
+
+        Raises:
+            ValueError: If the group does not exist in Keycloak
         """
         try:
             groups = {g['name']: g['id'] for g in self.keycloak_admin.get_groups()}
 
             if group_name not in groups:
-                self.keycloak_admin.create_group({'name': group_name})
-                groups = {g['name']: g['id'] for g in self.keycloak_admin.get_groups()}
-                logger.info(f"Created Keycloak group: {group_name}")
-                return (groups.get(group_name), True)  # (group_id, created=True)
-            else:
-                logger.debug(f"Keycloak group {group_name} already exists")
-                return (groups.get(group_name), False)  # (group_id, created=False)
+                raise ValueError(
+                    f"Group '{group_name}' does not exist in Keycloak. "
+                    "Groups must be pre-created before running the policy automation."
+                )
+            logger.debug(f"Keycloak group {group_name} already exists")
+            return (groups.get(group_name), False)
+        except ValueError:
+            raise
         except Exception as e:
-            logger.error(f"Error ensuring group {group_name} exists: {e}")
+            logger.error(f"Error looking up group {group_name}: {e}")
             raise
 
     def assign_role_to_group(self, role_name: str, group_name: str) -> bool:
@@ -1223,8 +1230,7 @@ class KeycloakRoleManager:
             True if assignment was made, False if already assigned
         """
         try:
-            # Ensure group exists and get its ID
-            group_id, _ = self.ensure_group_exists(group_name)  # Unpack tuple, ignore created flag
+            group_id, _ = self.ensure_group_exists(group_name)
 
             # Get the role object
             role = self.keycloak_admin.get_realm_role(role_name)
@@ -1256,20 +1262,20 @@ class KeycloakRoleManager:
                 }
 
         Returns:
-            Dictionary with 'created_roles', 'created_groups', 'created_mappings', and 'failed' lists
+            Dictionary with 'created_roles', 'existing_groups', 'missing_groups', 'created_mappings', and 'failed' lists
         """
         results = {
             'created_roles': [],
             'existing_roles': [],
-            'created_groups': [],  # Keycloak groups created for role assignments
-            'existing_groups': [],  # Keycloak groups that already existed
+            'existing_groups': [],
+            'missing_groups': [],
             'created_mappings': [],
             'existing_mappings': [],
             'failed': []
         }
 
-        # Track groups we've already processed to avoid duplicates
-        processed_groups = set()
+        # Cache group lookups: group_name -> group_id (or None if missing)
+        processed_groups = {}
 
         for role_name, mapping in role_principals_dict.items():
             groups = mapping.get('groups', [])
@@ -1291,17 +1297,27 @@ class KeycloakRoleManager:
             # Assign role to groups
             for group_name in groups:
                 try:
-                    # Ensure group exists and track whether it was created
                     if group_name not in processed_groups:
-                        group_id, created = self.ensure_group_exists(group_name)
-                        if created:
-                            results['created_groups'].append(group_name)
-                        else:
+                        try:
+                            group_id, _ = self.ensure_group_exists(group_name)
+                            processed_groups[group_name] = group_id
                             results['existing_groups'].append(group_name)
-                        processed_groups.add(group_name)
+                        except ValueError:
+                            logger.warning("Group '%s' does not exist in Keycloak — skipping role assignments", group_name)
+                            processed_groups[group_name] = None
+                            results['missing_groups'].append(group_name)
 
-                    # Now assign the role to the group
-                    assigned = self._assign_role_to_principal(role_name, group_name, 'group')
+                    if processed_groups[group_name] is None:
+                        results['failed'].append({
+                            'operation': 'assign_role',
+                            'role': role_name,
+                            'principal': group_name,
+                            'type': 'group',
+                            'error': f"Group '{group_name}' does not exist in Keycloak"
+                        })
+                        continue
+
+                    assigned = self._assign_role_to_principal(role_name, group_name, 'group', group_id=processed_groups[group_name])
 
                     mapping_obj = {'role': role_name, 'principal': group_name, 'type': 'group'}
                     if assigned:

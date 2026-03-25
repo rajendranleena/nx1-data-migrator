@@ -559,7 +559,7 @@ def build_keycloak_failure_response(
         "summary": {
             "created_roles": [],
             "existing_roles": [],
-            "created_groups": [],
+            "missing_groups": [],
             "existing_groups": [],
             "created_mappings": [],
             "existing_mappings": [],
@@ -603,14 +603,14 @@ def build_keycloak_success_statuses(result: Dict[str, Any], tracking_run_id: str
             "completed_at": dt.now(timezone.utc)
         })
 
-    # Process Keycloak groups - track separately from Ranger groups
-    for group_name in result.get('created_groups', []):
+    # Process missing Keycloak groups as FAILED
+    for group_name in result.get('missing_groups', []):
         statuses.append({
             "run_id": tracking_run_id,
             "object_type": "keycloak_group",
             "object_name": group_name,
-            "status": "CREATED",
-            "error_message": "",
+            "status": "FAILED",
+            "error_message": f"Group '{group_name}' does not exist in Keycloak",
             "attempt": 1,
             "started_at": dt.now(timezone.utc),
             "completed_at": dt.now(timezone.utc)
@@ -1504,7 +1504,7 @@ with DAG(
             "summary": {
                 "created_roles": result.get('created_roles', []),
                 "existing_roles": result.get('existing_roles', []),
-                "created_groups": result.get('created_groups', []),
+                "missing_groups": result.get('missing_groups', []),
                 "existing_groups": result.get('existing_groups', []),
                 "created_mappings": result.get('created_mappings', []),
                 "existing_mappings": result.get('existing_mappings', []),

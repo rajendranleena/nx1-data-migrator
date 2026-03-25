@@ -306,7 +306,7 @@ class TestCreateKeycloakRoles:
         ranger_utils_mock.KeycloakRoleManager.side_effect = None
         manager.sync_roles_and_principals.return_value = {
             "created_roles": ["role_analyst"], "existing_roles": [],
-            "created_groups": [], "existing_groups": [],
+            "missing_groups": [], "existing_groups": [],
             "created_mappings": [{"role": "role_analyst", "principal": "grp1", "type": "group"}],
             "existing_mappings": [], "failed": [],
         }
@@ -334,6 +334,81 @@ class TestCreateKeycloakRoles:
 
         assert result["connection_error"] is True
         ranger_utils_mock.KeycloakRoleManager.side_effect = None
+
+    def test_missing_group_fails_mapping(self, dag_module):
+        fn = _unwrap(dag_module, "create_keycloak_roles")
+        import sys
+        ranger_utils_mock = sys.modules["ranger_utils"]
+        manager = MagicMock()
+        ranger_utils_mock.KeycloakRoleManager.return_value = manager
+        ranger_utils_mock.KeycloakRoleManager.side_effect = None
+        manager.sync_roles_and_principals.return_value = {
+            "created_roles": ["role_analyst"], "existing_roles": [],
+            "missing_groups": ["grp1"], "existing_groups": [],
+            "created_mappings": [], "existing_mappings": [],
+            "failed": [{"operation": "assign_role", "role": "role_analyst",
+                         "principal": "grp1", "type": "group",
+                         "error": "Group 'grp1' does not exist in Keycloak"}],
+        }
+
+        with patch.object(dag_module, "get_config", return_value=_CONFIG):
+            result = fn(_parsed_data_one_policy(), "run_001", {"status": "healthy"})
+
+        group_statuses = [s for s in result["statuses"] if s["object_type"] == "keycloak_group"]
+        assert any(s["object_name"] == "grp1" and s["status"] == "FAILED" for s in group_statuses)
+
+        assert result["summary"]["missing_groups"] == ["grp1"]
+        assert result["summary"]["created_mappings"] == []
+        assert len(result["summary"]["failed"]) == 1
+
+    def test_two_roles_same_missing_group(self, dag_module):
+        """When two roles reference the same missing group, one FAILED group status and two failed mappings."""
+        fn = _unwrap(dag_module, "create_keycloak_roles")
+        import sys
+        ranger_utils_mock = sys.modules["ranger_utils"]
+        manager = MagicMock()
+        ranger_utils_mock.KeycloakRoleManager.return_value = manager
+        ranger_utils_mock.KeycloakRoleManager.side_effect = None
+        manager.sync_roles_and_principals.return_value = {
+            "created_roles": ["role_a", "role_b"], "existing_roles": [],
+            "missing_groups": ["shared_grp"], "existing_groups": [],
+            "created_mappings": [], "existing_mappings": [],
+            "failed": [
+                {"operation": "assign_role", "role": "role_a",
+                 "principal": "shared_grp", "type": "group",
+                 "error": "Group 'shared_grp' does not exist in Keycloak"},
+                {"operation": "assign_role", "role": "role_b",
+                 "principal": "shared_grp", "type": "group",
+                 "error": "Group 'shared_grp' does not exist in Keycloak"},
+            ],
+        }
+
+        parsed = {
+            "policies": {
+                "iceberg.db1.t1": {
+                    "type": "table", "roles": [
+                        {"role": "role_a", "permissions": ["read"], "groups": ["shared_grp"], "users": []},
+                        {"role": "role_b", "permissions": ["write"], "groups": ["shared_grp"], "users": []},
+                    ],
+                }
+            },
+            "role_principals": {
+                "role_a": {"groups": ["shared_grp"], "users": []},
+                "role_b": {"groups": ["shared_grp"], "users": []},
+            },
+            "skipped_rows": [],
+        }
+
+        with patch.object(dag_module, "get_config", return_value=_CONFIG):
+            result = fn(parsed, "run_001", {"status": "healthy"})
+
+        group_statuses = [s for s in result["statuses"] if s["object_type"] == "keycloak_group"]
+        assert len(group_statuses) == 1
+        assert group_statuses[0]["object_name"] == "shared_grp"
+        assert group_statuses[0]["status"] == "FAILED"
+
+        assert result["summary"]["missing_groups"] == ["shared_grp"]
+        assert len(result["summary"]["failed"]) == 2
 
     def test_attempt_num_from_context_on_failure(self, dag_module):
         """When get_current_context is available, attempt_num should flow into failure statuses."""
