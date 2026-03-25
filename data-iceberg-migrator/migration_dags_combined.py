@@ -684,6 +684,8 @@ for tbl in table_list:
         loc = None
         table_type = "UNKNOWN"
         input_format = None
+        serde_properties = {{}}
+        in_serde_section = False
 
         for row in desc_rows:
             col_name = (row.col_name or "").strip().rstrip(":").lower()
@@ -695,6 +697,15 @@ for tbl in table_list:
                 table_type = data_type.replace("_TABLE", "")
             elif col_name == "inputformat":
                 input_format = data_type
+            elif col_name in ("storage properties", "serde library", "serialization lib"):
+                in_serde_section = True
+            elif in_serde_section and col_name and not col_name.startswith("#"):
+                if col_name in (
+                    "field.delim", "escape.delim", "null.format", "field delimiter"
+                ):
+                    serde_properties[col_name] = data_type
+            elif col_name.startswith("#"):
+                in_serde_section = False
 
         source_total_size = 0
         source_file_count = 0
@@ -798,6 +809,7 @@ for tbl in table_list:
             "unregistered_partitions": unregistered_partitions,
             "table_type": table_type,
             "source_total_size_bytes": source_total_size,
+            "serde_properties": serde_properties,
             "source_file_count": source_file_count
         }})
 
@@ -820,6 +832,7 @@ for tbl in table_list:
             "table_type": "UNKNOWN",
             "source_total_size_bytes": 0,
             "source_file_count": 0,
+            "serde_properties": serde_properties,
             "error": str(e)[:500]
         }})
 
@@ -1379,6 +1392,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
         schema_list = t.get('schema', [])
         part_cols_str = t.get('partition_columns', '')
         is_part = t.get('is_partitioned', False)
+        serde_props = t.get('serde_properties', {})
         full_name = f"{dest_db}.{tbl}"
 
         logger.info(f"[HiveTable] Processing {full_name} | format={fmt} | partitioned={is_part}")
@@ -1429,11 +1443,27 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                         pdefs.append(f"`{pc}` {ptype}")
                     part_clause = f"PARTITIONED BY ({', '.join(pdefs)})"
 
+                row_format_clause = ""
+                tbl_properties_clause = ""
+                if fmt == "TEXTFILE" and serde_props:
+                    field_delim = serde_props.get("field.delim") or serde_props.get("field delimiter", "")
+                    escape_delim = serde_props.get("escape.delim", "")
+                    null_format = serde_props.get("null.format", "")
+
+                    if field_delim:
+                        row_format_clause = f"ROW FORMAT DELIMITED FIELDS TERMINATED BY '{field_delim}'"
+                        if escape_delim:
+                            row_format_clause += f" ESCAPED BY '{escape_delim}'"
+                    if null_format:
+                        tbl_properties_clause = f"TBLPROPERTIES ('serialization.null.format'='{null_format}')"
+
                 ddl = f"""
                     CREATE EXTERNAL TABLE IF NOT EXISTS {full_name} ({col_def})
                     {part_clause}
+                    {row_format_clause}
                     STORED AS {fmt}
                     LOCATION '{s3_loc}'
+                    {tbl_properties_clause}
                 """
                 spark.sql(ddl)
 
