@@ -675,17 +675,16 @@ table_list = resolve_tokens(spark, src_db, tokens)
 metadata = []
 
 for tbl in table_list:
+    loc = None
+    table_type = "UNKNOWN"
+    input_format = None
+    serde_properties = {{}}
+    in_serde_section = False
     try:
         desc_df = spark.sql(
             "DESCRIBE FORMATTED {{0}}.{{1}}".format(src_db, tbl)
         )
         desc_rows = desc_df.collect()
-
-        loc = None
-        table_type = "UNKNOWN"
-        input_format = None
-        serde_properties = {{}}
-        in_serde_section = False
 
         for row in desc_rows:
             col_name = (row.col_name or "").strip().rstrip(":").lower()
@@ -697,15 +696,21 @@ for tbl in table_list:
                 table_type = data_type.replace("_TABLE", "")
             elif col_name == "inputformat":
                 input_format = data_type
-            elif col_name in ("storage properties", "serde library", "serialization lib"):
-                in_serde_section = True
-            elif in_serde_section and col_name and not col_name.startswith("#"):
-                if col_name in (
-                    "field.delim", "escape.delim", "null.format", "field delimiter"
-                ):
-                    serde_properties[col_name] = data_type
-            elif col_name.startswith("#"):
-                in_serde_section = False
+            elif col_name in (
+                "storage properties",
+                "storage desc params",
+                "serde library",
+                "serialization lib",
+                "parameters",
+            ):
+                raw = data_type.strip("[]")
+                for pair in raw.split(", "):
+                    if "=" in pair:
+                        k, _, v = pair.partition("=")
+                        k = k.strip()
+                        v = v.strip()
+                        if k in ("field.delim", "escape.delim", "null.format", "field delimiter"):
+                            serde_properties[k] = v
 
         source_total_size = 0
         source_file_count = 0
