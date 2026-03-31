@@ -65,3 +65,103 @@ class TestExecuteWithIcebergRetry:
         with patch('time.sleep'), pytest.raises(Exception, match="persistent error"):
             m.execute_with_iceberg_retry(mock_spark, "BAD SQL")
         assert mock_spark.sql.call_count == 6
+
+
+# ---------------------------------------------------------------------------
+# _build_s3_opts
+# ---------------------------------------------------------------------------
+class TestBuildS3Opts:
+    """Unit tests for the _build_s3_opts credential-builder helper."""
+
+    def _cfg(self, endpoint='', access_key='GLOBALAK', secret_key='GLOBALSK'):
+        return {'s3_endpoint': endpoint, 's3_access_key': access_key, 's3_secret_key': secret_key}
+
+    # ------------------------------------------------------------------
+    # Case 2: no dest_endpoint — original unscoped global config behaviour
+    # ------------------------------------------------------------------
+
+    def test_global_creds_emitted_unscoped(self):
+        opts = m._build_s3_opts('s3a://data-lake', self._cfg())
+        assert 'fs.s3a.access.key=GLOBALAK' in opts
+        assert 'fs.s3a.secret.key=GLOBALSK' in opts
+        assert 'fs.s3a.bucket.' not in opts
+
+    def test_global_endpoint_emitted_unscoped(self):
+        opts = m._build_s3_opts('s3a://data-lake', self._cfg(endpoint='https://s3.default.example.com'))
+        assert 'fs.s3a.endpoint=https://s3.default.example.com' in opts
+        assert 'fs.s3a.bucket.' not in opts
+
+    def test_case2_same_output_regardless_of_s3_url_prefix(self):
+        """Case 2 emits unscoped props — bucket name in URL does not matter."""
+        for url in ('s3://bucket-x', 's3n://bucket-x', 's3a://bucket-x', ''):
+            opts = m._build_s3_opts(url, self._cfg())
+            assert 'fs.s3a.access.key=GLOBALAK' in opts
+            assert 'fs.s3a.secret.key=GLOBALSK' in opts
+            assert 'fs.s3a.bucket.' not in opts
+
+    def test_empty_global_creds_produce_empty_string(self):
+        opts = m._build_s3_opts('s3a://data-lake', self._cfg(access_key='', secret_key=''))
+        assert opts == ''
+
+    def test_no_endpoint_no_creds_produces_empty_string(self):
+        opts = m._build_s3_opts('', self._cfg(access_key='', secret_key=''))
+        assert opts == ''
+
+    # ------------------------------------------------------------------
+    # Case 1: dest_endpoint provided — endpoint-hostname credential lookup
+    # ------------------------------------------------------------------
+
+    def test_endpoint_used_directly(self):
+        ep = 'https://s3.tenant-a.example.com'
+        with patch('airflow.models.Variable.get', return_value=''):
+            opts = m._build_s3_opts('s3a://data-lake', self._cfg(), dest_endpoint=ep)
+        assert f'fs.s3a.bucket.data-lake.endpoint={ep}' in opts
+
+    def test_endpoint_creds_looked_up_by_hostname(self):
+        ep = 'https://s3.tenant-a.example.com'
+        def fake_var(key, default_var=''):
+            return {'s3.tenant-a.example.com_access_key': 'TENANTAAK',
+                    's3.tenant-a.example.com_secret_key': 'TENANTASK'}.get(key, default_var)
+        with patch('airflow.models.Variable.get', side_effect=fake_var):
+            opts = m._build_s3_opts('s3a://data-lake', self._cfg(), dest_endpoint=ep)
+        assert 'fs.s3a.bucket.data-lake.access.key=TENANTAAK' in opts
+        assert 'fs.s3a.bucket.data-lake.secret.key=TENANTASK' in opts
+
+    def test_endpoint_creds_fall_back_to_global_when_variable_absent(self):
+        ep = 'https://s3.tenant-a.example.com'
+        with patch('airflow.models.Variable.get', return_value=''):
+            opts = m._build_s3_opts('s3a://data-lake', self._cfg(), dest_endpoint=ep)
+        assert 'fs.s3a.bucket.data-lake.access.key=GLOBALAK' in opts
+        assert 'fs.s3a.bucket.data-lake.secret.key=GLOBALSK' in opts
+
+    def test_two_different_endpoints_same_bucket_produce_different_opts(self):
+        ep_a = 'https://s3.tenant-a.example.com'
+        ep_b = 'https://s3.tenant-b.example.com'
+        def fake_var(key, default_var=''):
+            mapping = {
+                's3.tenant-a.example.com_access_key': 'AK_A',
+                's3.tenant-b.example.com_access_key': 'AK_B',
+            }
+            return mapping.get(key, default_var)
+        with patch('airflow.models.Variable.get', side_effect=fake_var):
+            opts_a = m._build_s3_opts('s3a://data-lake', self._cfg(), dest_endpoint=ep_a)
+            opts_b = m._build_s3_opts('s3a://data-lake', self._cfg(), dest_endpoint=ep_b)
+        assert f'endpoint={ep_a}' in opts_a
+        assert f'endpoint={ep_b}' in opts_b
+        assert 'AK_A' in opts_a
+        assert 'AK_B' in opts_b
+        assert opts_a != opts_b
+
+    def test_global_creds_not_used_when_endpoint_hostname_variable_present(self):
+        """Endpoint-scoped Variable must win over global config key."""
+        ep = 'https://s3.tenant-x.example.com'
+        def fake_var(key, default_var=''):
+            if key == 's3.tenant-x.example.com_access_key':
+                return 'TENANT_X_AK'
+            if key == 's3.tenant-x.example.com_secret_key':
+                return 'TENANT_X_SK'
+            return default_var
+        with patch('airflow.models.Variable.get', side_effect=fake_var):
+            opts = m._build_s3_opts('s3a://data-lake', self._cfg(), dest_endpoint=ep)
+        assert 'TENANT_X_AK' in opts
+        assert 'GLOBALAK' not in opts

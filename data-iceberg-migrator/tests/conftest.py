@@ -356,19 +356,38 @@ def sample_folder_run_id():
 
 @pytest.fixture
 def sample_folder_config(sample_folder_run_id):
-    return {'run_id': sample_folder_run_id, 'source_path': '/data/sales/raw', 'dest_bucket': 's3a://test-bucket', 'dest_folder': 'raw'}
+    return {
+        'run_id': sample_folder_run_id,
+        'source_path': '/data/sales/raw',
+        'dest_bucket': 's3a://test-bucket',
+        'dest_folder': 'raw',
+        'dest_endpoint': '',
+    }
+
 
 @pytest.fixture
 def sample_folder_distcp_result(sample_folder_run_id):
     return {
-        'run_id': sample_folder_run_id, 'source_path': '/data/sales/raw',
-        'dest_bucket': 's3a://test-bucket', 'dest_path': 'raw',
-        'status': 'COMPLETED', 'started_at': '2025-01-01 12:00:00', 'completed_at': '2025-01-01 12:05:00',
-        'source_file_count': 20, 'source_size_bytes': 50 * 1024 * 1024,
-        'dest_file_count': 20, 'dest_size_bytes': 50 * 1024 * 1024,
-        'files_copied': 20, 'bytes_copied': 50 * 1024 * 1024,
-        'is_incremental': False, 'file_count_match': True, 'size_match': True, 'error': None,
+        'run_id': sample_folder_run_id,
+        'source_path': '/data/sales/raw',
+        'dest_bucket': 's3a://test-bucket',
+        'dest_path': 'raw',
+        'dest_endpoint': '',
+        'status': 'COMPLETED',
+        'started_at': '2025-01-01 12:00:00',
+        'completed_at': '2025-01-01 12:05:00',
+        'source_file_count': 20,
+        'source_size_bytes': 50 * 1024 * 1024,
+        'dest_file_count': 20,
+        'dest_size_bytes': 50 * 1024 * 1024,
+        'files_copied': 20,
+        'bytes_copied': 50 * 1024 * 1024,
+        'is_incremental': False,
+        'file_count_match': True,
+        'size_match': True,
+        'error': None,
     }
+
 
 @pytest.fixture
 def sample_folder_validation_result(sample_folder_distcp_result):

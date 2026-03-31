@@ -45,14 +45,64 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | Variable                     | Default          | Description                                  |
 | ---------------------------- | ---------------- | -------------------------------------------- |
 | `cluster_edge_temp_path`     | `/tmp/migration` | Temporary directory on edge node             |
-| `s3_endpoint`                | _(empty)_        | Custom S3 endpoint URL                       |
-| `s3_access_key`              | _(empty)_        | S3 access key (if not using IAM)             |
-| `s3_secret_key`              | _(empty)_        | S3 secret key (if not using IAM)             |
+| `s3_endpoint`                | _(empty)_        | Default S3 endpoint URL (all buckets)        |
+| `s3_access_key`              | _(empty)_        | Default S3 access key (all buckets)          |
+| `s3_secret_key`              | _(empty)_        | Default S3 secret key (all buckets)          |
 | `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                     |
 | `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)            |
 | `s3_listing_tool`            | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`     |
 | `migration_smtp_conn_id`     | `smtp_default`   | Airflow SMTP connection ID for email reports |
 | `migration_email_recipients` | _(empty)_        | Comma-separated email addresses for reports  |
+
+### Multi-Tenant S3 Credentials (endpoint-based overrides)
+
+When destination buckets live on **different S3 tenant managers** you can route
+each row to the correct tenant by adding an `endpoint` column to the Excel
+configuration file. Rows without an `endpoint` value continue to use the global
+`s3_access_key` / `s3_secret_key` / `s3_endpoint` Variables.
+
+#### How it works
+
+For each Excel row that has a non-empty `endpoint` value:
+1. The endpoint URL is used directly as the Hadoop S3A endpoint for that destination bucket.
+2. Credentials are looked up by the **hostname** of that endpoint URL, with `_access_key` and `_secret_key` suffixes.
+
+| Airflow Variable (set as masked) | Env var equivalent | Description |
+| -------------------------------- | -------------------- | --------------------------------------------- |
+| `<ep-hostname>_access_key` | `<EP_HOSTNAME>_ACCESS_KEY` | Access key for the endpoint (masked) |
+| `<ep-hostname>_secret_key` | `<EP_HOSTNAME>_SECRET_KEY` | Secret key for the endpoint (masked) |
+
+The hostname slug is derived from the `endpoint` value: dots and hyphens become underscores for the env-var form.
+
+**Example** — Excel row has `endpoint = https://s3.tenant-a.example.com`:
+
+```
+Airflow Variables:
+  s3.tenant-a.example.com_access_key  →  AKIA...
+  s3.tenant-a.example.com_secret_key  →  abc123...
+
+Equivalent env vars (fallback):
+  S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY=AKIA...
+  S3_TENANT_A_EXAMPLE_COM_SECRET_KEY=abc123...
+```
+
+#### Credential resolution order per row
+
+1. **Endpoint provided in Excel** → credentials looked up via `<ep-hostname>_access_key` / `_secret_key` Variable (or env var), endpoint used as-is
+2. **No endpoint in Excel** → global `s3_access_key` / `s3_secret_key` / `s3_endpoint` from Airflow Variables
+3. Hadoop's own credential chain (e.g. IAM instance role) as final fallback
+
+Rows without an `endpoint` value are unaffected — no changes required for
+single-tenant setups.
+
+> **Same bucket name on two tenants:** Because credential lookup is keyed on
+> the *endpoint hostname* (not the bucket name), two buckets both named
+> `data-lake` on different tenants are fully supported as long as each row in the
+> Excel file has the correct `endpoint` value.
+
+> **Security note:** Create `_access_key` and `_secret_key` Variables with
+> **"Mask Variable value"** checked in the Airflow UI so secrets are never
+> exposed in task logs.
 
 ---
 
@@ -191,12 +241,13 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 
 **Required Columns:**
 
-| Column          | Required | Description                                                                                                                                                   | Example                 |
-| --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
-| `database`      | **Yes**  | Source database name                                                                                                                                          | `sales_data`            |
-| `table`         | No       | Table pattern: supports \* wildcards, comma-separated table names (e.g. table1,table2), or one table per row for same database (rows are combined internally) | `transactions_*` or `*` |
-| `dest database` | No       | Destination database (defaults to source)                                                                                                                     | `sales_data_s3`         |
-| `bucket`        | No       | S3 bucket (defaults to variable)                                                                                                                              | `s3a://data-lake`       |
+| Column          | Required | Description                                                                                                                                                   | Example                             |
+| --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `database`      | **Yes**  | Source database name                                                                                                                                          | `sales_data`                        |
+| `table`         | No       | Table pattern: supports \* wildcards, comma-separated table names (e.g. table1,table2), or one table per row for same database (rows are combined internally) | `transactions_*` or `*`             |
+| `dest database` | No       | Destination database (defaults to source)                                                                                                                     | `sales_data_s3`                     |
+| `bucket`        | No       | S3 bucket (defaults to variable)                                                                                                                              | `s3a://data-lake`                   |
+| `endpoint`      | No       | S3 endpoint URL for a non-default tenant; credentials resolved via `<hostname>_access_key/secret_key` Variables (see Multi-Tenant section)                   | `https://s3.tenant-a.example.com`   |
 
 ---
 
@@ -958,11 +1009,12 @@ Copies raw folders from MapR-FS/HDFS to S3 using Hadoop DistCp via SSH, with no 
 
 **Required Columns:**
 
-| Column          | Required | Description                                                                                      | Example                         |
-| --------------- | -------- | ------------------------------------------------------------------------------------------------ | ------------------------------- |
-| `source_path`   | **Yes**  | Full MapR/HDFS source path                                                                       | `/mapr/cluster1/data/raw/sales` |
-| `target_bucket` | **Yes**  | S3 bucket — normalised to `s3a://`                                                               | `s3a://data-lake`               |
-| `dest_folder`   | No       | Destination folder inside the bucket; defaults to the basename of `source_path` if not specified | `sales`                         |
+| Column          | Required | Description                                                                                      | Example                             |
+| --------------- | -------- | ------------------------------------------------------------------------------------------------ | ----------------------------------- |
+| `source_path`   | **Yes**  | Full MapR/HDFS source path                                                                       | `/mapr/cluster1/data/raw/sales`     |
+| `target_bucket` | **Yes**  | S3 bucket — normalised to `s3a://`                                                               | `s3a://data-lake`                   |
+| `dest_folder`   | No       | Destination folder inside the bucket; defaults to the basename of `source_path` if not specified | `sales`                             |
+| `endpoint`      | No       | S3 endpoint URL for a non-default tenant; credentials resolved via `<hostname>_access_key/secret_key` Variables (see Multi-Tenant section)                   | `https://s3.tenant-a.example.com`   |
 
 **Default Behaviour:**
 

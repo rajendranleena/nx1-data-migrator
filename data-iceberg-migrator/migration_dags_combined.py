@@ -160,6 +160,187 @@ DEFAULT_ARGS = {
     'retry_delay': timedelta(minutes=5),
 }
 
+
+def _build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -> str:
+    """Build per-bucket Hadoop S3A JVM options scoped to the destination bucket name.
+
+    Resolution order:
+      Case 1 — dest_endpoint is provided (from the Excel 'endpoint' column):
+        - Endpoint  : used directly from dest_endpoint.
+        - Credentials: looked up via Airflow Variable '<endpoint-hostname>_access_key/secret_key'
+                       or env var '<ENDPOINT_HOSTNAME>_ACCESS_KEY/SECRET_KEY'.
+        - Emitted as fs.s3a.bucket.<name>.* so multi-tenant rows in one DistCp command
+          carry isolated credentials per bucket.
+        The endpoint hostname is used as the credential slug so that two buckets with the
+        same name on different tenant managers are always disambiguated by their endpoint.
+
+      Case 2 — no dest_endpoint (original single-tenant behaviour, unchanged):
+        - Uses the global config keys s3_endpoint / s3_access_key / s3_secret_key.
+        - Emitted as unscoped fs.s3a.* properties, exactly as before this feature.
+        - If those are also empty, Hadoop uses its own credential chain (e.g. IAM role).
+
+    Credential Variable naming (Case 1):
+      Slug = hostname of dest_endpoint, lowercased, e.g. "s3.tenant-a.example.com"
+      Hyphens and dots are kept in the Airflow Variable name; env var uses underscores.
+
+      Airflow Variable                          Environment variable
+      ----------------------------------------- -------------------------------------------
+      s3.tenant-a.example.com_access_key        S3_TENANT_A_EXAMPLE_COM_ACCESS_KEY  (masked)
+      s3.tenant-a.example.com_secret_key        S3_TENANT_A_EXAMPLE_COM_SECRET_KEY  (masked)
+    """
+    from urllib.parse import urlparse
+
+    # Extract bare bucket name from the destination URL
+    raw = (dest_bucket_url or '').strip()
+    for prefix in ('s3a://', 's3n://', 's3://'):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    bucket_name = urlparse(f's3a://{raw}').netloc.lower().strip()
+
+    if not bucket_name:
+        logger.warning(f"[_build_s3_opts] Could not extract bucket name from '{dest_bucket_url}' — falling back to global credentials")
+
+    endpoint = (dest_endpoint or '').strip()
+
+    if endpoint and bucket_name:
+        # Case 1: row-level endpoint provided — use endpoint hostname as credential slug
+        ep_hostname = urlparse(endpoint).hostname or urlparse(endpoint).netloc or endpoint
+        ep_hostname = ep_hostname.lower().strip()
+        env_slug = ep_hostname.upper().replace('.', '_').replace('-', '_')
+
+        access_key = (Variable.get(f'{ep_hostname}_access_key',
+                                   default_var=os.getenv(f'{env_slug}_ACCESS_KEY', ''))
+                      or config.get('s3_access_key') or '')
+        secret_key = (Variable.get(f'{ep_hostname}_secret_key',
+                                   default_var=os.getenv(f'{env_slug}_SECRET_KEY', ''))
+                      or config.get('s3_secret_key') or '')
+
+        s3_opts = f" -Dfs.s3a.bucket.{bucket_name}.endpoint={endpoint}"
+        if access_key:
+            s3_opts += f" -Dfs.s3a.bucket.{bucket_name}.access.key={access_key}"
+        if secret_key:
+            s3_opts += f" -Dfs.s3a.bucket.{bucket_name}.secret.key={secret_key}"
+        return s3_opts
+
+    # Case 2: no row-level endpoint — use global config keys (original behaviour, unscoped)
+    global_endpoint   = config.get('s3_endpoint')   or ''
+    global_access_key = config.get('s3_access_key') or ''
+    global_secret_key = config.get('s3_secret_key') or ''
+
+    s3_opts = ""
+    if global_endpoint:
+        s3_opts += f" -Dfs.s3a.endpoint={global_endpoint}"
+    if global_access_key:
+        s3_opts += f" -Dfs.s3a.access.key={global_access_key}"
+    if global_secret_key:
+        s3_opts += f" -Dfs.s3a.secret.key={global_secret_key}"
+    return s3_opts
+
+
+def _validate_bucket_endpoint_pairs(grouped: dict, config: dict) -> None:
+    """Pre-flight check: verify each (bucket, endpoint) pair in the Excel config is reachable"""
+    try:
+        from urllib.parse import urlparse as _urlparse
+
+        import boto3
+        from botocore.exceptions import ClientError
+    except ImportError:
+        logger.warning(
+            "[ValidateBucketEndpoint] boto3 not available — skipping pre-flight validation"
+        )
+        return
+
+    errors = []
+    checked: set = set()
+
+    for (src_db, _dest_db, bucket_val, endpoint_val), _group in grouped.items():
+        if not endpoint_val:
+            continue
+
+        pair = (bucket_val, endpoint_val)
+        if pair in checked:
+            continue
+        checked.add(pair)
+
+        raw = bucket_val.strip()
+        for prefix in ('s3a://', 's3n://', 's3://'):
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):]
+                break
+        bucket_name = _urlparse(f's3a://{raw}').netloc.lower().strip()
+
+        if not bucket_name:
+            errors.append(
+                f"  - src_db={src_db}: could not extract bucket name from '{bucket_val}'"
+            )
+            continue
+
+        ep_hostname = (
+            _urlparse(endpoint_val).hostname
+            or _urlparse(endpoint_val).netloc
+            or endpoint_val
+        )
+        ep_hostname = ep_hostname.lower().strip()
+        env_slug = ep_hostname.upper().replace('.', '_').replace('-', '_')
+
+        access_key = (
+            Variable.get(f'{ep_hostname}_access_key',
+                         default_var=os.getenv(f'{env_slug}_ACCESS_KEY', ''))
+            or config.get('s3_access_key') or ''
+        )
+        secret_key = (
+            Variable.get(f'{ep_hostname}_secret_key',
+                         default_var=os.getenv(f'{env_slug}_SECRET_KEY', ''))
+            or config.get('s3_secret_key') or ''
+        )
+
+        try:
+            s3 = boto3.client(
+                's3',
+                endpoint_url=endpoint_val,
+                aws_access_key_id=access_key or None,
+                aws_secret_access_key=secret_key or None,
+            )
+            s3.head_bucket(Bucket=bucket_name)
+            logger.info(
+                f"[ValidateBucketEndpoint] ✓ bucket='{bucket_name}' "
+                f"reachable at endpoint='{endpoint_val}'"
+            )
+        except ClientError as exc:
+            code = exc.response.get('Error', {}).get('Code', '')
+            if code in ('403', 'AccessDenied'):
+                logger.warning(
+                    f"[ValidateBucketEndpoint] bucket='{bucket_name}' at "
+                    f"endpoint='{endpoint_val}' returned 403 — bucket exists but "
+                    f"credentials may lack full access. Proceeding."
+                )
+            elif code in ('404', 'NoSuchBucket'):
+                errors.append(
+                    f"  - src_db={src_db}: bucket='{bucket_name}' does NOT exist at "
+                    f"endpoint='{endpoint_val}' (HTTP 404) — "
+                    f"likely a bucket/endpoint mismatch in the Excel config"
+                )
+            else:
+                errors.append(
+                    f"  - src_db={src_db}: bucket='{bucket_name}' at "
+                    f"endpoint='{endpoint_val}' returned unexpected S3 error "
+                    f"{code}: {exc}"
+                )
+        except Exception as exc:
+            errors.append(
+                f"  - src_db={src_db}: could not reach endpoint='{endpoint_val}' "
+                f"for bucket='{bucket_name}': {exc}"
+            )
+
+    if errors:
+        raise Exception(
+            f"[ParseExcel] Bucket/endpoint validation failed for {len(errors)} "
+            f"pair(s). Fix the Excel config and re-trigger the DAG:\n"
+            + "\n".join(errors)
+        )
+
+
 # =============================================================================
 # DAG 1: MAPR TO S3 MIGRATION TASKS
 # =============================================================================
@@ -468,27 +649,34 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         raw_bucket = '' if (raw_bucket_val is None or (isinstance(raw_bucket_val, float) and __import__('math').isnan(raw_bucket_val)) or str(raw_bucket_val).strip().lower() == 'nan') else str(raw_bucket_val).strip()
         bucket_val = normalize_bucket(raw_bucket) if raw_bucket else config['default_s3_bucket']
 
-        key = (src_db, dest_db, bucket_val)
+        raw_endpoint_val = row.get('endpoint', '')
+        endpoint_val = '' if (raw_endpoint_val is None or (isinstance(raw_endpoint_val, float) and __import__('math').isnan(raw_endpoint_val)) or str(raw_endpoint_val).strip().lower() in ('', 'nan')) else str(raw_endpoint_val).strip()
+
+        # Grouping key includes endpoint so same bucket on different tenants gets separate task instances
+        key = (src_db, dest_db, bucket_val, endpoint_val)
         if key not in grouped:
-            grouped[key] = {'bucket': bucket_val, 'tokens': []}
+            grouped[key] = {'bucket': bucket_val, 'endpoint': endpoint_val, 'tokens': []}
 
         for tok in raw_cell.split(','):
             tok = tok.strip()
             if tok:
                 grouped[key]['tokens'].append(tok)
 
+    _validate_bucket_endpoint_pairs(grouped, config)
     configs = []
 
-    for (src_db, dest_db, bucket_val), group in grouped.items():
+    for (src_db, dest_db, bucket_val, endpoint_val), group in grouped.items():
         unique_tokens = list(dict.fromkeys(group['tokens']))
         if '*' in unique_tokens:
             unique_tokens = ['*']
 
         bucket_val = group['bucket']
+        endpoint_val = group['endpoint']
 
         logger.info(
-            f"[ParseExcel] {src_db} -> dest={dest_db} | bucket={bucket_val} | "
-            f"tokens={unique_tokens[:10]}"
+            f"[ParseExcel] {src_db} -> dest={dest_db} | bucket={bucket_val}"
+            + (f" | endpoint={endpoint_val}" if endpoint_val else "")
+            + f" | tokens={unique_tokens[:10]}"
             + (" ..." if len(unique_tokens) > 10 else "")
         )
 
@@ -497,6 +685,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
             'table_tokens': unique_tokens,
             'dest_database': dest_db,
             'dest_bucket': bucket_val,
+            'dest_endpoint': endpoint_val,
             'run_id': run_id,
         })
 
@@ -620,9 +809,13 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
         raw_tokens = [t.strip() for t in pattern_str.split(',') if t.strip()] or ['*']
     dest_db = db_config['dest_database']
     dest_bucket = db_config['dest_bucket']
+    dest_endpoint = db_config.get('dest_endpoint', '')
     tokens_json = json.dumps(raw_tokens)
 
     dest_bucket_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', dest_bucket)
+    if dest_endpoint:
+        dest_endpoint_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', dest_endpoint)
+        dest_bucket_slug = f"{dest_bucket_slug}_{dest_endpoint_slug}"
 
     pyspark_script = '''
 import json
@@ -926,6 +1119,7 @@ spark.stop()
         'source_database': src_db,
         'dest_database': dest_db,
         'dest_bucket': dest_bucket,
+        'dest_endpoint': dest_endpoint,
         'tables': metadata
     }
 
@@ -1053,17 +1247,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
     mappers = config['distcp_mappers']
     bandwidth = config['distcp_bandwidth']
 
-    s3_endpoint = config['s3_endpoint']
-    s3_access_key = config['s3_access_key']
-    s3_secret_key = config['s3_secret_key']
-
-    s3_opts = ""
-    if s3_endpoint:
-        s3_opts += f" -Dfs.s3a.endpoint={s3_endpoint}"
-    if s3_access_key:
-        s3_opts += f" -Dfs.s3a.access.key={s3_access_key}"
-    if s3_secret_key:
-        s3_opts += f" -Dfs.s3a.secret.key={s3_secret_key}"
+    s3_opts = _build_s3_opts(discovery['dest_bucket'], config, discovery.get('dest_endpoint', ''))
 
     source_profile = "source ~/.profile 2>/dev/null || true\n"
 
@@ -4145,6 +4329,8 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
       - target_bucket (required) : S3 bucket, normalised to s3a://
       - dest_folder   (optional) : Destination folder inside the bucket;
                                    defaults to the basename of source_path
+      - endpoint      (optional) : S3 endpoint URL for non-default tenants;
+                                   credentials looked up via <hostname>_access_key/secret_key Variables
     Returns a list of dicts, one per valid row.
     """
     import os
@@ -4179,7 +4365,7 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
             continue
 
         raw_bucket = str(row.get('target_bucket', '') or '').strip()
-        if not raw_bucket:
+        if not raw_bucket or raw_bucket.lower() in ('nan', 'none'):
             logger.warning(f"[FolderCopy] Skipping row — missing target_bucket for source_path={source_path!r}")
             skipped += 1
             continue
@@ -4190,11 +4376,15 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
         # Default dest_folder to the basename of source_path when not specified
         dest_folder = raw_dest_folder if raw_dest_folder else os.path.basename(source_path.rstrip('/'))
 
+        raw_endpoint = row.get('endpoint', '')
+        dest_endpoint = '' if (raw_endpoint is None or str(raw_endpoint).strip().lower() in ('', 'nan', 'none')) else str(raw_endpoint).strip()
+
         config_entry = {
             'run_id': run_id,
             'source_path': source_path,
             'dest_bucket': dest_bucket,
             'dest_folder': dest_folder,
+            'dest_endpoint': dest_endpoint,
         }
         logger.info(
             f"[FolderCopy] Parsed: {source_path} -> {dest_bucket}/{dest_folder}"
@@ -4222,22 +4412,13 @@ def run_folder_distcp_ssh(folder_config: dict, **context) -> dict:
     source_path = folder_config['source_path']
     dest_bucket = folder_config['dest_bucket']
     dest_folder = folder_config['dest_folder']
+    dest_endpoint = folder_config.get('dest_endpoint', '')
     s3_dest = f"{dest_bucket}/{dest_folder}"
 
     mappers = config['distcp_mappers']
     bandwidth = config['distcp_bandwidth']
 
-    s3_endpoint = config['s3_endpoint']
-    s3_access_key = config['s3_access_key']
-    s3_secret_key = config['s3_secret_key']
-
-    s3_opts = ""
-    if s3_endpoint:
-        s3_opts += f" -Dfs.s3a.endpoint={s3_endpoint}"
-    if s3_access_key:
-        s3_opts += f" -Dfs.s3a.access.key={s3_access_key}"
-    if s3_secret_key:
-        s3_opts += f" -Dfs.s3a.secret.key={s3_secret_key}"
+    s3_opts = _build_s3_opts(dest_bucket, config, dest_endpoint)
 
     source_profile = "source ~/.profile 2>/dev/null || true\n"
 
@@ -4358,6 +4539,7 @@ exit 0
                 'source_path': source_path,
                 'dest_bucket': dest_bucket,
                 'dest_path': dest_folder,
+                'dest_endpoint': dest_endpoint,
                 'status': 'COMPLETED',
                 'started_at': started_at_str,
                 'completed_at': completed_at.strftime('%Y-%m-%d %H:%M:%S'),
@@ -4382,6 +4564,7 @@ exit 0
             'source_path': source_path,
             'dest_bucket': dest_bucket,
             'dest_path': dest_folder,
+            'dest_endpoint': dest_endpoint,
             'status': 'FAILED',
             'started_at': started_at_str,
             'completed_at': completed_at.strftime('%Y-%m-%d %H:%M:%S'),
@@ -4472,19 +4655,10 @@ def validate_data_copy(copy_status: dict, **context) -> dict:
     source_path = copy_status['source_path']
     dest_bucket = copy_status['dest_bucket']
     dest_path   = copy_status['dest_path']
+    dest_endpoint = copy_status.get('dest_endpoint', '')
     s3_dest     = f"{dest_bucket}/{dest_path}"
 
-    s3_endpoint  = config['s3_endpoint']
-    s3_access_key = config['s3_access_key']
-    s3_secret_key = config['s3_secret_key']
-
-    s3_opts = ""
-    if s3_endpoint:
-        s3_opts += f" -Dfs.s3a.endpoint={s3_endpoint}"
-    if s3_access_key:
-        s3_opts += f" -Dfs.s3a.access.key={s3_access_key}"
-    if s3_secret_key:
-        s3_opts += f" -Dfs.s3a.secret.key={s3_secret_key}"
+    s3_opts = _build_s3_opts(dest_bucket, config, dest_endpoint)
 
     # If the copy itself failed, skip SSH validation and mark as VALIDATION_SKIPPED
     if copy_status.get('status') == 'FAILED':

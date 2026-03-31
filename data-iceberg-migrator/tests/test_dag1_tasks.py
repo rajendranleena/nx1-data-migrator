@@ -104,7 +104,80 @@ class TestParseExcel:
         result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
         assert set(result[0]['table_tokens']) == {'tbl_a', 'tbl_b', 'tbl_c'}
 
+    def test_s3_bucket_normalized(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'mydb', 'table': '*', 'dest database': '', 'bucket': 's3://plain-bucket'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert result[0]['dest_bucket'].startswith('s3a://')
 
+    def test_dest_database_defaults_to_source(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'sourcedb', 'table': '*', 'dest database': None, 'bucket': None},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert result[0]['dest_database'] == 'sourcedb'
+
+    def test_wildcard_overrides_other_tokens(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db', 'table': 'tbl_a', 'dest database': '', 'bucket': ''},
+            {'database': 'db', 'table': '*', 'dest database': '', 'bucket': ''},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        # When * is present, tokens should collapse to ['*']
+        assert result[0]['table_tokens'] == ['*']
+
+    def test_run_id_embedded_in_each_config(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': '*', 'dest database': '', 'bucket': ''},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_xyz', spark=mock_spark)
+        assert result[0]['run_id'] == 'run_xyz'
+
+    def test_dest_endpoint_emitted_when_present(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': '*', 'dest database': '', 'bucket': 's3a://bkt',
+            'endpoint': 'https://s3.tenant-a.example.com'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_xyz', spark=mock_spark)
+        assert result[0]['dest_endpoint'] == 'https://s3.tenant-a.example.com'
+
+    def test_dest_endpoint_defaults_to_empty_when_absent(self, mock_spark):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': '*', 'dest database': '', 'bucket': 's3a://bkt'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert result[0]['dest_endpoint'] == ''
+
+    def test_same_bucket_different_endpoint_produces_two_configs(self, mock_spark):
+        """Same (src_db, dest_db, bucket) but different endpoints must not be merged."""
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': 'tbl_a', 'dest database': 'db1_s3', 'bucket': 's3a://data-lake',
+            'endpoint': 'https://s3.tenant-a.example.com'},
+            {'database': 'db1', 'table': 'tbl_b', 'dest database': 'db1_s3', 'bucket': 's3a://data-lake',
+            'endpoint': 'https://s3.tenant-b.example.com'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert len(result) == 2
+        endpoints = {r['dest_endpoint'] for r in result}
+        assert endpoints == {'https://s3.tenant-a.example.com', 'https://s3.tenant-b.example.com'}
+
+    def test_same_bucket_same_endpoint_merged_into_one_config(self, mock_spark):
+        """Same (src_db, dest_db, bucket, endpoint) on two rows must merge tokens."""
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': 'tbl_a', 'dest database': 'db1_s3', 'bucket': 's3a://data-lake',
+            'endpoint': 'https://s3.tenant-a.example.com'},
+            {'database': 'db1', 'table': 'tbl_b', 'dest database': 'db1_s3', 'bucket': 's3a://data-lake',
+            'endpoint': 'https://s3.tenant-a.example.com'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert len(result) == 1
+        assert set(result[0]['table_tokens']) == {'tbl_a', 'tbl_b'}
+
+
+# ---------------------------------------------------------------------------
+# cluster_login_setup
+# ---------------------------------------------------------------------------
 class TestClusterLoginSetup:
 
     def test_success_returns_temp_dir(self, mock_ssh_hook):
