@@ -34,6 +34,12 @@ MOCK_VARIABLES = {
     's3_listing_tool':              'hadoop',
     'migration_smtp_conn_id':       'smtp_default',
     'migration_email_recipients':   'user@example.com',
+    's3_source_endpoint':  '',
+    's3_source_access_key': 'AKIASRC',
+    's3_source_secret_key': 'srcsecret',
+    's3_dest_endpoint':    '',
+    's3_dest_access_key':  'AKIADST',
+    's3_dest_secret_key':  'dstsecret',
 }
 
 
@@ -135,6 +141,8 @@ def _make_airflow_stubs():
         "pyspark":                              MagicMock(),
         "pyspark.sql":                          MagicMock(),
         "pyspark.sql.utils":                    pyspark_sql_utils,
+        "py4j":                                 MagicMock(),
+        "py4j.java_gateway":                    MagicMock(),
     }
     return stubs, variable_mock
 
@@ -396,3 +404,111 @@ def sample_folder_validation_result(sample_folder_distcp_result):
 @pytest.fixture
 def sample_folder_finalize_result(sample_folder_run_id):
     return {'run_id': sample_folder_run_id, 'status': 'COMPLETED', 'total_folders': 2, 'successful_folders': 2, 'failed_folders': 0}
+
+# ---------------------------------------------------------------------------
+# DAG 4 sample data
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def sample_s3_run_id():
+    return 's3_run_20250101_120000_abcd1234'
+
+
+@pytest.fixture
+def sample_s3_db_config(sample_s3_run_id):
+    return {
+        'source_database':  'sales_data',
+        'dest_database':    'sales_data_dest',
+        'dest_bucket':      's3a://dest-bucket',
+        'source_s3_prefix': 's3a://src-bucket/data',
+        'dest_s3_prefix':   's3a://dest-bucket/data',
+        'table_tokens':     ['transactions'],
+        'run_id':           sample_s3_run_id,
+    }
+
+
+@pytest.fixture
+def sample_s3_table_metadata():
+    return [{
+        'source_database':        'sales_data',
+        'source_table':           'transactions',
+        'dest_database':          'sales_data_dest',
+        'dest_bucket':            's3a://dest-bucket',
+        'source_location':        's3a://src-bucket/data/sales_data/transactions',
+        'dest_location':          's3a://dest-bucket/data/sales_data/transactions',
+        'file_format':            'PARQUET',
+        'table_type':             'EXTERNAL_TABLE',
+        'schema':                 [{'name': 'id', 'type': 'bigint'}, {'name': 'amount', 'type': 'double'}],
+        'partition_columns':      'dt',
+        'partitions':             ['dt=2024-01-01', 'dt=2024-01-02'],
+        'partition_count':        2,
+        'is_partitioned':         True,
+        'source_row_count':       1000,
+        'source_file_count':      5,
+        'source_total_size_bytes': 10 * 1024 * 1024,
+    }]
+
+
+@pytest.fixture
+def sample_s3_discovery(sample_s3_run_id, sample_s3_table_metadata):
+    return {
+        'run_id':           sample_s3_run_id,
+        'source_database':  'sales_data',
+        'dest_database':    'sales_data_dest',
+        'dest_bucket':      's3a://dest-bucket',
+        'source_s3_prefix': 's3a://src-bucket/data',
+        'dest_s3_prefix':   's3a://dest-bucket/data',
+        'tables':           sample_s3_table_metadata,
+        '_task_duration':   4.2,
+    }
+
+
+@pytest.fixture
+def sample_s3_presence_result(sample_s3_discovery):
+    return {
+        **sample_s3_discovery,
+        'presence_results': [{
+            'source_database': 'sales_data',
+            'source_table':    'transactions',
+            'status':          'CONFIRMED',
+            'file_count':      5,
+            'size_bytes':      10 * 1024 * 1024,
+            'error':           None,
+        }],
+    }
+
+
+@pytest.fixture
+def sample_s3_table_result(sample_s3_presence_result):
+    return {
+        **sample_s3_presence_result,
+        'table_results': [{
+            'source_table': 'transactions',
+            'status':       'COMPLETED',
+            'existed':      False,
+            'error':        None,
+        }],
+        '_task_duration': 3.1,
+        '_has_failures':  False,
+    }
+
+
+@pytest.fixture
+def sample_s3_validation_result(sample_s3_table_result):
+    return {
+        **sample_s3_table_result,
+        'validation_results': [{
+            'source_table':          'transactions',
+            'status':                'COMPLETED',
+            'source_row_count':      1000,
+            'dest_hive_row_count':   1000,
+            'source_partition_count': 2,
+            'dest_partition_count':  2,
+            'row_count_match':       True,
+            'partition_count_match': True,
+            'schema_match':          True,
+            'schema_differences':    '',
+            'error':                 None,
+        }],
+        '_task_duration': 2.8,
+        '_has_failures':  False,
+    }

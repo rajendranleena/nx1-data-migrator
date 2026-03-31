@@ -11,6 +11,7 @@ This implementation provides three independent but complementary migration DAGs:
 1. **`mapr_to_s3_migration`** - Migrates Hive tables from MapR-FS/HDFS to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
 3. **`folder_only_data_copy`** - Copies raw folders from MapR/HDFS to S3 via DistCp — no Hive metadata
+4. **`s3_to_s3_metadata_migration`** - Recreates Hive table metadata pointing to an existing destination S3 location (no data migration)
 
 ---
 
@@ -108,11 +109,12 @@ single-tenant setups.
 
 ## DAG Parameter Details
 
-| DAG   | Parameter         | Required | Description                   | Example                                      |
-| ----- | ----------------- | -------- | ----------------------------- | -------------------------------------------- |
-| DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config       | `s3a://config-bucket/migration.xlsx`         |
-| DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config     | `s3a://config-bucket/iceberg_migration.xlsx` |
-| DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config | `s3a://config-bucket/folder_copy.xlsx`       |
+| DAG   | Parameter         | Required | Description                             | Example                                          |
+| ----- | ----------------- | -------- | --------------------------------------- | ------------------------------------------------ |
+| DAG 1 | `excel_file_path` | Yes      | S3 path to Excel config                 | `s3a://config-bucket/migration.xlsx`             |
+| DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config               | `s3a://config-bucket/iceberg_migration.xlsx`     |
+| DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config           | `s3a://config-bucket/folder_copy.xlsx`           |
+| DAG 4 | `excel_file_path` | Yes      | S3 path to S3 metadata migration config | `s3a://config-bucket/s3_metadata_migration.xlsx` |
 
 ---
 
@@ -172,6 +174,26 @@ single-tenant setups.
 │ ▼                                                           │
 │ Validated & Tracked                                         │
 └─────────────────────────────────────────────────────────────┘
+│
+│ (Independent — use when data is already in destination S3)
+▼
+┌─────────────────────────────────────────────────────────────┐
+│ DAG 4: S3-to-S3 Metadata Migration                          │
+│                                                             │
+│ Source Hive (pointing to source S3)                         │
+│ │                                                           │
+│ │ [PySpark: Table Discovery + Metadata]                     │
+│ ▼                                                           │
+│ Destination S3 (Data Presence Validation)                   │
+│ │                                                           │
+│ │ [PySpark: Hive DDL]                                       │
+│ ▼                                                           │
+│ Dest S3 (Queryable via Hive)                                │
+│ │                                                           │
+│ │ [Validation: Row counts, partitions, schema]              │
+│ ▼                                                           │
+│ Validated & Tracked                                         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -193,8 +215,16 @@ Do you need to migrate from MapR-FS/HDFS to S3?
 │       └─ Both Hive and Iceberg → Snapshot migration
 │
 └─ NO → Already in S3, need Iceberg?
+│  │
+│  └─ YES → Run DAG 2 (iceberg_migration) only
+│
+└─ NO → Data already in destination S3?
    │
-   └─ YES → Run DAG 2 (iceberg_migration) only
+   ├─ YES, just need Hive metadata recreated → Run DAG 3 (s3_to_s3_metadata_migration)
+   │   │
+   │   └─ Need Iceberg format too? → Run DAG 2 after DAG 3
+   │
+   └─ Need Iceberg only (metadata already exists) → Run DAG 2 (iceberg_migration) only
 ```
 
 ---
@@ -961,30 +991,6 @@ VALIDATION_FAILED
 
 ---
 
-## Tracking Tables
-
-### MapR-to-S3 Migration Tracking
-
-1. **migration_tracking.migration_runs**: Run-level metadata for MapR-to-S3 migrations.
-2. **migration_tracking.migration_table_status**: Table-level tracking for MapR-to-S3 migrations.
-3. **migration_tracking.validation_results**: Aggregated validation summary per run.
-
----
-
-### Iceberg Migration Tracking
-
-1. **migration_tracking.iceberg_migration_runs**: Run-level metadata for Iceberg migrations.
-2. **migration_tracking.iceberg_migration_table_status**: Table-level tracking for Iceberg migrations.
-
----
-
-### Folder Data Copy Tracking
-
-1. **migration_tracking.data_copy_runs**: Run-level metadata for folder-only data copy runs.
-2. **migration_tracking.data_copy_status**: Folder-level tracking — one row per source/destination pair per run.
-
----
-
 ## DAG 3: Folder-Only Data Copy
 
 ### Purpose
@@ -1258,164 +1264,300 @@ COMPLETED_WITH_ERRORS
 
 ---
 
-## Notes for Dev
+## DAG 4: S3-to-S3 Metadata Migration
 
-Env files are loaded from `/opt/airflow/utils/migration_configs/`:
+### Purpose
 
-- `env.shared` — shared config (S3, SSH, Spark credentials, etc.)
-- `env.<dag_stem>` — per-developer overrides (e.g. `env.migration_dags_combined`)
-
-Copy the `env.*.example` files there, drop the `.example` suffix, and fill in your values. If the directory doesn't exist the DAG logs a warning and falls back to Airflow Variables / defaults.
-
-Config resolution: Airflow Variable → `os.getenv()` → hardcoded default in `get_config()`.
+Recreates Hive external table definitions in a destination database pointing to data that already exists in a destination S3 location. No data migration occurs. This DAG is purely a metadata operation suited for scenarios where data has been copied by an external process
 
 ---
 
-## Unit Tests
+### Key Features
 
-### Running Tests
+- **No Data Movement** - Assumes data already exists at destination S3 paths
+- **Data Presence Validation** - Verifies destination S3 paths contain files before creating tables
+- **Path Remapping** - Supports prefix-based path translation (`source_s3_prefix` → `dest_s3_prefix`) or simple bucket-based destination
+- **Partition Support** - Automatic partition discovery and repair via `MSCK REPAIR TABLE`
+- **Format Preservation** - Supports Parquet, ORC, Avro, and TextFile
+- **Comprehensive Validation** - Row counts, partition counts, schema comparison
+- **Incremental Support** - Detects existing tables and runs repair instead of recreating
 
-**Install test dependencies (from repo root):**
+---
 
-```bash
-pip install ".[dev]"
+### Excel Configuration Format
+
+**Required Columns:**
+
+| Column             | Required | Description                                             | Example                 |
+| ------------------ | -------- | ------------------------------------------------------- | ----------------------- |
+| `database`         | **Yes**  | Source database name                                    | `sales_data`            |
+| `table`            | No       | Table pattern (supports `*` wildcards, comma-separated) | `transactions_*` or `*` |
+| `dest_database`    | No       | Destination database (defaults to source)               | `sales_data_dest`       |
+| `dest_bucket`      | No\*     | Destination S3 bucket                                   | `s3a://dest-lake`       |
+| `source_s3_prefix` | No\*     | Source S3 prefix for path remapping                     | `s3a://source-lake`     |
+| `dest_s3_prefix`   | No\*     | Destination S3 prefix for path remapping                | `s3a://dest-lake`       |
+
+- Either `dest_bucket` or both `source_s3_prefix` + `dest_s3_prefix` must be provided per row.
+
+**Path Remapping Behavior:**
+
+- If `source_s3_prefix` and `dest_s3_prefix` are provided, destination path is computed by replacing the source prefix with the destination prefix, preserving the relative path.
+- If only `dest_bucket` is provided, destination path defaults to `{dest_bucket}/{dest_database}/{table_name}`.
+
+---
+
+### Task Flow
+
+```
+init_s3_tracking_tables
+    ↓
+create_s3_migration_run
+    ↓
+parse_s3_excel
+    ↓
+┌───────────────────────────────────────────────┐
+│  Dynamic Task Mapping (per database config)   │
+│                                               │
+│  discover_source_hive_tables (PySpark)        │
+│    ↓                                          │
+│  record_s3_discovered_tables                  │
+│    ↓                                          │
+│  validate_data_presence (PySpark)             │
+│    ↓                                          │
+│  update_data_presence_status                  │
+│    ↓                                          │
+│  create_dest_hive_tables (PySpark)            │
+│    ↓                                          │
+│  update_s3_table_create_status                │
+│    ↓                                          │
+│  validate_s3_destination_tables (PySpark)     │
+│    ↓                                          │
+│  update_s3_validation_status                  │
+└───────────────────────────────────────────────┘
+    ↓
+generate_s3_html_report
+    ↓
+send_s3_report_email
+    ↓
+finalize_s3_run
 ```
 
-**Run the full suite:**
+---
 
-```bash
-pytest tests/
+### Task Summaries
+
+#### Step 0 - `init_s3_tracking_tables`
+
+**Type:** PySpark  
+**Purpose:** Initialize tracking infrastructure for S3 metadata migration
+
+- Creates the `migration_tracking` database if it doesn't exist
+- Creates two Iceberg tables for tracking:
+  - `s3_migration_runs` - Run-level metadata including a `missing_tables` count
+  - `s3_migration_table_status` - Table-level tracking including data presence checks and path information
+- Ensures tracking tables persist across all migration runs
+
+---
+
+#### Step 1 - `create_s3_migration_run`
+
+**Type:** PySpark  
+**Purpose:** Generate unique run identifier and initialize run record
+
+- Creates a unique run ID prefixed with `s3_run_`
+- Inserts initial record into `s3_migration_runs` with status `RUNNING`
+- Stores DAG configuration snapshot for audit trail
+
+---
+
+#### Step 2 - `parse_s3_excel`
+
+**Type:** PySpark  
+**Purpose:** Read and parse the Excel configuration file
+
+- Reads Excel file from S3 using `pyspark.pandas.read_excel`
+- Normalizes column names and validates required fields
+- Groups rows by `(source_database, dest_database, dest_bucket, source_s3_prefix, dest_s3_prefix)`
+- Skips rows that provide neither a `dest_bucket` nor a `source_s3_prefix`+`dest_s3_prefix` pair
+
+---
+
+#### Step 3 - `discover_source_hive_tables`
+
+**Type:** PySpark (mapped per database)
+**Purpose:** Discover source Hive table metadata
+
+- Lists all tables in source database and filters by token patterns (supports wildcards and comma-separated names)
+- For each matched table, extracts schema, location, file format, partition columns, partition list, row count, and file size metrics from the source Hive metastore
+- Computes destination S3 path using prefix remapping or bucket-based logic
+
+---
+
+#### Step 4 - `record_s3_discovered_tables`
+
+**Type:** PySpark (mapped per database)
+**Purpose:** Persist discovered table metadata in tracking table
+
+- Inserts or updates records in `s3_migration_table_status`
+- Sets initial `overall_status` to `DISCOVERED`
+
+---
+
+#### Step 5 - `validate_data_presence`
+
+**Type:** PySpark (mapped per database)
+
+**Purpose:** Verify that data files exist at the computed destination S3 paths before creating any Hive tables
+
+- For each discovered table, checks that the destination S3 path exists and contains at least one file using Hadoop FileSystem API
+- Records `file_count` and `size_bytes` for each confirmed path
+- Marks tables with no files or non-existent paths as `MISSING` — these are tracked but do not block the run
+- Raises an exception only if S3 API/connectivity errors occur (`FAILED` status)
+
+---
+
+#### Step 6 - `update_data_presence_status`
+
+**Type:** PySpark (mapped per database)
+
+**Purpose:** Update tracking table with data presence results
+
+- Updates `data_presence_status` to `CONFIRMED`, `MISSING`, or `FAILED`
+- Sets `overall_status` to `DATA_CONFIRMED`, `DATA_MISSING`, or `FAILED` accordingly
+- Tables with `DATA_MISSING` are skipped in all downstream steps but remain visible in the report
+
+---
+
+#### Step 7 - `create_dest_hive_tables`
+
+**Type:** PySpark (mapped per database)
+
+**Purpose:** Create or repair destination Hive external tables for all `CONFIRMED` tables
+
+- Skips tables whose data presence status is not `CONFIRMED`
+- For each confirmed table:
+  - **If table exists:** Runs `MSCK REPAIR TABLE` and `REFRESH TABLE`
+  - **If table does not exist:** Generates and executes `CREATE EXTERNAL TABLE` DDL using schema from discovery, then runs `MSCK REPAIR TABLE` if partitioned
+- Applies per-bucket S3 credentials for destination paths
+
+---
+
+#### Step 8 - `update_s3_table_create_status`
+
+**Type:** PySpark (mapped per database)
+
+**Purpose:** Update tracking table with table creation results
+
+- Sets `table_create_status` to `COMPLETED`, `SKIPPED`, or `FAILED`
+- Preserves `DATA_MISSING` overall status for skipped tables
+
+---
+
+#### Step 9 - `validate_s3_destination_tables`
+
+**Type:** PySpark (mapped per database)
+
+**Purpose:** Validate destination Hive tables — row counts, partition counts, schema comparison
+
+- Skips tables where table creation was skipped or data was missing
+- Compares source row count, partition count, and schema against the newly created destination table
+- Partition count mismatches are treated as warnings (stale source partitions), not failures
+
+---
+
+#### Step 10 - `update_s3_validation_status`
+
+**Type:** PySpark (mapped per database)
+
+**Purpose:** Update tracking table with validation results and determine final status
+
+- Sets `overall_status` to `VALIDATED` or `VALIDATION_FAILED`
+
+**Final status meanings:**
+
+- `DISCOVERED`: Metadata extracted, data presence not yet checked
+- `DATA_CONFIRMED`: Data found at destination S3, table not yet created
+- `DATA_MISSING`: No files found at destination S3 path — skipped
+- `TABLE_CREATED`: Hive table created/repaired, not yet validated
+- `VALIDATED`: All validations passed — MIGRATION SUCCESS
+- `VALIDATION_FAILED`: One or more validations failed
+- `FAILED`: S3 API error or table creation error
+
+---
+
+### Step 11 - `generate_s3_html_report`
+
+**Type:** PySpark
+
+**Purpose:** Generate comprehensive HTML report covering data presence, table creation, validation, and performance
+
+- Writes report to `{report_location}/{run_id}_s3_report.html`
+- Report sections: Migration Summary, Data Presence Summary, Table Migration Details, Validation Results, Performance Metrics
+
+---
+
+### Step 12 - `send_s3_report_email`
+
+**Type:** PySpark
+
+**Purpose:** Send HTML report via email
+
+- Subject: `S3 Metadata Migration Report — {run_id}`
+- Skips if `migration_email_recipients` variable is empty
+
+---
+
+### Step 13 - `finalize_s3_run`
+
+**Type:** PySpark
+
+**Purpose:** Aggregate statistics and mark run complete
+
+- Updates `s3_migration_runs` with final counts including a dedicated `missing_tables` field
+- Final run statuses: `COMPLETED`, `COMPLETED_WITH_MISSING`, `COMPLETED_WITH_FAILURES`, or `FAILED`
+
+---
+
+### Status Progression
+
+```
+DISCOVERED
+    ↓
+DATA_CONFIRMED (files found at destination S3)
+    ↓
+TABLE_CREATED (Hive table created/repaired)
+    ↓
+VALIDATED (all validations passed)
+
+DATA_MISSING → skipped in all downstream steps, visible in report
 ```
 
-**Run a specific test file:**
+---
 
-```bash
-pytest tests/test_dag1_tasks.py
-pytest tests/test_dag2_tasks.py
-pytest tests/test_dag3_tasks.py
-pytest tests/test_dag_integrity.py
-pytest tests/test_utils.py
-```
+## Tracking Tables
 
-**Run with coverage report:**
+### MapR-to-S3 Migration Tracking
 
-```bash
-pytest tests/ --cov
-```
+1. **migration_tracking.migration_runs**: Run-level metadata for MapR-to-S3 migrations.
+2. **migration_tracking.migration_table_status**: Table-level tracking for MapR-to-S3 migrations.
+3. **migration_tracking.validation_results**: Aggregated validation summary per run.
 
 ---
 
-### Test Dependencies
+### Iceberg Migration Tracking
 
-All test dependencies are in the `dev` extra of the root `pyproject.toml`. No Airflow, PySpark, or Java installation is needed.
+1. **migration_tracking.iceberg_migration_runs**: Run-level metadata for Iceberg migrations.
+2. **migration_tracking.iceberg_migration_table_status**: Table-level tracking for Iceberg migrations.
 
-| Package          | Purpose                                     |
-| ---------------- | ------------------------------------------- |
-| `pytest>=7.4.0`  | Test runner                                 |
-| `pytest-cov`     | Coverage reporting                          |
-| `pytest-mock`    | Mock utilities                              |
-| `pytest-timeout` | Per-test 60-second timeout                  |
-| `openpyxl`       | Excel parsing (used by DAG and parse tests) |
-| `python-dotenv`  | Environment config (stubbed in tests)       |
+### Folder Data Copy Tracking
 
----
+1. **migration_tracking.data_copy_runs**: Run-level metadata for folder-only data copy runs.
+2. **migration_tracking.data_copy_status**: Folder-level tracking — one row per source/destination pair per run.
 
-### Test Files
+### S3-to-S3 Metadata Migration Tracking
 
-| File                     | Tests  | Covers                                                                                                                                                                        |
-| ------------------------ | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test_dag1_tasks.py`     | 37     | All DAG 1 task functions: prerequisites, tracking init, run creation, Excel parsing, SSH login, table discovery via SSH/Spark, DistCp, Hive table creation, validation, reporting, email, finalize |
-| `test_dag2_tasks.py`     | 22     | All DAG 2 task functions: tracking init, run creation, Excel parsing, Hive discovery, Iceberg migration (snapshot + inplace), validation, reporting, email, finalize           |
-| `test_dag3_tasks.py`     | 22     | All DAG 3 task functions: prerequisites, tracking init, run creation, folder Excel parsing, folder DistCp, status recording, validation, reporting, email, finalize            |
-| `test_dag_integrity.py`  | 6      | DAG IDs and params for all three DAGs (verifies module loads without import errors)                                                                                            |
-| `test_utils.py`          | 5      | `get_config()`, `@track_duration` decorator, `execute_with_iceberg_retry()`                                                                                                   |
-| **Total**                | **90** |                                                                                                                                                                               |
-
----
-
-### Test Classes
-
-**`test_dag1_tasks.py`**
-
-| Class                           | What it tests                                                       |
-| ------------------------------- | ------------------------------------------------------------------- |
-| `TestValidatePrerequisites`     | SSH checks pass/fail                                                |
-| `TestInitTrackingTables`        | Database and table creation DDL                                     |
-| `TestCreateMigrationRun`        | Run ID format, INSERT with RUNNING status                           |
-| `TestParseExcel`                | Column parsing, bucket normalisation, wildcard handling, tokenising |
-| `TestClusterLoginSetup`         | Temp dir creation, exit code and marker failure handling             |
-| `TestDiscoverTablesViaSshSpark` | SSH/SFTP/PySpark discovery, JSON parsing, error handling             |
-| `TestRecordDiscoveredTables`    | INSERT vs UPDATE based on existing record count                     |
-| `TestRunDistcpSsh`              | Successful copy, incremental detection, failure path                |
-| `TestUpdateDistcpStatus`        | COPIED status on success, FAILED on error                           |
-| `TestCreateHiveTables`          | New table creation vs existing table REPAIR                         |
-| `TestUpdateTableCreateStatus`   | TABLE_CREATED status tracking                                       |
-| `TestValidateDestinationTables` | Row count match/mismatch, schema comparison                         |
-| `TestUpdateValidationStatus`    | VALIDATED vs VALIDATION_FAILED determination                        |
-| `TestGenerateHtmlReport`        | Report path, S3 write                                               |
-| `TestSendMigrationReportEmail`  | Email delivery, skip when no recipients                              |
-| `TestFinalizeRun`               | Stats aggregation, COMPLETED status                                  |
-
-**`test_dag2_tasks.py`**
-
-| Class                               | What it tests                                         |
-| ----------------------------------- | ----------------------------------------------------- |
-| `TestInitIcebergTrackingTables`     | Database and Iceberg tracking table DDL               |
-| `TestCreateIcebergMigrationRun`     | Run ID format, INSERT with RUNNING status             |
-| `TestParseIcebergExcel`             | Snapshot default, inplace flag, custom dest database  |
-| `TestDiscoverHiveTables`            | Wildcard and pattern-based table discovery            |
-| `TestMigrateTablesToIceberg`        | Snapshot and inplace migration, failure handling      |
-| `TestUpdateMigrationDurations`      | Duration tracking update                              |
-| `TestValidateIcebergTables`         | Schema match/mismatch between Hive and Iceberg        |
-| `TestUpdateIcebergValidationStatus` | VALIDATED vs VALIDATION_FAILED status                 |
-| `TestGenerateIcebergHtmlReport`     | Report path, S3 write                                 |
-| `TestSendIcebergReportEmail`        | Email delivery, skip when no recipients               |
-| `TestFinalizeIcebergRun`            | Stats aggregation, COMPLETED status                   |
-
-**`test_dag3_tasks.py`**
-
-| Class                               | What it tests                                           |
-| ----------------------------------- | ------------------------------------------------------- |
-| `TestValidatePrerequisitesFolderCopy` | SSH, DistCp, Hadoop FS availability checks            |
-| `TestInitFolderCopyTrackingTables`  | Database and folder copy tracking table DDL              |
-| `TestCreateDataCopyRun`             | Run ID format, INSERT with RUNNING status                |
-| `TestParseFolderCopyExcel`          | Row parsing, bucket normalisation, basename defaulting   |
-| `TestRunFolderDistcpSsh`            | Successful copy, mismatch detection, failure paths       |
-| `TestRecordDataCopyStatus`          | Tracking insert for completed and failed copies          |
-| `TestValidateDataCopy`              | Post-copy validation: match, missing dest, mismatch      |
-| `TestUpdateDataCopyValidation`      | VALIDATED and VALIDATION_FAILED status updates           |
-| `TestFinalizeDataCopyRun`           | COMPLETED vs COMPLETED_WITH_ERRORS determination         |
-| `TestGenerateDataCopyHtmlReport`    | Report path, S3 write                                    |
-| `TestSendDataCopyReportEmail`       | Skip when no recipients configured                       |
-
-**`test_dag_integrity.py`**
-
-| Class                          | What it tests                                |
-| ------------------------------ | -------------------------------------------- |
-| `TestMaprToS3DagIntegrity`     | DAG ID and excel_file_path param             |
-| `TestIcebergDagIntegrity`      | DAG ID and excel_file_path param             |
-| `TestFolderCopyDagIntegrity`   | DAG ID and excel_file_path param             |
-
-**`test_utils.py`**
-
-| Class                         | What it tests                                       |
-| ----------------------------- | --------------------------------------------------- |
-| `TestGetConfig`               | Variable values used, fallback to default            |
-| `TestTrackDuration`           | Duration added to result, args/kwargs preserved      |
-| `TestExecuteWithIcebergRetry` | Immediate and retry success, exhaustion after 6 tries |
-
----
-
-## Notes for Dev
-
-Env files are loaded from `/opt/airflow/utils/migration_configs/`:
-
-- `env.shared` — shared config (S3, SSH, Spark credentials, etc.)
-- `env.<dag_stem>` — per-developer overrides (e.g. `env.migration_dags_combined`)
-
-Copy the `env.*.example` files there, drop the `.example` suffix, and fill in your values. If the directory doesn't exist the DAG logs a warning and falls back to Airflow Variables / defaults.
-
-Config resolution: Airflow Variable → `os.getenv()` → hardcoded default in `get_config()`.
+1. **migration_tracking.s3_migration_runs**: Run-level metadata for S3 metadata migrations, including a `missing_tables` count separate from `failed_tables`.
+2. **migration_tracking.s3_migration_table_status**: Table-level tracking including data presence check results (`data_presence_status`, `data_presence_file_count`, `data_presence_size_bytes`) alongside the standard discovery, table creation, and validation fields.
 
 ---
 
