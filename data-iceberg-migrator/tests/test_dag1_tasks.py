@@ -11,29 +11,183 @@ from .helpers import make_excel_bytes, mock_ssh_stdout, setup_spark_excel
 
 class TestValidatePrerequisites:
 
-    def test_all_checks_pass(self, mock_ssh_hook):
-        hook, client, stdout_mock, _ = mock_ssh_hook
-        responses = [
-            (MagicMock(), mock_ssh_stdout(0, b'SSH_TEST_OK'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'PySpark 3.4.0'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'Hive 3.1.0'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'Hadoop 3.3.0\nHADOOP_FS_OK'), MagicMock()),
-        ]
-        for r in responses:
-            r[2].read.return_value = b''
-        client.exec_command.side_effect = responses
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _side_effects(*outputs):
+        """Build exec_command side-effects from (exit_code, stdout_bytes) pairs."""
+        result = []
+        for exit_code, out in outputs:
+            stderr = MagicMock()
+            stderr.read.return_value = b''
+            result.append((MagicMock(), mock_ssh_stdout(exit_code, out), stderr))
+        return result
 
+    # ------------------------------------------------------------------
+    # happy-path: auth_method=none (default in MOCK_VARIABLES)
+    # ------------------------------------------------------------------
+    def test_all_checks_pass_auth_none(self, mock_ssh_hook):
+        """All 4 checks pass with auth_method=none (auth step auto-passes)."""
+        hook, client, stdout_mock, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._side_effects(
+            (0, b'SSH_TEST_OK'),
+            (0, b'CLUSTER_AUTH_OK'),      # none branch echoes this
+            (0, b'PYSPARK_HIVE_OK'),
+            (0, b'HADOOP_FS_OK'),
+        )
         result = m.validate_prerequisites.function(run_id='test_run')
         assert result['ssh_connectivity'] is True
+        assert result['cluster_auth'] is True
         assert result['pyspark_available'] is True
         assert result['hive_available'] is True
         assert result['hadoop_fs_available'] is True
         assert result['errors'] == []
 
+    # ------------------------------------------------------------------
+    # auth checks
+    # ------------------------------------------------------------------
+    def test_auth_mapr_passes(self, mock_ssh_hook):
+        """MapR auth check passes when maprlogin print contains the user."""
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._side_effects(
+            (0, b'SSH_TEST_OK'),
+            (0, b'CLUSTER_AUTH_OK'),
+            (0, b'PYSPARK_HIVE_OK'),
+            (0, b'HADOOP_FS_OK'),
+        )
+        with patch.dict(m.MOCK_VARIABLES if hasattr(m, 'MOCK_VARIABLES') else {},
+                        {}, clear=False), \
+             patch('migration_dags_combined.Variable') as mock_var:
+            mock_var.get.side_effect = lambda k, default_var=None, **kw: (
+                'mapr' if k == 'auth_method' else
+                'testuser' if k == 'mapr_user' else
+                default_var
+            )
+            result = m.validate_prerequisites.function(run_id='test_run')
+        assert result['cluster_auth'] is True
+
+    def test_auth_mapr_fails(self, mock_ssh_hook):
+        """MapR auth check failure is recorded and DAG raises."""
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._side_effects(
+            (0, b'SSH_TEST_OK'),
+            (1, b'CLUSTER_AUTH_FAIL: No valid MapR ticket found'),
+            (0, b'PYSPARK_HIVE_OK'),
+            (0, b'HADOOP_FS_OK'),
+        )
+        with patch('migration_dags_combined.Variable') as mock_var:
+            mock_var.get.side_effect = lambda k, default_var=None, **kw: (
+                'mapr' if k == 'auth_method' else
+                'testuser' if k == 'mapr_user' else
+                default_var
+            )
+            with pytest.raises(Exception, match="Pre-DAG validation failed"):
+                m.validate_prerequisites.function(run_id='test_run')
+
+    def test_auth_kinit_passes(self, mock_ssh_hook):
+        """Kerberos auth check passes when klist -s exits 0."""
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._side_effects(
+            (0, b'SSH_TEST_OK'),
+            (0, b'CLUSTER_AUTH_OK\nDefault principal: user@REALM'),
+            (0, b'PYSPARK_HIVE_OK'),
+            (0, b'HADOOP_FS_OK'),
+        )
+        with patch('migration_dags_combined.Variable') as mock_var:
+            mock_var.get.side_effect = lambda k, default_var=None, **kw: (
+                'kinit' if k == 'auth_method' else default_var
+            )
+            result = m.validate_prerequisites.function(run_id='test_run')
+        assert result['cluster_auth'] is True
+
+    def test_auth_kinit_fails(self, mock_ssh_hook):
+        """Kerberos auth failure (no TGT) is recorded and DAG raises."""
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._side_effects(
+            (0, b'SSH_TEST_OK'),
+            (1, b'CLUSTER_AUTH_FAIL: No valid Kerberos TGT found'),
+            (0, b'PYSPARK_HIVE_OK'),
+            (0, b'HADOOP_FS_OK'),
+        )
+        with patch('migration_dags_combined.Variable') as mock_var:
+            mock_var.get.side_effect = lambda k, default_var=None, **kw: (
+                'kinit' if k == 'auth_method' else default_var
+            )
+            with pytest.raises(Exception, match="Pre-DAG validation failed"):
+                m.validate_prerequisites.function(run_id='test_run')
+
+    # ------------------------------------------------------------------
+    # hdfs_nameservice
+    # ------------------------------------------------------------------
+    def test_hadoop_fs_uses_nameservice_when_set(self, mock_ssh_hook):
+        """When hdfs_nameservice is set, hadoop fs -ls uses hdfs://<ns>/."""
+        hook, client, _, _ = mock_ssh_hook
+        captured = []
+
+        def _exec(cmd, timeout=None):
+            captured.append(cmd)
+            stderr = MagicMock()
+            stderr.read.return_value = b''
+            return MagicMock(), mock_ssh_stdout(0, b'SSH_TEST_OK CLUSTER_AUTH_OK PYSPARK_HIVE_OK HADOOP_FS_OK'), stderr
+
+        client.exec_command.side_effect = self._side_effects(
+            (0, b'SSH_TEST_OK'),
+            (0, b'CLUSTER_AUTH_OK'),
+            (0, b'PYSPARK_HIVE_OK'),
+            (0, b'HADOOP_FS_OK'),
+        )
+        with patch('migration_dags_combined.Variable') as mock_var:
+            mock_var.get.side_effect = lambda k, default_var=None, **kw: (
+                'mycluster' if k == 'hdfs_nameservice' else default_var
+            )
+            m.validate_prerequisites.function(run_id='test_run')
+
+        # The 4th exec_command call (index 3) is the Hadoop FS check
+        fourth_call_cmd = client.exec_command.call_args_list[3][0][0]
+        assert 'hdfs://mycluster/' in fourth_call_cmd
+
+    def test_hadoop_fs_uses_root_without_nameservice(self, mock_ssh_hook):
+        """When hdfs_nameservice is empty, hadoop fs -ls uses /."""
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._side_effects(
+            (0, b'SSH_TEST_OK'),
+            (0, b'CLUSTER_AUTH_OK'),
+            (0, b'PYSPARK_HIVE_OK'),
+            (0, b'HADOOP_FS_OK'),
+        )
+        m.validate_prerequisites.function(run_id='test_run')
+        fourth_call_cmd = client.exec_command.call_args_list[3][0][0]
+        assert 'hadoop fs -ls /' in fourth_call_cmd
+        assert 'hdfs://' not in fourth_call_cmd
+
+    # ------------------------------------------------------------------
+    # failure cases
+    # ------------------------------------------------------------------
     def test_ssh_failure_raises(self, mock_ssh_hook):
         hook, client, _, _ = mock_ssh_hook
         hook.get_conn.side_effect = Exception("Connection refused")
 
+        with pytest.raises(Exception, match="Pre-DAG validation failed"):
+            m.validate_prerequisites.function(run_id='test_run')
+
+    def test_ssh_failure_marks_cluster_auth_skipped(self, mock_ssh_hook):
+        """When SSH fails entirely, cluster_auth error says 'Skipped'."""
+        hook, client, _, _ = mock_ssh_hook
+        hook.get_conn.side_effect = Exception("Connection refused")
+
+        with pytest.raises(Exception, match="Pre-DAG validation failed"):
+            m.validate_prerequisites.function(run_id='test_run')
+
+    def test_pyspark_hive_failure_raises(self, mock_ssh_hook):
+        """PySpark heredoc failure (missing marker) is recorded and DAG raises."""
+        hook, client, _, _ = mock_ssh_hook
+        client.exec_command.side_effect = self._side_effects(
+            (0, b'SSH_TEST_OK'),
+            (0, b'CLUSTER_AUTH_OK'),
+            (1, b'Error: could not find or load main class'),  # no PYSPARK_HIVE_OK
+            (0, b'HADOOP_FS_OK'),
+        )
         with pytest.raises(Exception, match="Pre-DAG validation failed"):
             m.validate_prerequisites.function(run_id='test_run')
 

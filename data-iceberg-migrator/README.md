@@ -1,6 +1,6 @@
-# MapR to S3 Migration DAG
+# Source (MapR/HDP) to S3 Migration DAG
 
-An automated **Airflow TaskFlow-based migration pipeline** consisting of two independent DAGs for orchestrating large-scale Hive table migrations from MapR-FS/HDFS to S3 and converting existing tables to Iceberg format.
+An automated **Airflow TaskFlow-based migration pipeline** consisting of two independent DAGs for orchestrating large-scale Hive table migrations from source (MapR or HDP) to S3 and converting existing tables to Iceberg format.
 
 ---
 
@@ -8,9 +8,9 @@ An automated **Airflow TaskFlow-based migration pipeline** consisting of two ind
 
 This implementation provides three independent but complementary migration DAGs:
 
-1. **`mapr_to_s3_migration`** - Migrates Hive tables from MapR-FS/HDFS to S3
+1. **`source_to_s3_migration`** - Migrates Hive tables from source (MapR/HDP) to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
-3. **`folder_only_data_copy`** - Copies raw folders from MapR/HDFS to S3 via DistCp — no Hive metadata
+3. **`folder_only_data_copy`** - Copies raw folders from source cluster (MapR/HDP) to S3 via DistCp — no Hive metadata
 4. **`s3_to_s3_metadata_migration`** - Recreates Hive table metadata pointing to an existing destination S3 location (no data migration)
 
 ---
@@ -37,9 +37,8 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | `auth_method`              | Authentication method: `mapr`, `kinit`, or `none` | MapR/Kerberos          |
 | `mapr_user`                | MapR username used to validate existing ticket    | MapR auth              |
 | `mapr_ticketfile_location` | MapR ticket file path                             | MapR auth              |
-| `kinit_principal`          | Kerberos principal                                | Kerberos auth          |
-| `kinit_keytab`             | Path to Kerberos keytab file                      | Kerberos keytab auth   |
-| `kinit_password`           | Kerberos password                                 | Kerberos password auth |
+| `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.    | HTML reports           |
+
 
 ### Optional Variables
 
@@ -54,6 +53,7 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | `s3_listing_tool`            | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`     |
 | `migration_smtp_conn_id`     | `smtp_default`   | Airflow SMTP connection ID for email reports |
 | `migration_email_recipients` | _(empty)_        | Comma-separated email addresses for reports  |
+| `hdfs_nameservice`           | _(empty)_        | HDFS HA nameservice (e.g. `mycluster`); leave empty for MapR |
 
 ### Multi-Tenant S3 Credentials (endpoint-based overrides)
 
@@ -134,9 +134,9 @@ single-tenant setups.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ DAG 1: MapR to S3                                           │
+│ DAG 1: Source (MapR/HDP) to S3                                 │
 │                                                             │
-│ MapR-FS/HDFS (Hive Tables)                                  │
+│ Source MapR/HDP (Hive Tables)                                │
 │ │                                                           │
 │ │ [PySpark: Metadata Discovery]                             │
 │ ▼                                                           │
@@ -201,9 +201,9 @@ single-tenant setups.
 ### Migration Strategy Decision Tree
 
 ```
-Do you need to migrate from MapR-FS/HDFS to S3?
+Do you need to migrate from source cluster (MapR-FS/HDFS) to S3?
 │
-├─ YES → Run DAG 1 (mapr_to_s3_migration)
+├─ YES → Run DAG 1 (source_to_s3_migration)
 │ │
 │ │
 │ └─ Need Iceberg format?
@@ -229,17 +229,17 @@ Do you need to migrate from MapR-FS/HDFS to S3?
 
 ---
 
-## DAG 1: MapR to S3 Migration
+## DAG 1: Source Cluster to S3 Migration
 
 ### Purpose
 
-Orchestrates the complete migration of Hive tables from MapR-FS/HDFS to S3, including data transfer, metadata recreation, and validation.
+Orchestrates the complete migration of Hive tables from a source cluster (MapR-FS or HDP/HDFS) to S3, including data transfer, metadata recreation, and validation.
 
 ---
 
 ### Key Features
 
-- **SSH Operations** - All MapR interactions via SSH to edge node
+- **SSH Operations** - All source cluster interactions via SSH to edge node
 - **Beeline Discovery** - Automated metadata extraction using HiveServer2
 - **Hadoop DistCp** - Efficient bulk data transfer with 24-hour timeout
 - **Incremental Support** - Automatic detection and `update` flag usage
@@ -284,7 +284,7 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 ### Task Flow
 
 ```
-validate_prerequisites (SSH: connectivity, PySpark, Hive, Hadoop FS checks)
+validate_prerequisites (SSH: connectivity, cluster auth, PySpark+Hive, Hadoop FS checks)
 ↓
 init_tracking_tables
 ↓
@@ -335,10 +335,13 @@ cleanup_edge (SSH: Cleanup temp files)
 - Connects to the cluster edge node via SSH
 - Runs four sequential checks:
   1. **SSH Connectivity** - Verifies SSH connection works with a simple echo command
-  2. **PySpark Availability** - Checks `pyspark --version` is accessible on the edge node
-  3. **Hive Availability** - Checks `hive --version` is accessible on the edge node
-  4. **Hadoop FS** - Verifies `hadoop fs -ls /` executes successfully
-- Sources `~/.profile` before each check to ensure environment variables are loaded
+  2. **Cluster Authentication** - Verifies a valid ticket/TGT exists before attempting any cluster operations:
+     - `mapr`: `maprlogin print | grep -q <mapr_user>` — confirms a valid MapR ticket for the configured user
+     - `kinit`: `klist -s` — confirms a valid Kerberos TGT in the ccache (populated by `~/.profile`)
+     - `none`: skipped (auto-passes)
+  3. **PySpark + Hive Metastore** - Starts a real `SparkSession` with `enableHiveSupport()` and runs `SHOW DATABASES`
+  4. **Hadoop FS** - Runs `hadoop fs -ls /` (MapR) or `hadoop fs -ls hdfs://<nameservice>/` (HDFS HA) to confirm filesystem access
+- Sources `~/.profile` before each check to ensure cluster auth and environment variables are loaded
 - If **all four checks pass**, proceeds with migration
 - If **any check fails**, raises an exception with a detailed summary of which checks failed and why, halting the DAG before any tracking tables or run records are created
 
@@ -392,7 +395,7 @@ cleanup_edge (SSH: Cleanup temp files)
 
 - Connects to the cluster edge node via SSH
 - Authenticates using one of the following methods, based on configuration:
-  1. **Kerberos authentication** - Uses `kinit_principal` and `kinit_keytab` or `kinit_password`
+  1. **Kerberos authentication** - Assumes valid Kerberos ticket sourced via `~/.profile`
   2. **Existing MapR or Kerberos ticket** - Validates and uses existing valid ticket
 - Verifies ticket validity with `maprlogin print` or `klist`
 - Creates temporary working directory on edge node (`/tmp/migration/{run_id}`)

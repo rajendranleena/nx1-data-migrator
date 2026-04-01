@@ -2,7 +2,7 @@
 Combined Migration DAGs
 
 This file contains two independent DAGs:
-1. mapr_to_s3_migration: Migrates data and Hive tables (metadata) from MapR or HDFS to S3
+1. source_to_s3_migration: Migrates data and Hive tables (metadata) from source cluster (MapR/HDP) to S3
 2. iceberg_migration: Converts existing Hive tables in S3 to Apache Iceberg format
 
 Both DAGs can be run independently. The iceberg_migration DAG is typically run after mapr_to_s3_migration is complete, but they are not automatically chained.
@@ -10,9 +10,9 @@ Both DAGs can be run independently. The iceberg_migration DAG is typically run a
 
 1. MapR/HDFS to S3 Migration DAG
 
-Orchestrates migration of Hive tables from MapR or HDFS to S3:
+Orchestrates migration of Hive tables from source cluster (MapR or HDP) to S3:
 - Excel config from S3 (only DAG parameter)
-- SSH operations for MapR or Kerberos authentication, beeline discovery, distcp (24h timeout)
+- SSH operations for source cluster authentication (MapR ticket or Kerberos), discovery, distcp (24h timeout)
 - PySpark tasks for Hive table creation
 - Incremental support (distcp -update, table repair)
 - Comprehensive validation (row counts, partitions, schema)
@@ -22,7 +22,7 @@ Excel columns: database | table | dest database | bucket
 2. Iceberg Migration DAG
 
 Converts existing Hive tables in S3 to Apache Iceberg format.
-This DAG runs independently after the main MapR-to-S3 migration is complete.
+This DAG runs independently after the main source-to-S3 migration is complete.
 
 Two migration strategies supported:
 1. In-place migration: Convert existing Hive table to Iceberg (overwrites metadata)
@@ -163,7 +163,7 @@ def _compute_dest_path(source_location: str, dest_database: str, table_name: str
 def get_config() -> dict:
     """Shared configuration for all DAGs (mapr_to_s3_migration, iceberg_migration, folder_only_data_copy)"""
     return {
-        # SSH Configuration (for MapR migration)
+        # SSH Configuration
         'ssh_conn_id': Variable.get('cluster_ssh_conn_id', default_var=os.getenv('CLUSTER_SSH_CONN_ID', 'cluster_edge_ssh')),
         'edge_temp_path': Variable.get('cluster_edge_temp_path', default_var=os.getenv('CLUSTER_EDGE_TEMP_PATH', '/tmp/migration')),
 
@@ -185,14 +185,14 @@ def get_config() -> dict:
         'tracking_location': Variable.get('migration_tracking_location', default_var=os.getenv('MIGRATION_TRACKING_LOCATION', 's3a://data-lake/migration_tracking')),
         'report_output_location': Variable.get('migration_report_location', default_var=os.getenv('MIGRATION_REPORT_LOCATION', 's3a://data-lake/migration_reports')),
 
-        # Cluster Authentication (MapR or Kerberos)
+        # Cluster type for display/reporting purposes ('MapR' or 'HDP')
+        'cluster_type': Variable.get('cluster_type', default_var=os.getenv('CLUSTER_TYPE', 'MapR')),
+        # Cluster Authentication ('mapr' or 'kinit' or 'none')
         'auth_method': Variable.get('auth_method', default_var=os.getenv('AUTH_METHOD', 'mapr')),  # 'mapr' or 'kinit'
         'mapr_user': Variable.get('mapr_user', default_var=os.getenv('MAPR_USER', '')),
         'mapr_ticketfile_location': Variable.get('mapr_ticketfile_location', default_var=os.getenv('MAPR_TICKETFILE_LOCATION', '/tmp/maprticket_${USER}')),
-        'kinit_principal': Variable.get('kinit_principal', default_var=os.getenv('KINIT_PRINCIPAL', '')),
-        'kinit_keytab': Variable.get('kinit_keytab', default_var=os.getenv('KINIT_KEYTAB', '')),
-        'kinit_password': Variable.get('kinit_password', default_var=os.getenv('KINIT_PASSWORD', '')),
-
+        # HDFS nameservice (required for HDFS HA clusters; leave empty for MapR)
+        'hdfs_nameservice': Variable.get('hdfs_nameservice', default_var=os.getenv('HDFS_NAMESERVICE', '')),
         # Listing tool
         's3_listing_tool': Variable.get('s3_listing_tool', default_var=os.getenv('S3_LISTING_TOOL', 'hadoop')),
 
@@ -403,8 +403,19 @@ def _validate_bucket_endpoint_pairs(grouped: dict, config: dict) -> None:
 
 
 # =============================================================================
-# DAG 1: MAPR TO S3 MIGRATION TASKS
+# DAG 1: SOURCE (MapR or HDP) TO S3 MIGRATION TASKS
 # =============================================================================
+
+def _login_shell(cmd: str) -> str:
+    """Wrap a command in a bash login shell so /etc/profile.d/*.sh is sourced.
+
+    This ensures JAVA_HOME, SPARK_HOME, HADOOP_HOME, HADOOP_CONF_DIR and PATH
+    entries for pyspark/hadoop/hive are set — exactly as they are in an
+    interactive SSH session or when using SSHOperator with bash -lc.
+    Using a heredoc avoids quoting complexity for multiline commands.
+    """
+    return f"bash -l <<'__LOGIN_SHELL_EOF__'\n{cmd}\n__LOGIN_SHELL_EOF__\n"
+
 
 @task
 def validate_prerequisites(run_id: str) -> dict:
@@ -412,11 +423,15 @@ def validate_prerequisites(run_id: str) -> dict:
     config = get_config()
     validation_results = {
         'ssh_connectivity': False,
+        'cluster_auth': False,
         'pyspark_available': False,
         'hive_available': False,
         'hadoop_fs_available': False,
         'errors': []
     }
+
+    auth_method = config.get('auth_method', 'mapr')
+    mapr_user = config.get('mapr_user', '')
 
     logger.info("="*60)
     logger.info("STARTING PRE-DAG VALIDATION")
@@ -428,10 +443,10 @@ def validate_prerequisites(run_id: str) -> dict:
 
             # 1. SSH Connectivity
             logger.info("[1/4] Testing SSH connectivity...")
-            _, stdout, stderr = client.exec_command('echo "SSH_TEST_OK"', timeout=30)
-            exit_code = stdout.channel.recv_exit_status()
+            _, stdout, stderr = client.exec_command(_login_shell('echo "SSH_TEST_OK"'), timeout=30)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
 
             if exit_code == 0 and "SSH_TEST_OK" in output:
                 validation_results['ssh_connectivity'] = True
@@ -441,66 +456,100 @@ def validate_prerequisites(run_id: str) -> dict:
                 validation_results['errors'].append(f"SSH: {error_msg}")
                 logger.error(f"SSH connectivity: FAILED - {error_msg}")
 
-            # 2. PySpark
-            logger.info("[2/4] Testing PySpark availability...")
-            test_cmd = """
-    source ~/.profile 2>/dev/null || true
-    which pyspark && pyspark --version 2>&1 | head -5
-    """
-            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
-            exit_code = stdout.channel.recv_exit_status()
+            # 2. Cluster authentication
+            # MapR:     maprlogin print — verifies a valid ticket exists in MAPR_TICKETFILE_LOCATION
+            # Kerberos: klist -s       — exits 0 if valid TGT in ccache, 1 if not
+            # none:     skipped
+            logger.info(f"[2/4] Testing cluster authentication (auth_method={auth_method})...")
+            if auth_method == 'mapr':
+                inner_cmd = f"""
+if maprlogin print 2>/dev/null | grep -q "{mapr_user}"; then
+    echo "CLUSTER_AUTH_OK"
+else
+    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '{mapr_user}'. Run maprlogin on the edge node."
+    exit 1
+fi
+"""
+            elif auth_method == 'kinit':
+                inner_cmd = """
+if klist -s 2>/dev/null; then
+    echo "CLUSTER_AUTH_OK"
+    klist 2>/dev/null | head -4
+else
+    echo "CLUSTER_AUTH_FAIL: No valid Kerberos TGT found. Ensure ~/.profile runs kinit or a valid ticket exists."
+    exit 1
+fi
+"""
+            else:
+                inner_cmd = 'echo "CLUSTER_AUTH_OK"'
+
+            _, stdout, stderr = client.exec_command(_login_shell(inner_cmd), timeout=30)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
 
-            if exit_code == 0 and ('pyspark' in output.lower() or 'spark' in output.lower()):
+            if exit_code == 0 and 'CLUSTER_AUTH_OK' in output:
+                validation_results['cluster_auth'] = True
+                logger.info(f"Cluster auth ({auth_method}): PASSED")
+                if auth_method == 'kinit':
+                    logger.info(f"TGT info: {output.strip()[:300]}")
+            else:
+                error_msg = output.replace('CLUSTER_AUTH_FAIL: ', '').strip() or f"Auth check failed (exit={exit_code})"
+                validation_results['errors'].append(f"Cluster auth: {error_msg}")
+                logger.error(f"Cluster auth ({auth_method}): FAILED - {error_msg}")
+
+            # 3. PySpark + Hive metastore
+            # Runs a real SparkSession with enableHiveSupport() + SHOW DATABASES —
+            # the same way discover_tables_via_spark_ssh uses PySpark.
+            # Sourcing ~/.profile ensures cluster auth is active before the session starts.
+            logger.info("[3/4] Testing PySpark with Hive metastore support (enableHiveSupport + SHOW DATABASES)...")
+            pyspark_inner = """
+pyspark --master local[*] << 'PYSPARK_VALIDATION_EOF'
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.enableHiveSupport().getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
+spark.sql("SHOW DATABASES").collect()
+spark.stop()
+print("PYSPARK_HIVE_OK")
+PYSPARK_VALIDATION_EOF
+"""
+            _, stdout, stderr = client.exec_command(_login_shell(pyspark_inner), timeout=180, get_pty=True)
+            output = stdout.read().decode()
+            stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
+
+            if exit_code == 0 and 'PYSPARK_HIVE_OK' in output:
                 validation_results['pyspark_available'] = True
-                logger.info("PySpark: PASSED")
-                logger.info(f"Version info: {output.strip()[:200]}")
-            else:
-                error_msg = f"PySpark not found or failed. Output: {output[:200]}"
-                validation_results['errors'].append(f"PySpark: {error_msg}")
-                logger.error(f"PySpark: FAILED - {error_msg}")
-
-            # 3. Hive
-            logger.info("[3/4] Testing Hive availability...")
-            test_cmd = """
-    source ~/.profile 2>/dev/null || true
-    hive --version 2>&1 | head -3
-    """
-            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
-            exit_code = stdout.channel.recv_exit_status()
-            output = stdout.read().decode()
-            stderr.read()
-
-            if exit_code == 0 and 'hive' in output.lower():
                 validation_results['hive_available'] = True
-                logger.info("Hive: PASSED")
-                logger.info(f"Version info: {output.strip()[:200]}")
+                logger.info("PySpark + Hive metastore: PASSED")
             else:
-                error_msg = f"Hive not found or failed. Output: {output[:200]}"
-                validation_results['errors'].append(f"Hive: {error_msg}")
-                logger.error(f"Hive: FAILED - {error_msg}")
+                error_msg = f"PySpark/Hive check failed (exit={exit_code}). Output: {output[-400:]}"
+                validation_results['errors'].append(f"PySpark/Hive: {error_msg}")
+                logger.error(f"PySpark + Hive metastore: FAILED - {error_msg}")
 
-            # 4. Hadoop FS
-            logger.info("[4/4] Testing Hadoop FS commands...")
-            test_cmd = """
-    source ~/.profile 2>/dev/null || true
-    hadoop version 2>&1 | head -3
-    hadoop fs -ls / > /dev/null 2>&1 && echo "HADOOP_FS_OK"
-    """
-            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
-            exit_code = stdout.channel.recv_exit_status()
+            # 4. Hadoop FS access (works for both MapR-FS and HDFS sources)
+            # For HDFS HA clusters set hdfs_nameservice; MapR/non-HA uses / directly.
+            # Sourcing ~/.profile ensures cluster auth is active.
+            logger.info("[4/4] Testing Hadoop FS access...")
+            hdfs_nameservice = config.get('hdfs_nameservice', '')
+            fs_root = f"hdfs://{hdfs_nameservice}/" if hdfs_nameservice else "/"
+            hadoop_inner = f"""
+if hadoop fs -ls {fs_root} > /dev/null 2>&1; then
+    echo "HADOOP_FS_OK"
+else
+    echo "HADOOP_FS_FAIL: hadoop fs -ls returned non-zero"
+fi
+"""
+            _, stdout, stderr = client.exec_command(_login_shell(hadoop_inner), timeout=60)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
 
-            if exit_code == 0 and 'HADOOP_FS_OK' in output:
+            if 'HADOOP_FS_OK' in output:
                 validation_results['hadoop_fs_available'] = True
                 logger.info("Hadoop FS: PASSED")
-                version_line = [line for line in output.split('\n') if 'hadoop' in line.lower()]
-                if version_line:
-                    logger.info(f"Version info: {version_line[0].strip()}")
             else:
-                error_msg = f"Hadoop FS commands failed. Output: {output[:200]}"
+                error_msg = output.replace('HADOOP_FS_FAIL: ', '').strip() or f"Hadoop FS access failed (exit={exit_code})"
                 validation_results['errors'].append(f"Hadoop FS: {error_msg}")
                 logger.error(f"Hadoop FS: FAILED - {error_msg}")
 
@@ -509,12 +558,12 @@ def validate_prerequisites(run_id: str) -> dict:
         if not validation_results['ssh_connectivity']:
             validation_results['errors'].append(f"SSH: {error_msg}")
             logger.error(f"SSH connectivity: FAILED - {error_msg}")
+        if not validation_results['cluster_auth']:
+            validation_results['errors'].append("Cluster auth: Skipped due to SSH failure")
+            logger.warning("Cluster auth: SKIPPED (SSH failed)")
         if not validation_results['pyspark_available']:
-            validation_results['errors'].append("PySpark: Skipped due to SSH failure")
-            logger.warning("PySpark: SKIPPED (SSH failed)")
-        if not validation_results['hive_available']:
-            validation_results['errors'].append("Hive: Skipped due to SSH failure")
-            logger.warning("Hive: SKIPPED (SSH failed)")
+            validation_results['errors'].append("PySpark/Hive: Skipped due to SSH failure")
+            logger.warning("PySpark/Hive: SKIPPED (SSH failed)")
         if not validation_results['hadoop_fs_available']:
             validation_results['errors'].append("Hadoop FS: Skipped due to SSH failure")
             logger.warning("Hadoop FS: SKIPPED (SSH failed)")
@@ -526,6 +575,7 @@ def validate_prerequisites(run_id: str) -> dict:
 
     all_passed = all([
         validation_results['ssh_connectivity'],
+        validation_results['cluster_auth'],
         validation_results['pyspark_available'],
         validation_results['hive_available'],
         validation_results['hadoop_fs_available']
@@ -756,29 +806,15 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
 
 @task
 def cluster_login_setup(run_id: str) -> dict:
-    """SSH to edge, perform cluster login (MapR or Kerberos), create temp dir."""
+    """SSH to edge, perform cluster login (MapR ticket or Kerberos), create temp dir."""
     config = get_config()
     ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
     temp_dir = f"{config['edge_temp_path']}/{run_id}"
-
-    auth_script_parts = []
-
-    auth_script_parts.append("""
-echo "=== Sourcing User Profile ==="
-if [ -f ~/.profile ]; then
-    source ~/.profile
-    echo "Profile sourced: ~/.profile"
-else
-    echo "WARNING: Profile not found at ~/.profile"
-fi
-""")
-
     auth_method = config.get('auth_method', 'mapr')
     mapr_user = config.get('mapr_user', '')
-    mapr_ticketfile = config.get('mapr_ticketfile_location', '')
-    kinit_principal = config.get('kinit_principal', '')
-    kinit_keytab = config.get('kinit_keytab', '')
-    kinit_password = config.get('kinit_password', '')
+    mapr_ticketfile = config.get('mapr_ticketfile_location', '/tmp/maprticket_${USER}')
+
+    auth_script_parts = []
 
     auth_script_parts.append(f"""
 echo "=== Cluster Authentication ({auth_method}) ==="
@@ -796,14 +832,7 @@ if [ "{auth_method}" = "mapr" ]; then
     fi
 
 elif [ "{auth_method}" = "kinit" ]; then
-    if [ -n "{kinit_keytab}" ] && [ -n "{kinit_principal}" ]; then
-        kinit -kt "{kinit_keytab}" "{kinit_principal}"
-    elif [ -n "{kinit_principal}" ] && [ -n "{kinit_password}" ]; then
-        echo "{kinit_password}" | kinit "{kinit_principal}"
-    else
-        echo "ERROR: kinit requires principal and keytab or password"
-        exit 1
-    fi
+    echo "Kerberos authentication handled via ~/.profile"
 
 elif [ "{auth_method}" = "none" ]; then
     echo "No authentication required (auth_method=none)"
@@ -826,10 +855,10 @@ echo "TEMP_DIR={temp_dir}"
 """)
     full_script = "set -e\n" + "\n".join(auth_script_parts)
     with ssh.get_conn() as client:
-        _, stdout, stderr = client.exec_command(full_script, timeout=300)
-        exit_code = stdout.channel.recv_exit_status()
+        _, stdout, stderr = client.exec_command(_login_shell(full_script), timeout=300)
         output = stdout.read().decode()
         error = stderr.read().decode()
+        exit_code = stdout.channel.recv_exit_status()
 
         logger.info("=== Cluster Login Output ===")
         logger.info(output)
@@ -1123,17 +1152,15 @@ spark.stop()
             f.write(pyspark_script)
         sftp.close()
 
-        source_profile = "source ~/.profile 2>/dev/null || true\n"
-
         # Use pyspark < script.py instead of spark-submit
         cmd = f"""
-    {source_profile} cd {temp_dir}
-    pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}.log
-    """
-        _, stdout, stderr = client.exec_command(cmd, timeout=3600)
-        exit_code = stdout.channel.recv_exit_status()
+cd {temp_dir}
+pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}.log
+"""
+        _, stdout, stderr = client.exec_command(_login_shell(cmd), timeout=3600, get_pty=True)
         output = stdout.read().decode()
         error_output = stderr.read().decode()
+        exit_code = stdout.channel.recv_exit_status()
 
         logger.info("=== Spark Discovery Output ===")
         logger.info(output[-1000:])
@@ -1310,8 +1337,6 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
     s3_opts = _build_s3_opts(discovery['dest_bucket'], config, discovery.get('dest_endpoint', ''))
 
-    source_profile = "source ~/.profile 2>/dev/null || true\n"
-
     results = []
     for t in tables:
         if t.get('error'):
@@ -1333,8 +1358,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
         logger.info(f"[DistCp]   Dest   : {s3_loc}")
         logger.info(f"[DistCp]   Mappers: {mappers} | Bandwidth: {bandwidth} MB/s")
 
-        cmd = f'''{source_profile}
-set -e
+        cmd = f'''set -e
 
 calculate_s3_metrics_hadoop() {{
     local location=$1
@@ -1404,10 +1428,10 @@ exit 0
         distcp_started_at = _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         try:
             with ssh.get_conn() as client:
-                _, stdout, stderr = client.exec_command(cmd, timeout=SSH_COMMAND_TIMEOUT)
-                exit_code = stdout.channel.recv_exit_status()
+                _, stdout, stderr = client.exec_command(_login_shell(cmd), timeout=SSH_COMMAND_TIMEOUT)
                 output = stdout.read().decode()
                 error_output = stderr.read().decode()
+                exit_code = stdout.channel.recv_exit_status()
 
                 logger.info(f"=== DistCp for {src_db}.{tbl} (last 1000 chars) ===")
                 logger.info(output[-1000:])
@@ -2156,6 +2180,8 @@ def generate_html_report(run_id: str, spark) -> str:
     total_rows = sum(t.source_row_count or 0 for t in table_status)
     incremental_runs = sum(1 for t in table_status if t.distcp_is_incremental)
 
+    cluster_type = config.get('cluster_type', 'MapR')
+
     # Generate HTML
     html = f"""
 <!DOCTYPE html>
@@ -2163,7 +2189,7 @@ def generate_html_report(run_id: str, spark) -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MapR to S3 Migration Report - {run_id}</title>
+    <title>{cluster_type} to S3 Migration Report - {run_id}</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -2301,7 +2327,7 @@ def generate_html_report(run_id: str, spark) -> str:
 </head>
 <body>
     <div class="container">
-        <h1>MapR to S3 Migration Report</h1>
+        <h1>{cluster_type} to S3 Migration Report</h1>
 
         <div class="timestamp">
             Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
@@ -2501,7 +2527,7 @@ def generate_html_report(run_id: str, spark) -> str:
                     <td class="{schema_match_class}">{schema_match_icon}</td>
                 </tr>
 """
-    html += """
+    html += f"""
             </tbody>
         </table>
 
@@ -2513,12 +2539,12 @@ def generate_html_report(run_id: str, spark) -> str:
                 <tr>
                     <th>Database</th>
                     <th>Table</th>
-                    <th>MapR Size (GB)</th>
+                    <th>{cluster_type} Size (GB)</th>
                     <th>S3 Size Before (GB)</th>
                     <th>S3 Size After (GB)</th>
                     <th>S3 Size - Transferred (GB)</th>
                     <th>Size Match</th>
-                    <th>MapR Files</th>
+                    <th>{cluster_type} Files</th>
                     <th>S3 Files Before</th>
                     <th>S3 Files After</th>
                     <th>S3 Files - Transferred</th>
@@ -2606,7 +2632,7 @@ def generate_html_report(run_id: str, spark) -> str:
         </table>
 
         <div style="margin-top: 50px; padding-top: 20px; border-top: 1px solid #ecf0f1; color: #95a5a6; font-size: 12px;">
-            <p>This report was automatically generated by the MapR to S3 Migration DAG.</p>
+            <p>This report was automatically generated by the {cluster_type} to S3 Migration DAG.</p>
         </div>
     </div>
 </body>
@@ -4092,10 +4118,10 @@ def validate_prerequisites_folder_copy() -> dict:
 
             # 1. SSH connectivity
             logger.info("[1/3] Testing SSH connectivity...")
-            _, stdout, stderr = client.exec_command('echo "SSH_TEST_OK"', timeout=30)
-            exit_code = stdout.channel.recv_exit_status()
+            _, stdout, stderr = client.exec_command(_login_shell('echo "SSH_TEST_OK"'), timeout=30)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
             if exit_code == 0 and "SSH_TEST_OK" in output:
                 checks['ssh_connectivity'] = True
                 logger.info("SSH connectivity: PASSED")
@@ -4106,11 +4132,11 @@ def validate_prerequisites_folder_copy() -> dict:
 
             # 2. Hadoop DistCp
             logger.info("[2/3] Testing hadoop distcp availability...")
-            test_cmd = "source ~/.profile 2>/dev/null || true\nhadoop distcp --help > /dev/null 2>&1 && echo DISTCP_OK || echo DISTCP_FAIL"
-            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
-            exit_code = stdout.channel.recv_exit_status()
+            test_cmd = "hadoop distcp --help > /dev/null 2>&1 && echo DISTCP_OK || echo DISTCP_FAIL"
+            _, stdout, stderr = client.exec_command(_login_shell(test_cmd), timeout=60)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
             if "DISTCP_OK" in output:
                 checks['hadoop_distcp_available'] = True
                 logger.info("Hadoop DistCp: PASSED")
@@ -4121,11 +4147,13 @@ def validate_prerequisites_folder_copy() -> dict:
 
             # 3. Hadoop FS
             logger.info("[3/3] Testing Hadoop FS commands...")
-            test_cmd = "source ~/.profile 2>/dev/null || true\nhadoop fs -ls / > /dev/null 2>&1 && echo HADOOP_FS_OK || echo HADOOP_FS_FAIL"
-            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
-            exit_code = stdout.channel.recv_exit_status()
+            hdfs_nameservice = config.get('hdfs_nameservice', '')
+            fs_root = f"hdfs://{hdfs_nameservice}/" if hdfs_nameservice else "/"
+            test_cmd = f"if hadoop fs -ls {fs_root} > /dev/null 2>&1; then echo HADOOP_FS_OK; else echo HADOOP_FS_FAIL; fi"
+            _, stdout, stderr = client.exec_command(_login_shell(test_cmd), timeout=60)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
             if "HADOOP_FS_OK" in output:
                 checks['hadoop_fs_available'] = True
                 logger.info("Hadoop FS: PASSED")
@@ -4243,7 +4271,7 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
     """Read folder copy Excel config from S3.
 
     Expected columns:
-      - source_path   (required) : Full MapR/HDFS source path
+      - source_path   (required) : Full source cluster path (MapR-FS or HDFS)
       - target_bucket (required) : S3 bucket, normalised to s3a://
       - dest_folder   (optional) : Destination folder inside the bucket;
                                    defaults to the basename of source_path
@@ -4338,10 +4366,7 @@ def run_folder_distcp_ssh(folder_config: dict, **context) -> dict:
 
     s3_opts = _build_s3_opts(dest_bucket, config, dest_endpoint)
 
-    source_profile = "source ~/.profile 2>/dev/null || true\n"
-
-    cmd = f'''{source_profile}
-set -e
+    cmd = f'''set -e
 
 calculate_s3_metrics() {{
     local location=$1
@@ -4399,10 +4424,10 @@ exit 0
 
     try:
         with ssh.get_conn() as client:
-            _, stdout, stderr = client.exec_command(cmd, timeout=SSH_COMMAND_TIMEOUT)
-            exit_code = stdout.channel.recv_exit_status()
+            _, stdout, stderr = client.exec_command(_login_shell(cmd), timeout=SSH_COMMAND_TIMEOUT)
             output = stdout.read().decode()
             error_output = stderr.read().decode()
+            exit_code = stdout.channel.recv_exit_status()
 
             logger.info(f"[FolderDistCp] {source_path} -> {s3_dest} (last 1000 chars):")
             logger.info(output[-1000:])
@@ -4585,8 +4610,7 @@ def validate_data_copy(copy_status: dict, **context) -> dict:
         context['ti'].xcom_push(key='return_value', value=result)
         raise Exception(f"Validation skipped — upstream copy FAILED for {source_path}")
 
-    cmd = f"""source ~/.profile 2>/dev/null || true
-
+    cmd = f"""
 if ! hadoop fs{s3_opts} -test -d "{s3_dest}" 2>/dev/null; then
     echo "DEST_EXISTS=false"
     echo "DEST_FILE_COUNT=0"
@@ -4609,10 +4633,10 @@ fi
 
     try:
         with ssh.get_conn() as client:
-            _, stdout, stderr = client.exec_command(cmd, timeout=SSH_COMMAND_TIMEOUT)
-            stdout.channel.recv_exit_status()
+            _, stdout, stderr = client.exec_command(_login_shell(cmd), timeout=SSH_COMMAND_TIMEOUT)
             output = stdout.read().decode()
             stderr.read()
+            stdout.channel.recv_exit_status()
 
             for line in output.split('\n'):
                 line = line.strip()
@@ -6429,14 +6453,14 @@ def finalize_s3_run(run_id: str, spark) -> dict:
 # =============================================================================
 
 with DAG(
-    dag_id='mapr_to_s3_migration',
+    dag_id='source_to_s3_migration',
     default_args=DEFAULT_ARGS,
-    description='Migrate Hive tables from MapR-FS to S3',
+    description='Migrate Hive tables from source cluster (MapR/HDP) to S3',
     schedule=None,
     start_date=datetime(2025, 1, 1),
     catchup=False,
     max_active_runs=5,
-    tags=['migration', 'mapr', 's3', 'hive'],
+    tags=['migration', 'source-cluster', 's3', 'hive'],
     params={
         'excel_file_path': Param(
             default='s3a://config-bucket/migration.xlsx',
@@ -6573,12 +6597,12 @@ with DAG(
 with DAG(
     dag_id='folder_only_data_copy',
     default_args=DEFAULT_ARGS,
-    description='Copy folders from MapR/HDFS to S3 via DistCp — no Hive metadata',
+    description='Copy folders from source cluster (MapR/HDP) to S3 via DistCp — no Hive metadata',
     schedule=None,
     start_date=datetime(2025, 1, 1),
     catchup=False,
     max_active_runs=3,
-    tags=['migration', 'mapr', 's3', 'folder-copy'],
+    tags=['migration', 'source-cluster', 's3', 'folder-copy'],
     params={
         'excel_file_path': Param(
             default='s3a://config-bucket/folder_copy.xlsx',
