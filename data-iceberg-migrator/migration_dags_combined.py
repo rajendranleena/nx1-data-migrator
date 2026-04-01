@@ -497,7 +497,7 @@ def _validate_bucket_endpoint_pairs(grouped: dict, config: dict) -> None:
 
 
 # =============================================================================
-# DAG 1: MAPR TO S3 MIGRATION TASKS
+# DAG 1: MAPR / HDFS TO S3 MIGRATION TASKS
 # =============================================================================
 
 @task
@@ -816,15 +816,9 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         raw_bucket = '' if (raw_bucket_val is None or (isinstance(raw_bucket_val, float) and __import__('math').isnan(raw_bucket_val)) or str(raw_bucket_val).strip().lower() == 'nan') else str(raw_bucket_val).strip()
         bucket_val = normalize_bucket(raw_bucket) if raw_bucket else config['default_s3_bucket']
 
-<<<<<<< HEAD
         raw_endpoint_val = row.get('endpoint', '')
         endpoint_val = '' if (raw_endpoint_val is None or (isinstance(raw_endpoint_val, float) and __import__('math').isnan(raw_endpoint_val)) or str(raw_endpoint_val).strip().lower() in ('', 'nan')) else str(raw_endpoint_val).strip()
 
-        # Grouping key includes endpoint so same bucket on different tenants gets separate task instances
-        key = (src_db, dest_db, bucket_val, endpoint_val)
-        if key not in grouped:
-            grouped[key] = {'bucket': bucket_val, 'endpoint': endpoint_val, 'tokens': []}
-=======
         # Warn if wildcard used with a filter
         if '*' in [t.strip() for t in raw_cell.split(',')] and partition_filter:
             logger.warning(
@@ -841,10 +835,9 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
                 f"Each table will inherit the same filter."
             )
 
-        key = (src_db, dest_db, bucket_val, partition_filter)
+        key = (src_db, dest_db, bucket_val, endpoint_val, partition_filter)
         if key not in grouped:
-            grouped[key] = {'bucket': bucket_val, 'tokens': [], 'partition_filter': partition_filter}
->>>>>>> 98a6d78 (Feat: Partition specific migration)
+            grouped[key] = {'bucket': bucket_val, 'tokens': [], 'endpoint': endpoint_val, 'partition_filter': partition_filter}
 
         for tok in raw_cell.split(','):
             tok = tok.strip()
@@ -854,11 +847,8 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     _validate_bucket_endpoint_pairs(grouped, config)
     configs = []
 
-<<<<<<< HEAD
-    for (src_db, dest_db, bucket_val, endpoint_val), group in grouped.items():
-=======
-    for (src_db, dest_db, bucket_val, partition_filter), group in grouped.items():
->>>>>>> 98a6d78 (Feat: Partition specific migration)
+
+    for (src_db, dest_db, bucket_val, endpoint_val, partition_filter), group in grouped.items():
         unique_tokens = list(dict.fromkeys(group['tokens']))
         if '*' in unique_tokens:
             unique_tokens = ['*']
@@ -1519,6 +1509,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
                   AND source_database = '{t['source_database']}'
+                  AND dest_database = '{t['dest_database']}'
                   AND source_table = '{t['source_table']}'
             """,
             task_label=f"record_discovered_tables:{t['source_table']}")
@@ -1601,6 +1592,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             results.append({
                 'source_database': t['source_database'],
                 'source_table': t['source_table'],
+                'dest_database': t['dest_database'],
                 'status': 'SKIPPED',
 
             })
@@ -1615,6 +1607,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             results.append({
                 'source_database': t['source_database'],
                 'source_table': t['source_table'],
+                'dest_database': t['dest_database'],
                 'status': 'SKIPPED',
                 'error': f"partition_filter matched 0 partitions: {t.get('partition_filter')}"
             })
@@ -1622,6 +1615,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
         src_db = t['source_database']
         tbl = t['source_table']
+        dest_db_for_table = t['dest_database']
         source_loc = t['source_location']
         s3_loc = t['s3_location']
 
@@ -1844,6 +1838,7 @@ exit 0
                 results.append({
                     'source_database': src_db,
                     'source_table': tbl,
+                    'dest_database': dest_db_for_table,
                     'status': 'COMPLETED',
                     'distcp_started_at': distcp_started_at,
                     'distcp_duration_secs': distcp_duration_secs,
@@ -1867,6 +1862,7 @@ exit 0
             results.append({
                 'source_database': src_db,
                 'source_table': tbl,
+                'dest_database': dest_db_for_table,
                 'status': 'FAILED',
                 'distcp_started_at': distcp_started_at,
                 'distcp_completed_at': _fail_dt.strftime('%Y-%m-%d %H:%M:%S'),
@@ -1972,25 +1968,41 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
                   AND source_database = '{r['source_database']}'
-                  AND dest_database='{distcp_result["dest_database"]}'
                   AND source_table = '{r['source_table']}'
                   AND distcp_status IS NULL
             """,
             task_label=f"update_distcp_status:failure_patch:{r['source_table']}")
 
-    execute_with_iceberg_retry(spark, f"""
-        UPDATE {tracking_db}.migration_table_status
-        SET distcp_status = 'FAILED',
-            overall_status = 'FAILED',
-            error_message = COALESCE(error_message, 'S3 copy task did not process this table'),
-            updated_at = current_timestamp()
-        WHERE run_id = '{run_id}'
-          AND source_database = '{src_db}'
-          AND dest_database='{distcp_result["dest_database"]}'
-          AND distcp_status IS NULL
-          AND discovery_status = 'COMPLETED'
-    """,
-    task_label="update_distcp_status:catchall")
+    _distcp_processed_dbs = set(
+        r.get('dest_database', distcp_result['dest_database'])
+        for r in distcp_result.get('distcp_results', [])
+    )
+    _distcp_processed_tables = set(
+        r['source_table']
+        for r in distcp_result.get('distcp_results', [])
+    )
+    _distcp_not_in = ', '.join(f"'{t}'" for t in _distcp_processed_tables) if _distcp_processed_tables else "'__no_tables__'"
+
+    from collections import defaultdict
+    _slot_tables_by_db = defaultdict(set)
+    for t in distcp_result.get('tables', []):
+        _slot_tables_by_db[t.get('dest_database', distcp_result['dest_database'])].add(t['source_table'])
+    if not _slot_tables_by_db:
+        _slot_tables_by_db[distcp_result['dest_database']] = set()
+
+    for _pddb, _slot_tbls in _slot_tables_by_db.items():
+        _slot_in = ', '.join(f"'{t}'" for t in _slot_tbls) if _slot_tbls else "'__no_tables__'"
+        execute_with_iceberg_retry(spark, f"""
+            UPDATE {tracking_db}.migration_table_status
+            SET distcp_status='FAILED', overall_status='FAILED',
+                error_message=COALESCE(error_message,'S3 copy task did not process this table'),
+                updated_at=current_timestamp()
+            WHERE run_id='{run_id}' AND source_database='{src_db}'
+              AND dest_database='{_pddb}'
+              AND source_table IN ({_slot_in})
+              AND source_table NOT IN ({_distcp_not_in})
+              AND distcp_status IS NULL AND discovery_status='COMPLETED'
+        """, task_label=f"update_distcp:catchall:{_pddb}")
 
     return distcp_result
 
@@ -2005,8 +2017,8 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
         return {}
 
     tables = distcp_result['tables']
-    results = []
 
+    results = []
     created_dbs = set()
 
     for t in tables:
@@ -2029,9 +2041,9 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                  if r['source_table'] == tbl),
                 None
             )
-        
+
         distcp_status = distcp_entry['status'] if distcp_entry else 'UNKNOWN'
-        
+
         if distcp_status in ('FAILED', 'SKIPPED', 'UNKNOWN'):
             results.append({
                 'source_table': t['source_table'],
@@ -2264,16 +2276,19 @@ def update_table_create_status(table_result: dict, spark) -> dict:
             """,
             task_label=f"update_table_create_status:failure_patch:{r['source_table']}")
 
-    _tbl_processed_dbs = set(
-        r.get('dest_database', table_result['dest_database'])
-        for r in table_result.get('table_results', [])
-    )
     _tbl_processed_tables = set(
         r['source_table']
         for r in table_result.get('table_results', [])
     )
     _tbl_not_in = ', '.join(f"'{t}'" for t in _tbl_processed_tables) if _tbl_processed_tables else "'__no_tables__'"
-    for _pddb in _tbl_processed_dbs:
+    from collections import defaultdict
+    _tbl_slot_tables_by_db = defaultdict(set)
+    for t in table_result.get('tables', []):
+        _tbl_slot_tables_by_db[t.get('dest_database', table_result['dest_database'])].add(t['source_table'])
+    if not _tbl_slot_tables_by_db:
+        _tbl_slot_tables_by_db[table_result['dest_database']] = set()
+    for _pddb, _slot_tbls in _tbl_slot_tables_by_db.items():
+        _slot_in = ', '.join(f"'{t}'" for t in _slot_tbls) if _slot_tbls else "'__no_tables__'"
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.migration_table_status
             SET table_create_status = 'FAILED',
@@ -2283,6 +2298,7 @@ def update_table_create_status(table_result: dict, spark) -> dict:
             WHERE run_id = '{run_id}'
               AND source_database = '{src_db}'
               AND dest_database = '{_pddb}'
+              AND source_table IN ({_slot_in})
               AND source_table NOT IN ({_tbl_not_in})
               AND table_create_status IS NULL
               AND discovery_status = 'COMPLETED'
@@ -2584,19 +2600,36 @@ def update_validation_status(validation_result: dict, spark) -> dict:
             """,
             task_label=f"update_validation_status:failure_patch:{v['source_table']}")
 
-    execute_with_iceberg_retry(spark, f"""
-        UPDATE {tracking_db}.migration_table_status
-        SET validation_status = 'SKIPPED',
-            overall_status = CASE WHEN overall_status = 'FAILED' THEN 'FAILED' ELSE 'VALIDATION_FAILED' END,
-            error_message = COALESCE(error_message, 'Validation task did not process this table'),
-            updated_at = current_timestamp()
-        WHERE run_id = '{run_id}'
-          AND source_database = '{src_db}'
-          AND dest_database = '{dest_db}'
-          AND table_create_status = 'COMPLETED'
-          AND validation_status IS NULL
-    """,
-    task_label="update_validation_status:catchall")
+    _val_processed_tables = set(
+        v['source_table']
+        for v in validation_result.get('validation_results', [])
+    )
+    _val_not_in = ', '.join(f"'{t}'" for t in _val_processed_tables) if _val_processed_tables else "'__no_tables__'"
+
+    from collections import defaultdict
+    _slot_tables_by_db = defaultdict(set)
+    for t in validation_result.get('tables', []):
+        _slot_tables_by_db[t.get('dest_database', dest_db)].add(t['source_table'])
+    if not _slot_tables_by_db:
+        _slot_tables_by_db[dest_db] = set()
+
+    for _vpddb, _slot_tbls in _slot_tables_by_db.items():
+        _slot_in = ', '.join(f"'{t}'" for t in _slot_tbls) if _slot_tbls else "'__no_tables__'"
+        execute_with_iceberg_retry(spark, f"""
+            UPDATE {tracking_db}.migration_table_status
+            SET validation_status = 'SKIPPED',
+                overall_status = CASE WHEN overall_status = 'FAILED' THEN 'FAILED' ELSE 'VALIDATION_FAILED' END,
+                error_message = COALESCE(error_message, 'Validation task did not process this table'),
+                updated_at = current_timestamp()
+            WHERE run_id = '{run_id}'
+              AND source_database = '{src_db}'
+              AND dest_database = '{_vpddb}'
+              AND source_table IN ({_slot_in})
+              AND source_table NOT IN ({_val_not_in})
+              AND table_create_status = 'COMPLETED'
+              AND validation_status IS NULL
+        """,
+        task_label=f"update_validation_status:catchall:{_vpddb}")
 
     return validation_result
 
@@ -2865,7 +2898,7 @@ def generate_html_report(run_id: str, spark) -> str:
             abs(total_src_gb - total_dest_gb) / total_src_gb * 100
             if total_src_gb > 0 else 0.0
         )
-        
+
         html += f"""
         <div class="summary-grid">
             <div class="summary-card info">
@@ -2929,6 +2962,7 @@ def generate_html_report(run_id: str, spark) -> str:
                     <th>Database</th>
                     <th>Table</th>
                     <th>Status</th>
+                    <th>Partition Filter</th>
                     <th>Discovery</th>
                     <th>DistCp</th>
                     <th>Table Create</th>
@@ -2960,11 +2994,21 @@ def generate_html_report(run_id: str, spark) -> str:
         total_dur = (t.discovery_duration_seconds or 0) + (t.distcp_duration_seconds or 0) + \
                     (t.table_create_duration_seconds or 0) + (t.validation_duration_seconds or 0)
 
+        pf_display = t.partition_filter or ''
+        if pf_display:
+            fpc = t.filtered_partition_count
+            pf_display = f"<span style='background-color:#e8f4fd;color:#1a6fa3;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:bold;'>{pf_display}</span>"
+            if fpc is not None:
+                pf_display += f"<br><small style='color:#7f8c8d;'>({fpc} partition{'s' if fpc != 1 else ''})</small>"
+        else:
+            pf_display = "<span style='color:#bdc3c7;font-size:11px;'>—</span>"
+
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
                     <td><strong>{t.source_table}</strong></td>
                     <td><span class="status-badge {status_class}">{t.overall_status}</span></td>
+                    <td>{pf_display}</td>
                     <td class="duration">{discovery_dur}</td>
                     <td class="duration">{distcp_dur}{distcp_detail}</td>
                     <td class="duration">{table_dur}</td>
@@ -3168,7 +3212,7 @@ def finalize_run(run_id: str, spark) -> dict:
         stats_result = spark.sql(f"""
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS') THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED') THEN 1 ELSE 0 END) as successful,
                 SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed
             FROM {tracking_db}.migration_table_status
             WHERE run_id = '{run_id}'

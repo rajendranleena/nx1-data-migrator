@@ -431,7 +431,7 @@ class TestValidateDestinationTables:
                 df.collect.return_value = [self._make_tracking_row()]
             elif 'source_row_count' in sql_lower:
                 r = MagicMock()
-                r.__getitem__ = lambda self, k: {'source_row_count': 1000, 'source_partition_count': 2}[k]
+                r.__getitem__ = lambda self, k: {'source_row_count': 1000, 'source_partition_count': 2, 'partition_filter': None, }[k]
                 df.collect.return_value = [r]
             elif 'count(*)' in sql_lower and 'as c' in sql_lower:
                 r = MagicMock()
@@ -500,6 +500,8 @@ class TestGenerateHtmlReport:
             s3_files_transferred=5, file_count_match=True,
             distcp_status='COMPLETED',
             file_format='PARQUET',
+            partition_filter=None,
+            filtered_partition_count=None,
         )
         vs_row = MagicMock()
         vs_row.__getitem__ = lambda self, k: 1

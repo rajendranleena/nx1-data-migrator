@@ -280,7 +280,7 @@ def sample_distcp_result(sample_discovery):
     return {
         **sample_discovery,
         'distcp_results': [{
-            'source_database': 'sales_data', 'source_table': 'transactions',
+            'source_database': 'sales_data', 'source_table': 'transactions', 'dest_database': 'sales_data_s3',
             'status': 'COMPLETED', 'distcp_started_at': '2025-01-01 12:00:00',
             'distcp_completed_at': '2025-01-01 12:05:00', 'distcp_duration_secs': 300.0,
             'is_incremental': False, 'bytes_copied': 10 * 1024 * 1024, 'files_copied': 5,
