@@ -170,6 +170,9 @@ def _install_airflow_stubs():
         else:
             sys.modules[name] = original
     sys.modules.pop(_MODULE_NAME, None)
+    sys.modules.pop("migration_dag_metadata", None)
+    sys.modules.pop("utils.shared", None)
+    sys.modules.pop("utils", None)
     if _str_dir in sys.path:
         sys.path.remove(_str_dir)
 
@@ -241,7 +244,8 @@ def mock_ssh_hook():
 @pytest.fixture
 def mock_iceberg_retry():
     """Patch execute_with_iceberg_retry and yield the mock for SQL assertions."""
-    with patch('migration_dags_combined.execute_with_iceberg_retry') as retry:
+    with patch('migration_dags_combined.execute_with_iceberg_retry') as retry, \
+         patch('migration_dag_metadata.execute_with_iceberg_retry', retry):
         yield retry
 
 

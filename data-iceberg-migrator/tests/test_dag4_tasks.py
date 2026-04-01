@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
-import migration_dags_combined as m
+import migration_dag_metadata as m
 import pytest
 
 from .helpers import make_excel_bytes, setup_spark_excel
@@ -365,7 +365,7 @@ class TestValidateDataPresence:
         mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.side_effect = Exception("S3 error")
         with pytest.raises(Exception, match="Data presence check FAILED"):
             m.validate_data_presence.function(
-                discovery=sample_s3_discovery, spark=mock_spark,
+                discovery=sample_s3_discovery, spark=mock_spark, ti=MagicMock(),
             )
 
     def test_skips_invalid_input(self, mock_spark):
@@ -661,7 +661,7 @@ class TestGenerateS3HtmlReport:
 class TestSendS3ReportEmail:
 
     def test_skips_when_no_recipients_configured(self, mock_spark, sample_s3_run_id):
-        with patch('migration_dags_combined.get_config') as mock_cfg:
+        with patch('migration_dag_metadata.get_config') as mock_cfg:
             mock_cfg.return_value = {
                 'smtp_conn_id': 'smtp_default',
                 'email_recipients': '',
@@ -682,7 +682,7 @@ class TestSendS3ReportEmail:
         mock_spark._jvm.java.io.BufferedReader.return_value = reader_mock
 
         send_email_mock = MagicMock()
-        with patch('migration_dags_combined.get_config') as mock_cfg, \
+        with patch('migration_dag_metadata.get_config') as mock_cfg, \
              patch('airflow.utils.email.send_email', send_email_mock):
             mock_cfg.return_value = {
                 'smtp_conn_id': 'smtp_default',
