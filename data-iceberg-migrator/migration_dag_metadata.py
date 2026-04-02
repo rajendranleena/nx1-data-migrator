@@ -1,21 +1,24 @@
 """
 DAG 4: S3-to-S3 Metadata Migration
 
-Metadata-only migration: discovers source Hive table schemas and recreates them
-as external tables pointing to destination S3 paths. No data is copied — only
-Hive metadata (DDL) is migrated.
+Metadata-only migration: discovers source table schemas and recreates them
+at a destination. No data is copied — only metadata (DDL) is migrated.
+
+Supports multiple migration types via the strategy pattern:
+  - hive_to_hive:         Hive external tables → Hive external tables at dest S3
+  - iceberg_to_iceberg:   File-based Iceberg catalog → HMS-registered Iceberg tables
 
 Pipeline stages:
   1. Init tracking tables & create run record
   2. Parse Excel config (database, table tokens, prefix mapping)
-  3. Discover source Hive table metadata (schema, partitions, row counts)
+  3. Discover source table metadata (schema, partitions, row counts)
   4. Validate data presence at destination S3 paths
-  5. Create destination Hive external tables (or repair existing)
+  5. Create destination tables (Hive DDL or Iceberg register_table)
   6. Validate destination tables (row count, partition, schema comparison)
   7. Generate HTML report & send email
 
 Excel columns: database | table | dest_database | dest_bucket |
-               source_s3_prefix | dest_s3_prefix
+               source_s3_prefix | dest_s3_prefix | source_table_path (iceberg only)
 """
 
 import contextlib
@@ -33,12 +36,12 @@ from dotenv import load_dotenv
 from utils.shared import (
     DEFAULT_ARGS,
     apply_bucket_credentials,
-    compute_dest_path,
     configure_spark_s3,
     execute_with_iceberg_retry,
     get_config,
     track_duration,
 )
+from utils.metadata_strategies import get_strategy
 
 _dag_stem = Path(__file__).stem
 logger = logging.getLogger(__name__)
@@ -160,14 +163,14 @@ def create_s3_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str
 
 
 @task.pyspark(conn_id='spark_default')
-def parse_s3_excel(excel_file_path: str, run_id: str, spark) -> list:
-    """Read and parse the S3 migration Excel config."""
-    import math
+def parse_s3_excel(excel_file_path: str, run_id: str, migration_type: str, spark) -> list:
+    """Read Excel config and delegate row parsing to the active strategy."""
     from io import BytesIO
 
     import pandas as ps
 
     config = get_config()
+    strategy = get_strategy(migration_type)
 
     binary_df = spark.read.format("binaryFile").load(excel_file_path)
     row = binary_df.select("content").first()
@@ -175,261 +178,39 @@ def parse_s3_excel(excel_file_path: str, run_id: str, spark) -> list:
     df = ps.read_excel(BytesIO(excel_bytes), engine='openpyxl')
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
-    def _str(val, default=''):
-        if val is None or (isinstance(val, float) and math.isnan(val)):
-            return default
-        return str(val).strip() or default
+    configs = strategy['parse_excel_rows'](df, config, run_id)
 
-    def _normalize_s3(path: str) -> str:
-        if not path:
-            return path
-        if path.startswith('s3n://'):
-            return 's3a://' + path[6:]
-        if path.startswith('s3://'):
-            return 's3a://' + path[5:]
-        if not path.startswith('s3a://'):
-            return 's3a://' + path
-        return path
-
-    # Group rows by (src_db, dest_db, dest_bucket, src_prefix, dest_prefix)
-    grouped = {}
-    for _, row in df.iterrows():
-        src_db = _str(row.get('database'))
-        if not src_db:
-            continue
-
-        raw_table = _str(row.get('table'), '*')
-        dest_db   = _str(row.get('dest_database'), src_db)
-
-        raw_bucket       = _str(row.get('dest_bucket'))
-        src_prefix       = _normalize_s3(_str(row.get('source_s3_prefix')))
-        dest_prefix      = _normalize_s3(_str(row.get('dest_s3_prefix')))
-        dest_bucket_norm = _normalize_s3(raw_bucket) if raw_bucket else config['default_s3_bucket']
-
-        has_prefix  = bool(src_prefix and dest_prefix)
-        has_bucket  = bool(dest_bucket_norm)
-        if not has_prefix and not has_bucket:
-            logger.warning(
-                f"[parse_s3_excel] Skipping row for database '{src_db}' — "
-                f"must supply either (source_s3_prefix + dest_s3_prefix) or dest_bucket"
-            )
-            continue
-
-        key = (src_db, dest_db, dest_bucket_norm, src_prefix, dest_prefix)
-        if key not in grouped:
-            grouped[key] = {'tokens': []}
-
-        for tok in raw_table.split(','):
-            tok = tok.strip()
-            if tok:
-                grouped[key]['tokens'].append(tok)
-
-    configs = []
-    for (src_db, dest_db, dest_bucket, src_prefix, dest_prefix), group in grouped.items():
-        unique_tokens = list(dict.fromkeys(group['tokens']))
-        if '*' in unique_tokens:
-            unique_tokens = ['*']
-
-        configs.append({
-            'source_database':  src_db,
-            'dest_database':    dest_db,
-            'dest_bucket':      dest_bucket,
-            'source_s3_prefix': src_prefix,
-            'dest_s3_prefix':   dest_prefix,
-            'table_tokens':     unique_tokens,
-            'run_id':           run_id,
-        })
-        logger.info(
-            f"[parse_s3_excel] {src_db} → {dest_db} | bucket={dest_bucket} | "
-            f"src_prefix={src_prefix or 'N/A'} | dest_prefix={dest_prefix or 'N/A'} | "
-            f"tokens={unique_tokens[:5]}"
-        )
+    for cfg in configs:
+        cfg['migration_type'] = migration_type
 
     if not configs:
         logger.error("[parse_s3_excel] No valid rows found in Excel config")
         return []
 
-    logger.info(f"[parse_s3_excel] Emitting {len(configs)} database config(s)")
+    logger.info(f"[parse_s3_excel] Emitting {len(configs)} database config(s) for strategy '{migration_type}'")
     return configs
 
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
-def discover_source_hive_tables(db_config: dict, spark, **context) -> dict:
-    """Discover source Hive table metadata"""
-    import fnmatch
-
+def discover_source_tables(db_config: dict, spark, **context) -> dict:
+    """Discover source table metadata — dispatches to the active strategy."""
     config = get_config()
-    src_db = db_config['source_database']
-    dest_db = db_config['dest_database']
-    dest_bucket = db_config['dest_bucket']
-    src_prefix = db_config.get('source_s3_prefix', '')
-    dest_prefix = db_config.get('dest_s3_prefix', '')
-    tokens = db_config.get('table_tokens', ['*'])
-    run_id = db_config['run_id']
+    migration_type = db_config.get('migration_type', 'hive_to_hive')
+    strategy = get_strategy(migration_type)
 
     configure_spark_s3(spark, config)
 
-    all_tables = [r.tableName for r in spark.sql(f"SHOW TABLES IN {src_db}").collect()]
-    matched = []
-    for tok in tokens:
-        if tok == '*':
-            matched = all_tables
-            break
-        matched += [t for t in all_tables if fnmatch.fnmatch(t, tok) and t not in matched]
-
-    logger.info(f"[discover_source_hive_tables] '{src_db}': {len(matched)} table(s) matched")
-
-    metadata = []
-    for tbl in matched:
-        try:
-            desc_rows    = spark.sql(f"DESCRIBE FORMATTED {src_db}.{tbl}").collect()
-
-            location     = None
-            input_format = None
-            table_type   = 'EXTERNAL_TABLE'
-
-            for r in desc_rows:
-                col  = (r.col_name  or '').strip().rstrip(':').lower()
-                val  = (r.data_type or '').strip()
-                if col == 'location':
-                    location = val
-                elif col in ('type', 'table type'):
-                    table_type = val.replace('_TABLE', '')
-                elif col == 'inputformat':
-                    input_format = val
-
-            file_format = 'PARQUET'
-            if input_format:
-                lf = input_format.lower()
-                if 'parquet' in lf:
-                    file_format = 'PARQUET'
-                elif 'orc' in lf:
-                    file_format = 'ORC'
-                elif 'avro' in lf:
-                    file_format = 'AVRO'
-                elif 'text' in lf:
-                    file_format = 'TEXTFILE'
-                else:
-                    logger.warning(
-                        f"[discover_source_hive_tables] Unrecognised InputFormat "
-                        f"'{input_format}' for {src_db}.{tbl} — defaulting to PARQUET"
-                    )
-
-            part_cols = []
-            in_part_section = False
-            for r in desc_rows:
-                cn = (r.col_name or '').strip()
-                if cn == '# Partition Information':
-                    in_part_section = True
-                    continue
-                if in_part_section and cn == '# col_name':
-                    continue
-                if in_part_section and cn.startswith('#'):
-                    break
-                if in_part_section and cn:
-                    part_cols.append(cn)
-
-            is_partitioned = len(part_cols) > 0
-
-            partitions = []
-            with contextlib.suppress(Exception):
-                partitions = [r.partition for r in spark.sql(f"SHOW PARTITIONS {src_db}.{tbl}").collect()]
-
-            row_count = 0
-            try:
-                row_count = spark.sql(f"SELECT COUNT(*) as c FROM {src_db}.{tbl}").collect()[0]['c']
-            except Exception as e:
-                logger.warning(f"[discover_source_hive_tables] Could not count rows for {src_db}.{tbl}: {e}")
-
-            source_file_count = 0
-            source_total_size = 0
-            if location:
-                try:
-                    from py4j.java_gateway import java_import
-                    java_import(spark._jvm, 'org.apache.hadoop.fs.*')
-                    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-                        spark._jvm.java.net.URI(location),
-                        spark._jsc.hadoopConfiguration()
-                    )
-                    path_obj = spark._jvm.org.apache.hadoop.fs.Path(location)
-                    if fs.exists(path_obj):
-                        summary = fs.getContentSummary(path_obj)
-                        source_total_size = int(summary.getLength())
-                        source_file_count = int(summary.getFileCount())
-                except Exception as e:
-                    logger.warning(f"[discover_source_hive_tables] Could not get FS summary for {src_db}.{tbl}: {e}")
-
-            schema = []
-            for r in spark.sql(f"DESCRIBE {src_db}.{tbl}").collect():
-                cn = (r.col_name or '').strip()
-                if cn.startswith('#') or cn == '' or cn == 'col_name':
-                    break
-                schema.append({'name': cn, 'type': (r.data_type or '').strip()})
-
-            dest_path = compute_dest_path(
-                source_location=location or '',
-                dest_database=dest_db,
-                table_name=tbl,
-                dest_bucket=dest_bucket,
-                source_s3_prefix=src_prefix,
-                dest_s3_prefix=dest_prefix,
-            )
-
-            logger.info(
-                f"[discover_source_hive_tables] {src_db}.{tbl} | fmt={file_format} | "
-                f"parts={len(partitions)} | rows={row_count} | "
-                f"size={source_total_size/(1024**2):.1f}MB | dest={dest_path}"
-            )
-
-            metadata.append({
-                'source_database': src_db,
-                'source_table': tbl,
-                'dest_database': dest_db,
-                'dest_bucket': dest_bucket,
-                'source_location': location or '',
-                'dest_location': dest_path,
-                'file_format': file_format,
-                'table_type': table_type,
-                'schema': schema,
-                'partition_columns': ','.join(part_cols),
-                'partitions': partitions,
-                'partition_count': len(partitions),
-                'is_partitioned': is_partitioned,
-                'source_row_count': row_count,
-                'source_file_count': source_file_count,
-                'source_total_size_bytes': source_total_size,
-            })
-
-        except Exception as e:
-            logger.error(f"[discover_source_hive_tables] FAILED for {src_db}.{tbl}: {e}")
-            metadata.append({
-                'source_database': src_db,
-                'source_table': tbl,
-                'dest_database': dest_db,
-                'dest_bucket': dest_bucket,
-                'source_location': '',
-                'dest_location': '',
-                'file_format': 'PARQUET',
-                'table_type': 'UNKNOWN',
-                'schema': [],
-                'partition_columns': '',
-                'partitions': [],
-                'partition_count': 0,
-                'is_partitioned': False,
-                'source_row_count': 0,
-                'source_file_count': 0,
-                'source_total_size_bytes': 0,
-                'error': str(e)[:500],
-            })
+    metadata = strategy['discover_tables'](db_config, spark, config)
 
     result_dict = {
-        'run_id': run_id,
-        'source_database': src_db,
-        'dest_database': dest_db,
-        'dest_bucket': dest_bucket,
-        'source_s3_prefix': src_prefix,
-        'dest_s3_prefix': dest_prefix,
+        'run_id': db_config['run_id'],
+        'source_database': db_config['source_database'],
+        'dest_database': db_config['dest_database'],
+        'dest_bucket': db_config['dest_bucket'],
+        'source_s3_prefix': db_config.get('source_s3_prefix', ''),
+        'dest_s3_prefix': db_config.get('dest_s3_prefix', ''),
+        'migration_type': migration_type,
         'tables': metadata,
     }
 
@@ -437,7 +218,8 @@ def discover_source_hive_tables(db_config: dict, spark, **context) -> dict:
     if failed:
         context['ti'].xcom_push(key='return_value', value=result_dict)
         raise Exception(
-            f"Discovery failed for {len(failed)}/{len(metadata)} table(s) in '{src_db}': "
+            f"Discovery failed for {len(failed)}/{len(metadata)} table(s) in "
+            f"'{db_config['source_database']}': "
             + ', '.join(t['source_table'] for t in failed[:3])
         )
 
@@ -699,14 +481,16 @@ def update_data_presence_status(presence_result: dict, spark) -> dict:
 
 @task.pyspark(conn_id='spark_default')
 @track_duration
-def create_dest_hive_tables(presence_result: dict, spark, **context) -> dict:
-    """Create or repair destination Hive external tables."""
+def create_dest_tables(presence_result: dict, spark, **context) -> dict:
+    """Create destination tables — dispatches per-table creation to the active strategy."""
     if not isinstance(presence_result, dict) or 'tables' not in presence_result:
-        logger.warning("[create_dest_hive_tables] Skipping invalid input")
+        logger.warning("[create_dest_tables] Skipping invalid input")
         return {}
 
     config = get_config()
     configure_spark_s3(spark, config)
+    migration_type = presence_result.get('migration_type', 'hive_to_hive')
+    strategy = get_strategy(migration_type)
     dest_db = presence_result['dest_database']
     tables = presence_result['tables']
 
@@ -724,7 +508,7 @@ def create_dest_hive_tables(presence_result: dict, spark, **context) -> dict:
         p_status = presence.get('status', 'UNKNOWN')
 
         if p_status != 'CONFIRMED':
-            logger.info(f"[create_dest_hive_tables] Skipping {dest_db}.{tbl}, data_presence={p_status}")
+            logger.info(f"[create_dest_tables] Skipping {dest_db}.{tbl}, data_presence={p_status}")
             results.append({
                 'source_table': tbl,
                 'status': 'SKIPPED',
@@ -733,86 +517,8 @@ def create_dest_hive_tables(presence_result: dict, spark, **context) -> dict:
             })
             continue
 
-        dest_path = t['dest_location']
-        fmt = t.get('file_format', 'PARQUET')
-        schema_list = t.get('schema', [])
-        part_cols_str = t.get('partition_columns', '')
-        is_part = t.get('is_partitioned', False)
-        full_name = f"{dest_db}.{tbl}"
-
-        # Apply per-bucket destination credentials
-        apply_bucket_credentials(
-            spark, dest_path,
-            config.get('_dest_endpoint', ''),
-            config.get('_dest_access_key', ''),
-            config.get('_dest_secret_key', ''),
-        )
-
-        logger.info(f"[create_dest_hive_tables] Processing {full_name} | fmt={fmt} | partitioned={is_part}")
-
-        try:
-            exists = False
-            try:
-                spark.sql(f"DESCRIBE {full_name}")
-                exists = True
-            except Exception:
-                pass
-
-            if exists:
-                if is_part:
-                    spark.sql(f"MSCK REPAIR TABLE {full_name}")
-                spark.sql(f"REFRESH TABLE {full_name}")
-                logger.info(f"[create_dest_hive_tables] REPAIRED (already existed): {full_name}")
-                results.append({'source_table': tbl, 'status': 'COMPLETED', 'existed': True, 'error': None})
-            else:
-                part_col_list = [p.strip() for p in part_cols_str.split(',') if p.strip()]
-
-                if schema_list:
-                    cols = [
-                        f"`{c['name']}` {c['type']}"
-                        for c in schema_list
-                        if c.get('name') and c['name'] not in part_col_list
-                    ]
-                    col_def = ', '.join(cols)
-                else:
-                    infer_df = spark.read.format(fmt.lower()).load(dest_path)
-                    col_def = ', '.join([
-                        f"`{f.name}` {f.dataType.simpleString()}"
-                        for f in infer_df.schema.fields
-                        if f.name not in part_col_list
-                    ])
-
-                part_clause = ''
-                if is_part and part_col_list:
-                    pdefs = []
-                    for pc in part_col_list:
-                        ptype = 'STRING'
-                        for c in schema_list:
-                            if c.get('name') == pc:
-                                ptype = c.get('type', 'STRING')
-                                break
-                        pdefs.append(f"`{pc}` {ptype}")
-                    part_clause = f"PARTITIONED BY ({', '.join(pdefs)})"
-
-                ddl = f"""
-                    CREATE EXTERNAL TABLE IF NOT EXISTS {full_name} ({col_def})
-                    {part_clause}
-                    STORED AS {fmt}
-                    LOCATION '{dest_path}'
-                """
-                spark.sql(ddl)
-
-                if is_part:
-                    spark.sql(f"MSCK REPAIR TABLE {full_name}")
-                spark.sql(f"REFRESH TABLE {full_name}")
-
-                logger.info(f"[create_dest_hive_tables] CREATED: {full_name} at {dest_path}")
-                results.append({'source_table': tbl, 'status': 'COMPLETED', 'existed': False, 'error': None})
-
-        except Exception as e:
-            error_msg = str(e)[:2000]
-            logger.error(f"[create_dest_hive_tables] FAILED for {full_name}: {error_msg}")
-            results.append({'source_table': tbl, 'status': 'FAILED', 'existed': False, 'error': error_msg})
+        result = strategy['create_dest_table'](t, dest_db, spark, config)
+        results.append(result)
 
     failed = [r for r in results if r['status'] == 'FAILED']
     has_failures = len(failed) > 0
@@ -826,7 +532,7 @@ def create_dest_hive_tables(presence_result: dict, spark, **context) -> dict:
 
     if has_failures:
         raise Exception(
-            f"Hive table creation failed for {len(failed)}/{len(results)} table(s) in '{dest_db}'"
+            f"Table creation failed for {len(failed)}/{len(results)} table(s) in '{dest_db}'"
         )
     return result_dict
 
@@ -958,9 +664,9 @@ def validate_s3_destination_tables(table_result: dict, spark, **context) -> dict
             with contextlib.suppress(Exception):
                 dest_partition_count = spark.sql(f"SHOW PARTITIONS {dest_tbl}").count()
 
-            src_schema = {c['name']: c['type'] for c in t.get('schema', [])}
+            src_schema = {c['name'].lower(): c['type'].lower() for c in t.get('schema', [])}
             dest_schema = {
-                r.col_name: r.data_type
+                r.col_name.lower(): (r.data_type or '').lower()
                 for r in spark.sql(f"DESCRIBE {dest_tbl}").collect()
                 if r.col_name and not r.col_name.startswith('#')
             }
@@ -1448,18 +1154,24 @@ def finalize_s3_run(run_id: str, spark) -> dict:
 with DAG(
     dag_id='s3_to_s3_metadata_migration',
     default_args=DEFAULT_ARGS,
-    description='Metadata-only migration: recreate Hive tables pointing to dest S3',
+    description='Metadata-only migration: recreate tables at destination (Hive or Iceberg)',
     schedule=None,
     start_date=datetime(2025, 1, 1),
     catchup=False,
     max_active_runs=5,
-    tags=['migration', 's3', 'hive', 'metadata-only', 'netapp'],
+    tags=['migration', 's3', 'metadata-only'],
     params={
         'excel_file_path': Param(
             default='s3a://config-bucket/s3_metadata_migration.xlsx',
             type='string',
             description='S3 path to the Excel config file for metadata migration',
-        )
+        ),
+        'migration_type': Param(
+            default='hive_to_hive',
+            type='string',
+            enum=['hive_to_hive', 'iceberg_to_iceberg'],
+            description='Type of metadata migration to perform',
+        ),
     },
     render_template_as_native_obj=True,
 ) as dag_s3_metadata:
@@ -1471,11 +1183,12 @@ with DAG(
     )
     t_excel = parse_s3_excel(
         excel_file_path="{{ params.excel_file_path }}",
-        run_id=t_run_id
+        run_id=t_run_id,
+        migration_type="{{ params.migration_type }}",
     )
 
     # Dynamic task mapping (per database)
-    t_discover = discover_source_hive_tables.expand(db_config=t_excel)
+    t_discover = discover_source_tables.expand(db_config=t_excel)
     t_record = record_s3_discovered_tables.expand(discovery=t_discover)
     t_record.operator.trigger_rule = 'all_done'
 
@@ -1485,7 +1198,7 @@ with DAG(
     t_pres_status = update_data_presence_status.expand(presence_result=t_presence)
     t_pres_status.operator.trigger_rule = 'all_done'
 
-    t_tables = create_dest_hive_tables.expand(presence_result=t_pres_status)
+    t_tables = create_dest_tables.expand(presence_result=t_pres_status)
     t_tables.operator.trigger_rule = 'all_done'
 
     t_tbl_status = update_s3_table_create_status.expand(table_result=t_tables)

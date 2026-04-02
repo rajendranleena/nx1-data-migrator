@@ -171,6 +171,9 @@ def _install_airflow_stubs():
             sys.modules[name] = original
     sys.modules.pop(_MODULE_NAME, None)
     sys.modules.pop("migration_dag_metadata", None)
+    sys.modules.pop("utils.metadata_strategies.iceberg_to_iceberg", None)
+    sys.modules.pop("utils.metadata_strategies.hive_to_hive", None)
+    sys.modules.pop("utils.metadata_strategies", None)
     sys.modules.pop("utils.shared", None)
     sys.modules.pop("utils", None)
     if _str_dir in sys.path:
@@ -427,6 +430,7 @@ def sample_s3_db_config(sample_s3_run_id):
         'dest_s3_prefix':   's3a://dest-bucket/data',
         'table_tokens':     ['transactions'],
         'run_id':           sample_s3_run_id,
+        'migration_type':   'hive_to_hive',
     }
 
 
@@ -461,6 +465,7 @@ def sample_s3_discovery(sample_s3_run_id, sample_s3_table_metadata):
         'dest_bucket':      's3a://dest-bucket',
         'source_s3_prefix': 's3a://src-bucket/data',
         'dest_s3_prefix':   's3a://dest-bucket/data',
+        'migration_type':   'hive_to_hive',
         'tables':           sample_s3_table_metadata,
         '_task_duration':   4.2,
     }
