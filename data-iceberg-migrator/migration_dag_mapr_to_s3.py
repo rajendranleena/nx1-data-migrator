@@ -22,7 +22,6 @@ from airflow.decorators import task
 from airflow.models.param import Param
 from airflow.providers.ssh.hooks.ssh import SSHHook
 from dotenv import load_dotenv
-
 from utils.shared import (
     DEFAULT_ARGS,
     SSH_COMMAND_TIMEOUT,

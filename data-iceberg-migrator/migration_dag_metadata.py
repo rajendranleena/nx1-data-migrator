@@ -32,7 +32,7 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.models.param import Param
 from dotenv import load_dotenv
-
+from utils.metadata_strategies import get_strategy
 from utils.shared import (
     DEFAULT_ARGS,
     apply_bucket_credentials,
@@ -41,7 +41,6 @@ from utils.shared import (
     get_config,
     track_duration,
 )
-from utils.metadata_strategies import get_strategy
 
 _dag_stem = Path(__file__).stem
 logger = logging.getLogger(__name__)

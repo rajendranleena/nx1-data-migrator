@@ -1,13 +1,7 @@
 """Tests for metadata migration strategy functions."""
 
 import json
-from io import BytesIO
 from unittest.mock import MagicMock
-
-import pytest
-
-from .helpers import make_excel_bytes, setup_spark_excel
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -105,8 +99,8 @@ def _mock_fs_for_iceberg(spark, metadata_dict, has_version_hint=True):
 class TestIcebergParseExcelRows:
 
     def test_basic_parsing(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
         import pandas as pd
+        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'warehouse',
@@ -131,8 +125,8 @@ class TestIcebergParseExcelRows:
         assert result[0]['run_id'] == 'run_123'
 
     def test_skips_rows_without_source_table_path(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
         import pandas as pd
+        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'warehouse',
@@ -150,8 +144,8 @@ class TestIcebergParseExcelRows:
         assert len(result) == 0
 
     def test_groups_by_dest_database(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
         import pandas as pd
+        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([
             {'database': 'wh', 'table': 'orders', 'dest_database': 'analytics',
@@ -170,8 +164,8 @@ class TestIcebergParseExcelRows:
         assert len(result[0]['table_entries']) == 2
 
     def test_normalizes_s3_paths(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
         import pandas as pd
+        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'wh', 'table': 'orders', 'dest_database': 'analytics',

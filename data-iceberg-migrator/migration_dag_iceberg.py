@@ -21,7 +21,6 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.models.param import Param
 from dotenv import load_dotenv
-
 from utils.shared import (
     DEFAULT_ARGS,
     execute_with_iceberg_retry,

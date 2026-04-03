@@ -6,6 +6,7 @@ used across mapr_to_s3, iceberg, folder_copy, and s3_metadata DAGs.
 """
 
 import logging
+import math
 import os
 import random
 import time
@@ -21,6 +22,7 @@ __all__ = [
     "SSH_COMMAND_TIMEOUT",
     "apply_bucket_credentials",
     "build_s3_opts",
+    "cell_str",
     "cluster_login",
     "compute_dest_path",
     "configure_spark_s3",
@@ -126,6 +128,13 @@ def compute_dest_path(source_location: str, dest_database: str, table_name: str,
         relative = source_location[len(source_s3_prefix):].lstrip('/')
         return f"{dest_s3_prefix.rstrip('/')}/{relative}"
     return f"{dest_bucket.rstrip('/')}/{dest_database}/{table_name}"
+
+
+def cell_str(val, default=''):
+    """Safely convert a pandas cell value to a stripped string, handling NaN/None."""
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return default
+    return str(val).strip() or default
 
 
 def normalize_s3(path: str) -> str:

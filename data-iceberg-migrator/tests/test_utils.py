@@ -8,8 +8,8 @@ Tests for shared utility functions:
 import time
 from unittest.mock import patch
 
-import utils.shared as m
 import pytest
+import utils.shared as m
 
 
 class TestGetConfig:
