@@ -1,5 +1,10 @@
 [run]
-source = migration_dags_combined
+source =
+    migration_dag_mapr_to_s3
+    migration_dag_iceberg
+    migration_dag_folder_copy
+    migration_dag_metadata
+    utils
 
 [report]
 fail_under = 80

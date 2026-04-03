@@ -4,7 +4,7 @@ Tests for TEXTFILE delimiter preservation during migration.
 
 from unittest.mock import MagicMock
 
-import migration_dags_combined as m
+import migration_dag_mapr_to_s3 as m
 import pytest
 
 # ---------------------------------------------------------------------------

@@ -21,10 +21,12 @@ __all__ = [
     "SSH_COMMAND_TIMEOUT",
     "apply_bucket_credentials",
     "build_s3_opts",
+    "cluster_login",
     "compute_dest_path",
     "configure_spark_s3",
     "execute_with_iceberg_retry",
     "get_config",
+    "normalize_s3",
     "track_duration",
     "validate_bucket_endpoint_pairs",
 ]
@@ -125,6 +127,19 @@ def compute_dest_path(source_location: str, dest_database: str, table_name: str,
         return f"{dest_s3_prefix.rstrip('/')}/{relative}"
     return f"{dest_bucket.rstrip('/')}/{dest_database}/{table_name}"
 
+
+def normalize_s3(path: str) -> str:
+    """Normalize S3 path prefixes to s3a://."""
+    if not path:
+        return path
+    if path.startswith('s3n://'):
+        return 's3a://' + path[6:]
+    if path.startswith('s3://'):
+        return 's3a://' + path[5:]
+    if not path.startswith('s3a://'):
+        return 's3a://' + path
+    return path
+
 # =============================================================================
 # SHARED CONFIGURATION
 # =============================================================================
@@ -189,6 +204,108 @@ DEFAULT_ARGS = {
     'retries': 2,
     'retry_delay': timedelta(minutes=5),
 }
+
+
+def cluster_login(run_id: str) -> dict:
+    """SSH to edge node, perform cluster login (MapR or Kerberos), create temp dir.
+
+    This is the core logic — DAG files wrap it with @task to make it an Airflow task.
+    """
+    from airflow.providers.ssh.hooks.ssh import SSHHook
+
+    config = get_config()
+    ssh = SSHHook(ssh_conn_id=config['ssh_conn_id'])
+    temp_dir = f"{config['edge_temp_path']}/{run_id}"
+
+    auth_script_parts = []
+
+    auth_script_parts.append("""
+echo "=== Sourcing User Profile ==="
+if [ -f ~/.profile ]; then
+    source ~/.profile
+    echo "Profile sourced: ~/.profile"
+else
+    echo "WARNING: Profile not found at ~/.profile"
+fi
+""")
+
+    auth_method = config.get('auth_method', 'mapr')
+    mapr_user = config.get('mapr_user', '')
+    mapr_ticketfile = config.get('mapr_ticketfile_location', '')
+    kinit_principal = config.get('kinit_principal', '')
+    kinit_keytab = config.get('kinit_keytab', '')
+    kinit_password = config.get('kinit_password', '')
+
+    auth_script_parts.append(f"""
+echo "=== Cluster Authentication ({auth_method}) ==="
+
+if [ "{auth_method}" = "mapr" ]; then
+    MAPR_TICKETFILE_LOCATION="{mapr_ticketfile}"
+    export MAPR_TICKETFILE_LOCATION
+
+    if maprlogin print 2>/dev/null | grep -q "{mapr_user}"; then
+        echo "Using existing valid MapR ticket"
+    else
+        echo "ERROR: No valid MapR ticket found"
+        echo "Please ensure a valid MapR ticket exists before running this DAG"
+        exit 1
+    fi
+
+elif [ "{auth_method}" = "kinit" ]; then
+    if [ -n "{kinit_keytab}" ] && [ -n "{kinit_principal}" ]; then
+        kinit -kt "{kinit_keytab}" "{kinit_principal}"
+    elif [ -n "{kinit_principal}" ] && [ -n "{kinit_password}" ]; then
+        echo "{kinit_password}" | kinit "{kinit_principal}"
+    else
+        echo "ERROR: kinit requires principal and keytab or password"
+        exit 1
+    fi
+
+elif [ "{auth_method}" = "none" ]; then
+    echo "No authentication required (auth_method=none)"
+
+else
+    echo "ERROR: Unknown auth_method: {auth_method}"
+    exit 1
+fi
+
+echo "Authentication successful"
+""")
+
+    auth_script_parts.append(f"""
+echo "=== Creating temp directory ==="
+mkdir -p {temp_dir}
+chmod 755 {temp_dir}
+
+echo "CLUSTER_LOGIN_SUCCESS"
+echo "TEMP_DIR={temp_dir}"
+""")
+    full_script = "set -e\n" + "\n".join(auth_script_parts)
+    with ssh.get_conn() as client:
+        _, stdout, stderr = client.exec_command(full_script, timeout=300)
+        exit_code = stdout.channel.recv_exit_status()
+        output = stdout.read().decode()
+        error = stderr.read().decode()
+
+        logger.info("=== Cluster Login Output ===")
+        logger.info(output)
+
+        if exit_code != 0:
+            logger.error("=== Cluster Login Errors ===")
+            logger.error(error)
+            raise Exception(
+                f"Cluster login setup failed with exit code {exit_code}\n"
+                f"Error: {error}\n"
+                f"Output: {output[-500:]}"
+            )
+
+        if "CLUSTER_LOGIN_SUCCESS" not in output:
+            raise Exception(
+                f"Cluster login setup incomplete - success marker not found\n"
+                f"Output: {output[-500:]}"
+            )
+
+    return {'temp_dir': temp_dir, 'run_id': run_id}
 
 
 def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -> str:

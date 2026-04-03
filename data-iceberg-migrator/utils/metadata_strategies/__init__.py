@@ -25,17 +25,7 @@ def cell_str(val, default=''):
     return str(val).strip() or default
 
 
-def normalize_s3(path: str) -> str:
-    """Normalize S3 path prefixes to s3a://."""
-    if not path:
-        return path
-    if path.startswith('s3n://'):
-        return 's3a://' + path[6:]
-    if path.startswith('s3://'):
-        return 's3a://' + path[5:]
-    if not path.startswith('s3a://'):
-        return 's3a://' + path
-    return path
+from utils.shared import normalize_s3  # noqa: F401 — re-exported for strategy modules
 
 
 from .hive_to_hive import (  # noqa: E402
