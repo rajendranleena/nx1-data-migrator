@@ -44,8 +44,8 @@ def _map_iceberg_type(iceberg_type):
     return 'STRING'
 
 
-def _read_iceberg_metadata(spark, table_path):
-    """Read and parse the latest Iceberg metadata.json from S3."""
+def _resolve_metadata_file(spark, table_path):
+    """Resolve the path to the latest Iceberg metadata.json file for a table."""
     from py4j.java_gateway import java_import
 
     java_import(spark._jvm, 'org.apache.hadoop.fs.*')
@@ -64,17 +64,31 @@ def _read_iceberg_metadata(spark, table_path):
         )
         version = reader.readLine().strip()
         reader.close()
-        metadata_file = f"{metadata_dir}/v{version}.metadata.json"
-    else:
-        status_list = fs.listStatus(spark._jvm.org.apache.hadoop.fs.Path(metadata_dir))
-        metadata_files = []
-        for i in range(len(status_list)):
-            name = status_list[i].getPath().getName()
-            if name.endswith('.metadata.json'):
-                metadata_files.append(status_list[i].getPath().toString())
-        if not metadata_files:
-            raise FileNotFoundError(f"No metadata.json files found in {metadata_dir}")
-        metadata_file = sorted(metadata_files)[-1]
+        return f"{metadata_dir}/v{version}.metadata.json"
+
+    status_list = fs.listStatus(spark._jvm.org.apache.hadoop.fs.Path(metadata_dir))
+    metadata_files = []
+    for i in range(len(status_list)):
+        name = status_list[i].getPath().getName()
+        if name.endswith('.metadata.json'):
+            metadata_files.append(status_list[i].getPath().toString())
+    if not metadata_files:
+        raise FileNotFoundError(f"No metadata.json files found in {metadata_dir}")
+    return sorted(metadata_files)[-1]
+
+
+def _read_iceberg_metadata(spark, table_path):
+    """Read and parse the latest Iceberg metadata.json from S3."""
+    metadata_file = _resolve_metadata_file(spark, table_path)
+
+    from py4j.java_gateway import java_import
+
+    java_import(spark._jvm, 'org.apache.hadoop.fs.*')
+
+    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+        spark._jvm.java.net.URI(table_path),
+        spark._jsc.hadoopConfiguration()
+    )
 
     reader = spark._jvm.java.io.BufferedReader(
         spark._jvm.java.io.InputStreamReader(
@@ -362,10 +376,11 @@ def create_dest_table(table_info, dest_db, spark, config):
             logger.info(f"[iceberg_create] REFRESHED (already existed): {full_name}")
             return {'source_table': tbl, 'status': 'COMPLETED', 'existed': True, 'error': None}
 
+        metadata_file = _resolve_metadata_file(spark, dest_path)
         spark.sql(
-            f"CALL spark_catalog.system.register_table('{full_name}', '{dest_path}')"
+            f"CALL spark_catalog.system.register_table('{full_name}', '{metadata_file}')"
         )
-        logger.info(f"[iceberg_create] REGISTERED: {full_name} at {dest_path}")
+        logger.info(f"[iceberg_create] REGISTERED: {full_name} at {dest_path} (metadata: {metadata_file})")
         return {'source_table': tbl, 'status': 'COMPLETED', 'existed': False, 'error': None}
 
     except Exception as e:
