@@ -1380,46 +1380,45 @@ calculate_s3_metrics_hadoop() {{
 
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
-echo "INCREMENTAL=$INCR"
 
 echo "=== Calculating S3 metrics BEFORE distcp ==="
 S3_BEFORE=$(calculate_s3_metrics_hadoop "{s3_loc}")
-
-S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
-S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
-
-echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
-echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
+S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
+[ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
+[ -z "$S3_TOTAL_SIZE_BEFORE" ] && S3_TOTAL_SIZE_BEFORE=0
 
 echo "=== Running distcp ==="
 DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
-echo "DISTCP_EXIT_CODE=$DISTCP_EXIT"
 
 BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | awk '{{print $NF}}' | tr -d ',')
 FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Number of files copied" | awk '{{print $NF}}' | tr -d ',')
-
 [ -z "$BYTES_COPIED" ] && BYTES_COPIED=0
 [ -z "$FILES_COPIED" ] && FILES_COPIED=0
 
-echo "BYTES_COPIED=$BYTES_COPIED"
-echo "FILES_COPIED=$FILES_COPIED"
-
 echo "=== Calculating S3 metrics AFTER distcp ==="
 S3_AFTER=$(calculate_s3_metrics_hadoop "{s3_loc}")
-
-S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
-S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
-
-echo "S3_FILE_COUNT_AFTER=$S3_FILE_COUNT_AFTER"
-echo "S3_TOTAL_SIZE_AFTER=$S3_TOTAL_SIZE_AFTER"
+S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
+[ -z "$S3_FILE_COUNT_AFTER" ] && S3_FILE_COUNT_AFTER=0
+[ -z "$S3_TOTAL_SIZE_AFTER" ] && S3_TOTAL_SIZE_AFTER=0
 
 S3_FILES_TRANSFERRED=$((S3_FILE_COUNT_AFTER - S3_FILE_COUNT_BEFORE))
 S3_BYTES_TRANSFERRED=$((S3_TOTAL_SIZE_AFTER - S3_TOTAL_SIZE_BEFORE))
 
+echo "===DISTCP_METRICS_START==="
+echo "INCREMENTAL=$INCR"
+echo "BYTES_COPIED=$BYTES_COPIED"
+echo "FILES_COPIED=$FILES_COPIED"
+echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
+echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
+echo "S3_FILE_COUNT_AFTER=$S3_FILE_COUNT_AFTER"
+echo "S3_TOTAL_SIZE_AFTER=$S3_TOTAL_SIZE_AFTER"
 echo "S3_FILES_TRANSFERRED=$S3_FILES_TRANSFERRED"
 echo "S3_BYTES_TRANSFERRED=$S3_BYTES_TRANSFERRED"
+echo "===DISTCP_METRICS_END==="
 
 [ "$DISTCP_EXIT" -ne 0 ] && exit $DISTCP_EXIT
 exit 0
@@ -1436,8 +1435,7 @@ exit 0
                 logger.info(f"=== DistCp for {src_db}.{tbl} (last 1000 chars) ===")
                 logger.info(output[-1000:])
 
-                is_incr = "INCREMENTAL=true" in output
-
+                is_incr = False
                 bytes_copied = 0
                 files_copied = 0
                 s3_size_before = 0
@@ -1447,27 +1445,48 @@ exit 0
                 s3_bytes_transferred = 0
                 s3_files_transferred = 0
 
-                try:
-                    for line in output.split('\n'):
+                m_start = output.find('===DISTCP_METRICS_START===')
+                m_end   = output.find('===DISTCP_METRICS_END===')
+                if m_start != -1 and m_end != -1:
+                    metrics = {
+                        'INCREMENTAL': 'false',
+                        'BYTES_COPIED': 0,
+                        'FILES_COPIED': 0,
+                        'S3_FILE_COUNT_BEFORE': 0,
+                        'S3_TOTAL_SIZE_BEFORE': 0,
+                        'S3_FILE_COUNT_AFTER': 0,
+                        'S3_TOTAL_SIZE_AFTER': 0,
+                        'S3_FILES_TRANSFERRED': 0,
+                        'S3_BYTES_TRANSFERRED': 0,
+                    }
+                    metrics_block = output[m_start + len('===DISTCP_METRICS_START==='):m_end]
+                    for line in metrics_block.splitlines():
                         line = line.strip()
-                        if 'BYTES_COPIED=' in line:
-                            bytes_copied = int(line.split('=')[1].strip() or 0)
-                        elif 'FILES_COPIED=' in line:
-                            files_copied = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_TOTAL_SIZE_BEFORE=' in line:
-                            s3_size_before = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_FILE_COUNT_BEFORE=' in line:
-                            s3_files_before = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_TOTAL_SIZE_AFTER=' in line:
-                            s3_size_after = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_FILE_COUNT_AFTER=' in line:
-                            s3_files_after = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_BYTES_TRANSFERRED=' in line:
-                            s3_bytes_transferred = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_FILES_TRANSFERRED=' in line:
-                            s3_files_transferred = int(line.split('=')[1].strip() or 0)
-                except Exception:
-                    pass
+                        if '=' not in line:
+                            continue
+                        key, _, val = line.partition('=')
+                        key = key.strip()
+                        if key not in metrics:
+                            continue
+                        val = val.strip()
+                        if key == 'INCREMENTAL':
+                            metrics[key] = val
+                        else:
+                            try:
+                                metrics[key] = int(val or 0)
+                            except ValueError:
+                                logger.warning(f"[DistCp] Could not parse metric '{key}={val}' for {src_db}.{tbl}")
+                    is_incr              = metrics['INCREMENTAL'].lower() == 'true'
+                    bytes_copied         = metrics['BYTES_COPIED']
+                    files_copied         = metrics['FILES_COPIED']
+                    s3_size_before       = metrics['S3_TOTAL_SIZE_BEFORE']
+                    s3_files_before      = metrics['S3_FILE_COUNT_BEFORE']
+                    s3_size_after        = metrics['S3_TOTAL_SIZE_AFTER']
+                    s3_files_after       = metrics['S3_FILE_COUNT_AFTER']
+                    s3_bytes_transferred = metrics['S3_BYTES_TRANSFERRED']
+                    s3_files_transferred = metrics['S3_FILES_TRANSFERRED']
+                else:
+                    logger.warning(f"[DistCp] Metrics block not found in output for {src_db}.{tbl} — all metrics will be 0")
 
                 if exit_code != 0:
                     logger.error(f"=== DistCp Error for {src_db}.{tbl} ===")
