@@ -65,13 +65,14 @@ configuration file. Rows without an `endpoint` value continue to use the global
 #### How it works
 
 For each Excel row that has a non-empty `endpoint` value:
+
 1. The endpoint URL is used directly as the Hadoop S3A endpoint for that destination bucket.
 2. Credentials are looked up by the **hostname** of that endpoint URL, with `_access_key` and `_secret_key` suffixes.
 
-| Airflow Variable (set as masked) | Env var equivalent | Description |
-| -------------------------------- | -------------------- | --------------------------------------------- |
-| `<ep-hostname>_access_key` | `<EP_HOSTNAME>_ACCESS_KEY` | Access key for the endpoint (masked) |
-| `<ep-hostname>_secret_key` | `<EP_HOSTNAME>_SECRET_KEY` | Secret key for the endpoint (masked) |
+| Airflow Variable (set as masked) | Env var equivalent         | Description                          |
+| -------------------------------- | -------------------------- | ------------------------------------ |
+| `<ep-hostname>_access_key`       | `<EP_HOSTNAME>_ACCESS_KEY` | Access key for the endpoint (masked) |
+| `<ep-hostname>_secret_key`       | `<EP_HOSTNAME>_SECRET_KEY` | Secret key for the endpoint (masked) |
 
 The hostname slug is derived from the `endpoint` value: dots and hyphens become underscores for the env-var form.
 
@@ -97,7 +98,7 @@ Rows without an `endpoint` value are unaffected — no changes required for
 single-tenant setups.
 
 > **Same bucket name on two tenants:** Because credential lookup is keyed on
-> the *endpoint hostname* (not the bucket name), two buckets both named
+> the _endpoint hostname_ (not the bucket name), two buckets both named
 > `data-lake` on different tenants are fully supported as long as each row in the
 > Excel file has the correct `endpoint` value.
 
@@ -271,13 +272,14 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 
 **Required Columns:**
 
-| Column          | Required | Description                                                                                                                                                   | Example                             |
-| --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
-| `database`      | **Yes**  | Source database name                                                                                                                                          | `sales_data`                        |
-| `table`         | No       | Table pattern: supports \* wildcards, comma-separated table names (e.g. table1,table2), or one table per row for same database (rows are combined internally) | `transactions_*` or `*`             |
-| `dest database` | No       | Destination database (defaults to source)                                                                                                                     | `sales_data_s3`                     |
-| `bucket`        | No       | S3 bucket (defaults to variable)                                                                                                                              | `s3a://data-lake`                   |
-| `endpoint`      | No       | S3 endpoint URL for a non-default tenant; credentials resolved via `<hostname>_access_key/secret_key` Variables (see Multi-Tenant section)                   | `https://s3.tenant-a.example.com`   |
+| Column             | Required | Description                                                                                                                                                                                         | Example                                  |
+| ------------------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| `database`         | **Yes**  | Source database name                                                                                                                                                                                | `sales_data`                             |
+| `table`            | No       | Table pattern: supports \* wildcards, comma-separated table names (e.g. table1,table2), or one table per row for same database (rows are combined internally)                                       | `transactions_*` or `*`                  |
+| `dest database`    | No       | Destination database (defaults to source)                                                                                                                                                           | `sales_data_s3`                          |
+| `bucket`           | No       | S3 bucket (defaults to variable)                                                                                                                                                                    | `s3a://data-lake`                        |
+| `endpoint`         | No       | S3 endpoint URL for a non-default tenant; credentials resolved via `<hostname>_access_key/secret_key` Variables (see Multi-Tenant section)                                                          | `https://s3.tenant-a.example.com`        |
+| `partition_filter` | No       | Migrate only specific partitions. Comma-separated expressions. Supports: exact match (`year=2023/month=01`), prefix wildcard (`year=2023/*`), comparison (`year>=2022`), and `last_n_partitions=N`. | `year=2023/month=01, year=2023/month=02` |
 
 ---
 
@@ -380,6 +382,7 @@ cleanup_edge (SSH: Cleanup temp files)
   - `dest_database` defaults to source database name
   - `bucket` defaults to `migration_default_s3_bucket` variable
   - `table` pattern defaults to `*` (all tables); supports comma-separated table names and multi-row input for the same database (rows are combined into a single database record internally)
+  - `partition_filter` is optional; if set, only the matching partitions are migrated for that row's table(s)
 - Expands to list of database configurations for dynamic task mapping
 - Filters out rows with empty database names
 
@@ -413,6 +416,7 @@ cleanup_edge (SSH: Cleanup temp files)
   - **Format** - Parquet, ORC, or Avro (detected from InputFormat)
   - **Partitions** - Partition spec and count (via `DESCRIBE FORMATTED`)
   - **Partition columns** - Extracted from table metadata
+  - **Partition filter** - If `partition_filter` is set in the Excel config, only matching partitions are included; full-table row and partition counts are also captured as a baseline
 - Generates JSON output with all discovered metadata
 - Determines S3 destination path: `{bucket}/{dest_database}/{table_name}`
 
@@ -446,6 +450,7 @@ cleanup_edge (SSH: Cleanup temp files)
   - Bandwidth limit per mapper (default: 100 MB/s)
   - Dynamic strategy for load balancing
   - S3 credentials passed via `-D` properties
+- **Partition-specific copy (path-list mode):** When a `partition_filter` is active, DistCp runs in `-f pathlist` mode instead of copying the whole table root. A temporary path-list file is written to the edge node listing only the matched source/destination partition paths (`{source_loc}/{part}  {s3_loc}/{part}`), and DistCp copies exactly those partitions with `-update -delete`.
 - Captures success/failure status per table
 - **File metrics tracking:**
   - Calculates S3 metrics BEFORE DistCp: file count and total size
@@ -557,7 +562,7 @@ cleanup_edge (SSH: Cleanup temp files)
 - **Generates HTML report with comprehensive sections:**
   1. **Migration Summary** - Total/successful/failed tables, data volume, file counts, incremental runs
   2. **Validation Summary** - Tables validated, passed/failed counts, mismatch breakdowns
-  3. **Table Migration Details** - Per-table status, durations for discovery/DistCp/creation/validation
+  3. **Table Migration Details** - Per-table status, active partition filter (with matched partition count), durations for discovery/DistCp/creation/validation
   4. **Metadata Validation Results** - Row count comparison, partition comparison, schema comparison
   5. **Data Validation Results** - File size comparison (MapR vs S3), file count comparison
   6. **Performance Metrics** - Data volume, DistCp speed (MB/s), rows/second, end-to-end duration
@@ -1015,12 +1020,12 @@ Copies raw folders from MapR-FS/HDFS to S3 using Hadoop DistCp via SSH, with no 
 
 **Required Columns:**
 
-| Column          | Required | Description                                                                                      | Example                             |
-| --------------- | -------- | ------------------------------------------------------------------------------------------------ | ----------------------------------- |
-| `source_path`   | **Yes**  | Full MapR/HDFS source path                                                                       | `/mapr/cluster1/data/raw/sales`     |
-| `target_bucket` | **Yes**  | S3 bucket — normalised to `s3a://`                                                               | `s3a://data-lake`                   |
-| `dest_folder`   | No       | Destination folder inside the bucket; defaults to the basename of `source_path` if not specified | `sales`                             |
-| `endpoint`      | No       | S3 endpoint URL for a non-default tenant; credentials resolved via `<hostname>_access_key/secret_key` Variables (see Multi-Tenant section)                   | `https://s3.tenant-a.example.com`   |
+| Column          | Required | Description                                                                                                                                | Example                           |
+| --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------- |
+| `source_path`   | **Yes**  | Full MapR/HDFS source path                                                                                                                 | `/mapr/cluster1/data/raw/sales`   |
+| `target_bucket` | **Yes**  | S3 bucket — normalised to `s3a://`                                                                                                         | `s3a://data-lake`                 |
+| `dest_folder`   | No       | Destination folder inside the bucket; defaults to the basename of `source_path` if not specified                                           | `sales`                           |
+| `endpoint`      | No       | S3 endpoint URL for a non-default tenant; credentials resolved via `<hostname>_access_key/secret_key` Variables (see Multi-Tenant section) | `https://s3.tenant-a.example.com` |
 
 **Default Behaviour:**
 
@@ -1540,7 +1545,6 @@ DATA_MISSING → skipped in all downstream steps, visible in report
 
 1. **migration_tracking.migration_runs**: Run-level metadata for MapR-to-S3 migrations.
 2. **migration_tracking.migration_table_status**: Table-level tracking for MapR-to-S3 migrations.
-3. **migration_tracking.validation_results**: Aggregated validation summary per run.
 
 ---
 
