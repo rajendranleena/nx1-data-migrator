@@ -6,10 +6,21 @@ Data platform migration tools (MapR/HDFS to S3/Iceberg) and access control autom
 
 | Directory                        | Description                                                                                                                 |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `data-iceberg-migrator/`         | Airflow DAGs for migrating Hive tables from MapR-FS/HDFS to S3 and converting to Iceberg format                             |
+| `data-iceberg-migrator/`         | Airflow DAGs for migrating Hive tables from MapR-FS/HDFS to S3, converting to Iceberg format, and S3-to-S3 metadata migration (Hive and Iceberg) |
 | `ranger-policies-generator/`     | Airflow DAG for automating Apache Ranger policies and Keycloak role mappings from Excel config                              |
 | `code-scanner/`                  | Standalone CLI tool for static analysis of Spark, HDFS, JDK, and Python migration patterns                                  |
 | `airflow-3-migration-assistant/` | Standalone CLI tool that scans Airflow 2 DAG files and reports or auto-applies changes required for Airflow 3 compatibility |
+
+## Deployment
+
+`deploy.py` uploads DAGs and shared utilities to S3 for Airflow. It supports per-user DAG ID suffixes, owner customization, and env file management. Run interactively or pass all options via CLI:
+
+```bash
+python deploy.py --project migrator --dag metadata --owner my-name --suffix dev1
+python deploy.py --project ranger --dag ranger --owner my-name --suffix dev1 --dry-run
+```
+
+Use `--dry-run` to preview the upload plan without uploading.
 
 ## Development Setup
 
