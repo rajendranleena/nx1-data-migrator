@@ -14,15 +14,14 @@ Excel columns: database | table | inplace_migration | destination_iceberg_databa
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from airflow import DAG
 from airflow.decorators import task
 from airflow.models.param import Param
 from dotenv import load_dotenv
-from utils.shared import (
-    DEFAULT_ARGS,
+from utils.migrations.shared import (
     execute_with_iceberg_retry,
     get_config,
     track_duration,
@@ -38,6 +37,13 @@ if os.path.isdir(_config_dir):
     load_dotenv(os.path.join(_config_dir, f'env.{_dag_stem}'), override=True)
 else:
     logger.warning(f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults")
+
+default_args = {
+    'owner': 'data-migration',
+    'depends_on_past': False,
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
+}
 
 # =============================================================================
 # DAG 2: ICEBERG MIGRATION TASKS
@@ -1334,7 +1340,7 @@ def send_iceberg_report_email(report_result: dict, run_id: str, spark) -> dict:
 
 with DAG(
     dag_id='iceberg_migration',
-    default_args=DEFAULT_ARGS,
+    default_args=default_args,
     description='Migrate existing Hive tables in S3 to Iceberg format',
     schedule=None,
     start_date=datetime(2025, 1, 1),

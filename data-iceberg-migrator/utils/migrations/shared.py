@@ -10,7 +10,6 @@ import math
 import os
 import random
 import time
-from datetime import timedelta
 from functools import wraps
 
 from airflow.models import Variable
@@ -18,7 +17,6 @@ from airflow.models import Variable
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "DEFAULT_ARGS",
     "SSH_COMMAND_TIMEOUT",
     "apply_bucket_credentials",
     "build_s3_opts",
@@ -206,13 +204,6 @@ def get_config() -> dict:
 
 # SSH timeout: 24 hours
 SSH_COMMAND_TIMEOUT = 86400
-
-DEFAULT_ARGS = {
-    'owner': 'data-migration',
-    'depends_on_past': False,
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
-}
 
 
 def cluster_login(run_id: str) -> dict:

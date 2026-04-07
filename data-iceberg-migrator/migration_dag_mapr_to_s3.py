@@ -14,7 +14,7 @@ Excel columns: database | table | dest database | bucket | endpoint
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from airflow import DAG
@@ -22,8 +22,7 @@ from airflow.decorators import task
 from airflow.models.param import Param
 from airflow.providers.ssh.hooks.ssh import SSHHook
 from dotenv import load_dotenv
-from utils.shared import (
-    DEFAULT_ARGS,
+from utils.migrations.shared import (
     SSH_COMMAND_TIMEOUT,
     build_s3_opts,
     cluster_login,
@@ -44,6 +43,13 @@ if os.path.isdir(_config_dir):
     load_dotenv(os.path.join(_config_dir, f'env.{_dag_stem}'), override=True)
 else:
     logger.warning(f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults")
+
+default_args = {
+    'owner': 'data-migration',
+    'depends_on_past': False,
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
+}
 
 # =============================================================================
 # DAG 1: MAPR TO S3 MIGRATION TASKS
@@ -2325,7 +2331,7 @@ def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict
 
 with DAG(
     dag_id='mapr_to_s3_migration',
-    default_args=DEFAULT_ARGS,
+    default_args=default_args,
     description='Migrate Hive tables from MapR-FS to S3',
     schedule=None,
     start_date=datetime(2025, 1, 1),

@@ -8,8 +8,8 @@ Destination: Iceberg tables registered in Hive Metastore via register_table
 import json
 import logging
 
-from utils.metadata_strategies import cell_str, normalize_s3
-from utils.shared import compute_dest_path
+from utils.migrations.metadata_strategies import cell_str, normalize_s3
+from utils.migrations.shared import compute_dest_path
 
 logger = logging.getLogger(__name__)
 
@@ -336,7 +336,7 @@ def discover_tables(db_config, spark, config):
 
 def create_dest_table(table_info, dest_db, spark, config):
     """Register an Iceberg table in Hive Metastore via register_table procedure."""
-    from utils.shared import apply_bucket_credentials
+    from utils.migrations.shared import apply_bucket_credentials
 
     tbl = table_info['source_table']
     dest_path = table_info['dest_location']

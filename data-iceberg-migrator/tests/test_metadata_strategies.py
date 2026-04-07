@@ -100,7 +100,7 @@ class TestIcebergParseExcelRows:
 
     def test_basic_parsing(self):
         import pandas as pd
-        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'warehouse',
@@ -126,7 +126,7 @@ class TestIcebergParseExcelRows:
 
     def test_skips_rows_without_source_table_path(self):
         import pandas as pd
-        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'warehouse',
@@ -145,7 +145,7 @@ class TestIcebergParseExcelRows:
 
     def test_groups_by_dest_database(self):
         import pandas as pd
-        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([
             {'database': 'wh', 'table': 'orders', 'dest_database': 'analytics',
@@ -165,7 +165,7 @@ class TestIcebergParseExcelRows:
 
     def test_normalizes_s3_paths(self):
         import pandas as pd
-        from utils.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'wh', 'table': 'orders', 'dest_database': 'analytics',
@@ -188,8 +188,8 @@ class TestIcebergParseExcelRows:
 class TestIcebergDiscoverTables:
 
     def test_discovers_table_from_metadata(self, mock_spark):
-        from utils.metadata_strategies.iceberg_to_iceberg import discover_tables
-        from utils.shared import get_config
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
+        from utils.migrations.shared import get_config
 
         _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
 
@@ -218,8 +218,8 @@ class TestIcebergDiscoverTables:
         assert 'dt' in tbl['partition_columns']
 
     def test_extracts_schema_correctly(self, mock_spark):
-        from utils.metadata_strategies.iceberg_to_iceberg import discover_tables
-        from utils.shared import get_config
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
+        from utils.migrations.shared import get_config
 
         _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
 
@@ -240,8 +240,8 @@ class TestIcebergDiscoverTables:
         assert id_col['type'] == 'BIGINT'
 
     def test_handles_missing_version_hint(self, mock_spark):
-        from utils.metadata_strategies.iceberg_to_iceberg import discover_tables
-        from utils.shared import get_config
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
+        from utils.migrations.shared import get_config
 
         _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA, has_version_hint=False)
 
@@ -256,8 +256,8 @@ class TestIcebergDiscoverTables:
         assert 'error' not in result[0]
 
     def test_records_error_on_metadata_failure(self, mock_spark):
-        from utils.metadata_strategies.iceberg_to_iceberg import discover_tables
-        from utils.shared import get_config
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
+        from utils.migrations.shared import get_config
 
         fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
         fs_mock.exists.side_effect = Exception("S3 connection refused")
@@ -274,8 +274,8 @@ class TestIcebergDiscoverTables:
         assert result[0]['source_table'] == 'orders'
 
     def test_uses_prefix_remapping_for_dest_path(self, mock_spark):
-        from utils.metadata_strategies.iceberg_to_iceberg import discover_tables
-        from utils.shared import get_config
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
+        from utils.migrations.shared import get_config
 
         _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
 
@@ -291,8 +291,8 @@ class TestIcebergDiscoverTables:
         assert result[0]['dest_location'] == 's3a://dest-bkt/warehouse/orders'
 
     def test_data_stays_in_place_without_prefix(self, mock_spark):
-        from utils.metadata_strategies.iceberg_to_iceberg import discover_tables
-        from utils.shared import get_config
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
+        from utils.migrations.shared import get_config
 
         _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
 
@@ -314,8 +314,8 @@ class TestIcebergDiscoverTables:
 class TestIcebergCreateDestTable:
 
     def test_registers_new_table(self, mock_spark):
-        from utils.metadata_strategies.iceberg_to_iceberg import create_dest_table
-        from utils.shared import get_config
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
+        from utils.migrations.shared import get_config
 
         def sql_router(sql):
             sl = sql.lower().strip()
@@ -338,8 +338,8 @@ class TestIcebergCreateDestTable:
         assert 'analytics.orders' in calls_str
 
     def test_refreshes_existing_table(self, mock_spark):
-        from utils.metadata_strategies.iceberg_to_iceberg import create_dest_table
-        from utils.shared import get_config
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
+        from utils.migrations.shared import get_config
 
         mock_spark.sql.return_value = MagicMock()  # DESCRIBE succeeds
 
@@ -356,8 +356,8 @@ class TestIcebergCreateDestTable:
         assert 'REFRESH TABLE' in calls_str
 
     def test_returns_error_on_failure(self, mock_spark):
-        from utils.metadata_strategies.iceberg_to_iceberg import create_dest_table
-        from utils.shared import get_config
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
+        from utils.migrations.shared import get_config
 
         def sql_router(sql):
             sl = sql.lower().strip()
@@ -386,7 +386,7 @@ class TestIcebergCreateDestTable:
 class TestIcebergTypeMapping:
 
     def test_primitive_types(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
 
         assert _map_iceberg_type('boolean') == 'BOOLEAN'
         assert _map_iceberg_type('int') == 'INT'
@@ -401,17 +401,17 @@ class TestIcebergTypeMapping:
         assert _map_iceberg_type('uuid') == 'STRING'
 
     def test_decimal_type(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
 
         assert _map_iceberg_type('decimal(10,2)') == 'DECIMAL(10,2)'
 
     def test_fixed_type(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
 
         assert _map_iceberg_type('fixed[16]') == 'BINARY'
 
     def test_nested_type_maps_to_string(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
 
         assert _map_iceberg_type({'type': 'struct', 'fields': []}) == 'STRING'
 
@@ -423,7 +423,7 @@ class TestIcebergTypeMapping:
 class TestExtractSchema:
 
     def test_extracts_fields_from_current_schema(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _extract_schema
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_schema
 
         metadata = {
             'current-schema-id': 1,
@@ -442,7 +442,7 @@ class TestExtractSchema:
         ]
 
     def test_falls_back_to_last_schema_if_id_not_found(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _extract_schema
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_schema
 
         metadata = {
             'current-schema-id': 99,
@@ -454,7 +454,7 @@ class TestExtractSchema:
         assert result == [{'name': 'a', 'type': 'INT'}]
 
     def test_returns_empty_list_when_no_schemas(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _extract_schema
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_schema
 
         assert _extract_schema({'schemas': []}) == []
         assert _extract_schema({}) == []
@@ -463,7 +463,7 @@ class TestExtractSchema:
 class TestExtractPartitionSpec:
 
     def test_extracts_partition_columns(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _extract_partition_spec
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_partition_spec
 
         metadata = {
             'current-schema-id': 0,
@@ -481,7 +481,7 @@ class TestExtractPartitionSpec:
         assert is_part is True
 
     def test_unpartitioned_table(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _extract_partition_spec
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_partition_spec
 
         metadata = {
             'current-schema-id': 0,
@@ -494,7 +494,7 @@ class TestExtractPartitionSpec:
         assert is_part is False
 
     def test_no_partition_specs_at_all(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _extract_partition_spec
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_partition_spec
 
         cols, is_part = _extract_partition_spec({})
         assert cols == []
@@ -504,7 +504,7 @@ class TestExtractPartitionSpec:
 class TestExtractRowCount:
 
     def test_extracts_count_from_current_snapshot(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _extract_row_count
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_row_count
 
         metadata = {
             'current-snapshot-id': 42,
@@ -516,13 +516,13 @@ class TestExtractRowCount:
         assert _extract_row_count(metadata) == 5000
 
     def test_returns_zero_when_no_snapshots(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _extract_row_count
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_row_count
 
         assert _extract_row_count({}) == 0
         assert _extract_row_count({'current-snapshot-id': None}) == 0
 
     def test_returns_zero_when_snapshot_id_not_found(self):
-        from utils.metadata_strategies.iceberg_to_iceberg import _extract_row_count
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_row_count
 
         metadata = {
             'current-snapshot-id': 99,

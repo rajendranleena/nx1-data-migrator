@@ -14,7 +14,7 @@ Adding a new migration type:
 
 import logging
 
-from utils.shared import cell_str, normalize_s3  # noqa: F401 — re-exported for strategy modules
+from utils.migrations.shared import cell_str, normalize_s3  # noqa: F401 — re-exported for strategy modules
 
 from .hive_to_hive import create_dest_table as _hive_create
 from .hive_to_hive import discover_tables as _hive_discover

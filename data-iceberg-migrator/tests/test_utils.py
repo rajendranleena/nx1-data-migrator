@@ -9,7 +9,7 @@ import time
 from unittest.mock import patch
 
 import pytest
-import utils.shared as m
+import utils.migrations.shared as m
 
 
 class TestGetConfig:

@@ -62,7 +62,9 @@ def _make_airflow_stubs():
         "airflow.utils.trigger_rule": MagicMock(TriggerRule=MagicMock(ALL_DONE="all_done")),
         "airflow.utils.email": MagicMock(),
         "dotenv": MagicMock(),
-        "ranger_utils": MagicMock(),
+        "utils": MagicMock(),
+        "utils.migrations": MagicMock(),
+        "utils.migrations.ranger_utils": MagicMock(),
         "pyspark": MagicMock(),
     }
     return stubs, variable_mock
@@ -94,5 +96,8 @@ def dag_module():
             else:
                 sys.modules[mod_name] = original
         sys.modules.pop(_MODULE_NAME, None)
+        sys.modules.pop("utils.migrations.ranger_utils", None)
+        sys.modules.pop("utils.migrations", None)
+        sys.modules.pop("utils", None)
         if str_dir in sys.path:
             sys.path.remove(str_dir)
