@@ -89,7 +89,7 @@ class TestParseS3Excel:
             'dest_bucket': 's3a://dest-bkt',
             'source_s3_prefix': '', 'dest_s3_prefix': '',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, 'hive_to_hive', spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert len(result) == 1
         assert result[0]['source_database'] == 'sales'
         assert result[0]['dest_database'] == 'sales_dest'
@@ -106,7 +106,7 @@ class TestParseS3Excel:
             'database': 'db', 'table': '*', 'dest_database': '',
             'dest_bucket': raw_bucket, 'source_s3_prefix': '', 'dest_s3_prefix': '',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, 'hive_to_hive', spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert result[0]['dest_bucket'] == expected
 
     def test_wildcard_collapses_specific_tokens(self, mock_spark, sample_s3_run_id):
@@ -114,7 +114,7 @@ class TestParseS3Excel:
             {'database': 'db', 'table': 'tbl_a', 'dest_database': '', 'dest_bucket': 's3a://b', 'source_s3_prefix': '', 'dest_s3_prefix': ''},
             {'database': 'db', 'table': '*',     'dest_database': '', 'dest_bucket': 's3a://b', 'source_s3_prefix': '', 'dest_s3_prefix': ''},
         ]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, 'hive_to_hive', spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert result[0]['table_tokens'] == ['*']
 
     def test_comma_separated_tables_tokenized(self, mock_spark, sample_s3_run_id):
@@ -123,7 +123,7 @@ class TestParseS3Excel:
             'dest_database': '', 'dest_bucket': 's3a://b',
             'source_s3_prefix': '', 'dest_s3_prefix': '',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, 'hive_to_hive', spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert set(result[0]['table_tokens']) == {'tbl_a', 'tbl_b', 'tbl_c'}
 
     def test_empty_rows_skipped(self, mock_spark, sample_s3_run_id):
@@ -131,7 +131,7 @@ class TestParseS3Excel:
             {'database': '',      'table': '*', 'dest_database': '', 'dest_bucket': '',   'source_s3_prefix': '', 'dest_s3_prefix': ''},
             {'database': 'mydb', 'table': '*', 'dest_database': '', 'dest_bucket': 's3a://b', 'source_s3_prefix': '', 'dest_s3_prefix': ''},
         ]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, 'hive_to_hive', spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert len(result) == 1
         assert result[0]['source_database'] == 'mydb'
 
@@ -142,7 +142,7 @@ class TestParseS3Excel:
             'source_s3_prefix': 's3a://src/data',
             'dest_s3_prefix':   's3a://dst/data',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, 'hive_to_hive', spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert result[0]['source_s3_prefix'] == 's3a://src/data'
         assert result[0]['dest_s3_prefix'] == 's3a://dst/data'
 
