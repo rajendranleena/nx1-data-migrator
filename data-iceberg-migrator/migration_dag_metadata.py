@@ -168,7 +168,7 @@ def create_s3_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str
 
 
 @task.pyspark(conn_id='spark_default')
-def parse_s3_excel(excel_file_path: str, run_id: str, migration_type: str, spark) -> list:
+def parse_s3_excel(excel_file_path: str, migration_type: str, run_id: str, spark) -> list:
     """Read Excel config and delegate row parsing to the active strategy."""
     from io import BytesIO
 
