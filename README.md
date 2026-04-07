@@ -13,7 +13,9 @@ Data platform migration tools (MapR/HDFS to S3/Iceberg) and access control autom
 
 ## Deployment
 
-`deploy.py` uploads DAGs and shared utilities to S3 for Airflow. It supports per-user DAG ID suffixes, owner customization, and env file management. Run interactively or pass all options via CLI:
+`deploy.py` uploads DAGs and shared utilities to S3 for Airflow. It supports per-user DAG ID suffixes, owner customization, and env file management.
+
+**Configuration** — set `DEPLOY_S3_BUCKET` and `DEPLOY_DAGS_PREFIX` in `env.shared` (see `env.shared.example`). S3 credentials are resolved automatically from `env.shared`, AWS env vars, `~/.aws/credentials`, or IAM role — no manual input needed if any of these are configured.
 
 ```bash
 python deploy.py --project migrator --dag metadata --owner my-name --suffix dev1

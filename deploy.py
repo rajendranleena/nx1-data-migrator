@@ -7,9 +7,6 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-S3_BUCKET = "nx1poc-pdc-default-ygglold"
-DAGS_PREFIX = "airflow/es-tenant-2/dags/"
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 PROJECTS = {
@@ -100,6 +97,8 @@ def parse_args():
         action="store_true",
         help="Skip uploading env.shared",
     )
+    parser.add_argument("--s3-bucket", help="S3 bucket name (without s3:// prefix)")
+    parser.add_argument("--dags-prefix", help="S3 key prefix for DAG files (e.g. 'airflow/tenant/dags/')")
     parser.add_argument("--s3-endpoint", help="S3 endpoint URL")
     parser.add_argument("--s3-access-key", help="S3 access key")
     parser.add_argument("--s3-secret-key", help="S3 secret key")
@@ -212,36 +211,45 @@ def resolve_interactive(args):
                 args.env_file = choice
 
 
-def resolve_s3_credentials(args):
+def resolve_s3_config(args):
     env_shared_path = SCRIPT_DIR / "env.shared"
     env_values = {}
     if env_shared_path.exists():
         env_values = dotenv_values(env_shared_path)
 
-    cred_mapping = [
+    required = [
+        ("s3_bucket", "DEPLOY_S3_BUCKET", "Enter S3 bucket name: "),
+        ("dags_prefix", "DEPLOY_DAGS_PREFIX", "Enter DAGs S3 prefix (e.g. airflow/tenant/dags/): "),
+    ]
+
+    optional = [
         ("s3_endpoint", "S3_ENDPOINT"),
         ("s3_access_key", "S3_ACCESS_KEY"),
         ("s3_secret_key", "S3_SECRET_KEY"),
     ]
 
-    prompts = {
-        "s3_endpoint": "Enter S3 endpoint URL: ",
-        "s3_access_key": "Enter S3 access key: ",
-        "s3_secret_key": "Enter S3 secret key: ",
-    }
-
-    for attr, env_key in cred_mapping:
+    for attr, env_key, prompt in required:
         if getattr(args, attr):
             continue
         env_val = env_values.get(env_key, "")
         if env_val:
             setattr(args, attr, env_val)
         else:
-            val = input(prompts[attr]).strip()
+            val = input(prompt).strip()
             if not val:
                 print(f"Error: {env_key} is required.")
                 sys.exit(1)
             setattr(args, attr, val)
+
+    for attr, env_key in optional:
+        if getattr(args, attr):
+            continue
+        env_val = env_values.get(env_key, "")
+        if env_val:
+            setattr(args, attr, env_val)
+
+    if not args.dags_prefix.endswith("/"):
+        args.dags_prefix += "/"
 
 
 def build_upload_plan(args) -> list[tuple[str, str, str | None]]:
@@ -268,7 +276,7 @@ def build_upload_plan(args) -> list[tuple[str, str, str | None]]:
         )
 
         dag_stem = local_path.stem
-        s3_key = f"{DAGS_PREFIX}{dag_stem}_{args.suffix}.py"
+        s3_key = f"{args.dags_prefix}{dag_stem}_{args.suffix}.py"
         uploads.append((str(local_path), s3_key, content))
 
         if args.env_file:
@@ -276,7 +284,7 @@ def build_upload_plan(args) -> list[tuple[str, str, str | None]]:
             if not env_path.exists():
                 print(f"Error: Env file not found: {env_path}")
                 sys.exit(1)
-            env_s3_key = f"{DAGS_PREFIX}utils/migration_configs/env.{dag_stem}_{args.suffix}"
+            env_s3_key = f"{args.dags_prefix}utils/migration_configs/env.{dag_stem}_{args.suffix}"
             uploads.append((str(env_path), env_s3_key, None))
 
     if not args.skip_shared_utils:
@@ -285,7 +293,7 @@ def build_upload_plan(args) -> list[tuple[str, str, str | None]]:
             if not local_path.exists():
                 print(f"Error: Shared util not found: {local_path}")
                 sys.exit(1)
-            s3_key = f"{DAGS_PREFIX}{dst_rel}"
+            s3_key = f"{args.dags_prefix}{dst_rel}"
             uploads.append((str(local_path), s3_key, None))
 
     if not args.skip_env_shared:
@@ -294,62 +302,65 @@ def build_upload_plan(args) -> list[tuple[str, str, str | None]]:
             print(f"Error: env.shared not found: {env_shared_path}\n"
                   f"Use --skip-env-shared to skip uploading it.")
             sys.exit(1)
-        s3_key = f"{DAGS_PREFIX}utils/migration_configs/env.shared"
+        s3_key = f"{args.dags_prefix}utils/migration_configs/env.shared"
         uploads.append((str(env_shared_path), s3_key, None))
 
     return uploads
 
 
-def print_upload_plan(uploads: list[tuple[str, str, str | None]]):
+def print_upload_plan(uploads: list[tuple[str, str, str | None]], bucket: str):
     print("\nUpload plan:")
-    print(f"  Bucket: {S3_BUCKET}")
+    print(f"  Bucket: {bucket}")
     print()
     for local_path, s3_key, content in uploads:
         modified = " (modified)" if content is not None else ""
         print(f"  {local_path}")
-        print(f"    -> s3://{S3_BUCKET}/{s3_key}{modified}")
+        print(f"    -> s3://{bucket}/{s3_key}{modified}")
         print()
 
 
 def upload_to_s3(
     uploads: list[tuple[str, str, str | None]],
-    endpoint: str,
-    access_key: str,
-    secret_key: str,
+    bucket: str,
+    endpoint: str | None = None,
+    access_key: str | None = None,
+    secret_key: str | None = None,
 ):
     import boto3
 
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-    )
+    client_kwargs = {}
+    if endpoint:
+        client_kwargs["endpoint_url"] = endpoint
+    if access_key:
+        client_kwargs["aws_access_key_id"] = access_key
+    if secret_key:
+        client_kwargs["aws_secret_access_key"] = secret_key
+
+    s3 = boto3.client("s3", **client_kwargs)
 
     for local_path, s3_key, content in uploads:
         if content is not None:
             s3.put_object(
-                Bucket=S3_BUCKET,
+                Bucket=bucket,
                 Key=s3_key,
                 Body=content.encode("utf-8"),
             )
         else:
-            s3.upload_file(local_path, S3_BUCKET, s3_key)
-        print(f"  Uploaded: s3://{S3_BUCKET}/{s3_key}")
+            s3.upload_file(local_path, bucket, s3_key)
+        print(f"  Uploaded: s3://{bucket}/{s3_key}")
 
 
 def main():
     args = parse_args()
     resolve_interactive(args)
+    resolve_s3_config(args)
 
     uploads = build_upload_plan(args)
-    print_upload_plan(uploads)
+    print_upload_plan(uploads, args.s3_bucket)
 
     if args.dry_run:
         print("Dry run — no files uploaded.")
         return
-
-    resolve_s3_credentials(args)
 
     if not args.yes:
         confirm = input("Proceed? [y/N] ").strip().lower()
@@ -359,9 +370,24 @@ def main():
 
     print("\nUploading...")
     try:
-        upload_to_s3(uploads, args.s3_endpoint, args.s3_access_key, args.s3_secret_key)
+        upload_to_s3(
+            uploads, args.s3_bucket,
+            getattr(args, "s3_endpoint", None),
+            getattr(args, "s3_access_key", None),
+            getattr(args, "s3_secret_key", None),
+        )
     except Exception as exc:
-        print(f"\nS3 upload failed: {exc}")
+        from botocore.exceptions import NoCredentialsError
+        if isinstance(exc, NoCredentialsError):
+            print(
+                "\nNo S3 credentials found. Provide them via:\n"
+                "  --s3-access-key / --s3-secret-key CLI args\n"
+                "  S3_ACCESS_KEY / S3_SECRET_KEY in env.shared\n"
+                "  AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars\n"
+                "  ~/.aws/credentials file or IAM instance role"
+            )
+        else:
+            print(f"\nS3 upload failed: {exc}")
         sys.exit(1)
     print("\nDone.")
 
