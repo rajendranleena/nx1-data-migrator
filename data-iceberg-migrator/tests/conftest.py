@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 _MODULE_DIR = Path(__file__).resolve().parent.parent
-_MODULE_NAME = "migration_dags_combined"
 
 MOCK_VARIABLES = {
     'cluster_ssh_conn_id':          'cluster_edge_ssh',
@@ -169,7 +168,17 @@ def _install_airflow_stubs():
             sys.modules.pop(name, None)
         else:
             sys.modules[name] = original
-    sys.modules.pop(_MODULE_NAME, None)
+    sys.modules.pop("migration_dag_mapr_to_s3", None)
+    sys.modules.pop("migration_dag_iceberg", None)
+    sys.modules.pop("migration_dag_folder_copy", None)
+    sys.modules.pop("migration_dag_metadata", None)
+    sys.modules.pop("utils.migrations.metadata_strategies.iceberg_to_iceberg", None)
+    sys.modules.pop("utils.migrations.metadata_strategies.hive_to_hive", None)
+    sys.modules.pop("utils.migrations.metadata_strategies", None)
+    sys.modules.pop("utils.migrations.partition_utils", None)
+    sys.modules.pop("utils.migrations.shared", None)
+    sys.modules.pop("utils.migrations", None)
+    sys.modules.pop("utils", None)
     if _str_dir in sys.path:
         sys.path.remove(_str_dir)
 
@@ -209,13 +218,13 @@ def mock_spark():
 
 @pytest.fixture
 def mock_ssh_hook():
-    """Patch SSHHook at both the provider path and the module-level reference.
+    """Patch SSHHook at both the provider path and DAG module-level references.
 
     Yields (hook_instance, client, stdout_mock, stderr_mock).
-    Tests no longer need ``with patch('migration_dags_combined.SSHHook', ...)``.
     """
     with patch('airflow.providers.ssh.hooks.ssh.SSHHook') as MockSSH, \
-         patch('migration_dags_combined.SSHHook', MockSSH):
+         patch('migration_dag_mapr_to_s3.SSHHook', MockSSH), \
+         patch('migration_dag_folder_copy.SSHHook', MockSSH):
         hook_instance = MagicMock()
         MockSSH.return_value = hook_instance
 
@@ -240,8 +249,11 @@ def mock_ssh_hook():
 
 @pytest.fixture
 def mock_iceberg_retry():
-    """Patch execute_with_iceberg_retry and yield the mock for SQL assertions."""
-    with patch('migration_dags_combined.execute_with_iceberg_retry') as retry:
+    """Patch execute_with_iceberg_retry across all DAG modules."""
+    with patch('migration_dag_mapr_to_s3.execute_with_iceberg_retry') as retry, \
+         patch('migration_dag_iceberg.execute_with_iceberg_retry', retry), \
+         patch('migration_dag_folder_copy.execute_with_iceberg_retry', retry), \
+         patch('migration_dag_metadata.execute_with_iceberg_retry', retry):
         yield retry
 
 
@@ -260,11 +272,30 @@ def sample_table_metadata():
         'source_location': 'maprfs:///data/sales_data/transactions',
         's3_location': 's3a://test-bucket/sales_data_s3/transactions',
         'file_format': 'PARQUET',
-        'schema': [{'name': 'id', 'type': 'bigint'}, {'name': 'amount', 'type': 'double'}, {'name': 'dt', 'type': 'string'}],
-        'partitions': ['dt=2024-01-01', 'dt=2024-01-02'], 'partition_columns': 'dt',
-        'partition_count': 2, 'row_count': 1000, 'is_partitioned': True,
-        'unregistered_partitions': False, 'table_type': 'EXTERNAL',
-        'source_total_size_bytes': 10 * 1024 * 1024, 'source_file_count': 5,
+        'schema': [
+            {'name': 'id', 'type': 'bigint'},
+            {'name': 'amount', 'type': 'double'},
+            {'name': 'dt', 'type': 'string'},
+        ],
+        'partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
+        'partition_columns': 'dt',
+        'partition_count': 2,
+        'row_count': 1000,
+        'is_partitioned': True,
+        'unregistered_partitions': False,
+        'table_type': 'EXTERNAL',
+        'source_total_size_bytes': 10 * 1024 * 1024,
+        'source_file_count': 5,
+        'serde_properties': {},
+        # --- fields added by this branch ---
+        'partition_filter': None,
+        'filtered_partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
+        'partition_filter_active': False,
+        'filtered_row_count': 1000,
+        'filtered_source_size_bytes': 10 * 1024 * 1024,
+        'filtered_file_count': 5,
+        'full_table_row_count': 1000,
+        'full_table_partition_count': 2,
     }]
 
 @pytest.fixture
@@ -280,13 +311,16 @@ def sample_distcp_result(sample_discovery):
     return {
         **sample_discovery,
         'distcp_results': [{
-            'source_database': 'sales_data', 'source_table': 'transactions', 'dest_database': 'sales_data_s3',
+            'source_database': 'sales_data', 'source_table': 'transactions',
+            'dest_database': 'sales_data_s3',
             'status': 'COMPLETED', 'distcp_started_at': '2025-01-01 12:00:00',
             'distcp_completed_at': '2025-01-01 12:05:00', 'distcp_duration_secs': 300.0,
             'is_incremental': False, 'bytes_copied': 10 * 1024 * 1024, 'files_copied': 5,
             's3_total_size_bytes_before': 0, 's3_file_count_before': 0,
             's3_total_size_bytes_after': 10 * 1024 * 1024, 's3_file_count_after': 5,
-            's3_bytes_transferred': 10 * 1024 * 1024, 's3_files_transferred': 5, 'error': None,
+            's3_bytes_transferred': 10 * 1024 * 1024, 's3_files_transferred': 5,
+            'partition_filter_active': False, 'partitions_requested': None,
+            'error': None,
         }],
         '_task_duration': 305.0,
     }
@@ -295,7 +329,10 @@ def sample_distcp_result(sample_discovery):
 def sample_table_result(sample_distcp_result):
     return {
         **sample_distcp_result,
-        'table_results': [{'source_table': 'transactions', 'status': 'COMPLETED', 'action': 'created', 'existed': False, 'error': None}],
+        'table_results': [{
+            'source_table': 'transactions', 'dest_database': 'sales_data_s3',
+            'status': 'COMPLETED', 'action': 'created', 'existed': False, 'error': None,
+        }],
         '_task_duration': 8.0,
     }
 
@@ -403,7 +440,10 @@ def sample_folder_validation_result(sample_folder_distcp_result):
 
 @pytest.fixture
 def sample_folder_finalize_result(sample_folder_run_id):
-    return {'run_id': sample_folder_run_id, 'status': 'COMPLETED', 'total_folders': 2, 'successful_folders': 2, 'failed_folders': 0}
+    return {
+        'run_id': sample_folder_run_id, 'status': 'COMPLETED',
+        'total_folders': 2, 'successful_folders': 2, 'failed_folders': 0,
+    }
 
 # ---------------------------------------------------------------------------
 # DAG 4 sample data
@@ -423,6 +463,7 @@ def sample_s3_db_config(sample_s3_run_id):
         'dest_s3_prefix':   's3a://dest-bucket/data',
         'table_tokens':     ['transactions'],
         'run_id':           sample_s3_run_id,
+        'migration_type':   'hive_to_hive',
     }
 
 
@@ -457,6 +498,7 @@ def sample_s3_discovery(sample_s3_run_id, sample_s3_table_metadata):
         'dest_bucket':      's3a://dest-bucket',
         'source_s3_prefix': 's3a://src-bucket/data',
         'dest_s3_prefix':   's3a://dest-bucket/data',
+        'migration_type':   'hive_to_hive',
         'tables':           sample_s3_table_metadata,
         '_task_duration':   4.2,
     }

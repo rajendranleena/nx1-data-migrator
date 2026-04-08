@@ -11,7 +11,7 @@ This implementation provides three independent but complementary migration DAGs:
 1. **`mapr_to_s3_migration`** - Migrates Hive tables from MapR-FS/HDFS to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
 3. **`folder_only_data_copy`** - Copies raw folders from MapR/HDFS to S3 via DistCp — no Hive metadata
-4. **`s3_to_s3_metadata_migration`** - Recreates Hive table metadata pointing to an existing destination S3 location (no data migration)
+4. **`s3_to_s3_metadata_migration`** - Metadata-only migration with pluggable strategies: recreate Hive external tables (`hive_to_hive`) or register file-based Iceberg tables into HMS (`iceberg_to_iceberg`)
 
 ---
 
@@ -116,6 +116,7 @@ single-tenant setups.
 | DAG 2 | `excel_file_path` | Yes      | S3 path to Iceberg config               | `s3a://config-bucket/iceberg_migration.xlsx`     |
 | DAG 3 | `excel_file_path` | Yes      | S3 path to folder copy config           | `s3a://config-bucket/folder_copy.xlsx`           |
 | DAG 4 | `excel_file_path` | Yes      | S3 path to S3 metadata migration config | `s3a://config-bucket/s3_metadata_migration.xlsx` |
+| DAG 4 | `migration_type`  | Yes      | Strategy: `hive_to_hive` or `iceberg_to_iceberg` | `hive_to_hive` |
 
 ---
 
@@ -181,16 +182,16 @@ single-tenant setups.
 ┌─────────────────────────────────────────────────────────────┐
 │ DAG 4: S3-to-S3 Metadata Migration                          │
 │                                                             │
-│ Source Hive (pointing to source S3)                         │
-│ │                                                           │
-│ │ [PySpark: Table Discovery + Metadata]                     │
-│ ▼                                                           │
-│ Destination S3 (Data Presence Validation)                   │
-│ │                                                           │
-│ │ [PySpark: Hive DDL]                                       │
-│ ▼                                                           │
-│ Dest S3 (Queryable via Hive)                                │
-│ │                                                           │
+│ Strategy: hive_to_hive          │ iceberg_to_iceberg        │
+│ ────────────────────────────────┼───────────────────────────│
+│ Source: Hive metastore          │ Source: metadata.json      │
+│   (SHOW TABLES, DESCRIBE)      │   (read directly from S3)  │
+│ │                               │ │                         │
+│ │ [Data Presence Validation]    │ │ [Data Presence Valid.]   │
+│ ▼                               │ ▼                         │
+│ CREATE EXTERNAL TABLE           │ register_table (HMS)       │
+│ + MSCK REPAIR TABLE             │                            │
+│ │                               │ │                         │
 │ │ [Validation: Row counts, partitions, schema]              │
 │ ▼                                                           │
 │ Validated & Tracked                                         │
@@ -221,9 +222,11 @@ Do you need to migrate from MapR-FS/HDFS to S3?
 │
 └─ NO → Data already in destination S3?
    │
-   ├─ YES, just need Hive metadata recreated → Run DAG 3 (s3_to_s3_metadata_migration)
+   ├─ YES, Hive tables → Run DAG 4 (migration_type=hive_to_hive)
    │   │
-   │   └─ Need Iceberg format too? → Run DAG 2 after DAG 3
+   │   └─ Need Iceberg format too? → Run DAG 2 after DAG 4
+   │
+   ├─ YES, Iceberg files (no metastore) → Run DAG 4 (migration_type=iceberg_to_iceberg)
    │
    └─ Need Iceberg only (metadata already exists) → Run DAG 2 (iceberg_migration) only
 ```
@@ -1273,19 +1276,23 @@ COMPLETED_WITH_ERRORS
 
 ### Purpose
 
-Recreates Hive external table definitions in a destination database pointing to data that already exists in a destination S3 location. No data migration occurs. This DAG is purely a metadata operation suited for scenarios where data has been copied by an external process
+Metadata-only migration: discovers source table schemas and recreates them at a destination. No data is copied — only metadata (DDL) is migrated. Supports multiple migration types via the strategy pattern:
+
+- **`hive_to_hive`** — Discovers Hive tables via metastore (`SHOW TABLES` / `DESCRIBE FORMATTED`), creates Hive external tables at destination S3 paths
+- **`iceberg_to_iceberg`** — Reads Iceberg `metadata.json` directly from S3 (file-based catalog, no metastore), registers tables in HMS via `register_table`
 
 ---
 
 ### Key Features
 
+- **Strategy Pattern** - Pluggable migration types (`hive_to_hive`, `iceberg_to_iceberg`) with a shared pipeline
 - **No Data Movement** - Assumes data already exists at destination S3 paths
 - **Data Presence Validation** - Verifies destination S3 paths contain files before creating tables
 - **Path Remapping** - Supports prefix-based path translation (`source_s3_prefix` → `dest_s3_prefix`) or simple bucket-based destination
-- **Partition Support** - Automatic partition discovery and repair via `MSCK REPAIR TABLE`
+- **Partition Support** - Automatic partition discovery and repair (Hive) or partition-aware registration (Iceberg)
 - **Format Preservation** - Supports Parquet, ORC, Avro, and TextFile
 - **Comprehensive Validation** - Row counts, partition counts, schema comparison
-- **Incremental Support** - Detects existing tables and runs repair instead of recreating
+- **Incremental Support** - Detects existing tables and runs repair/refresh instead of recreating
 
 ---
 
@@ -1296,18 +1303,23 @@ Recreates Hive external table definitions in a destination database pointing to 
 | Column             | Required | Description                                             | Example                 |
 | ------------------ | -------- | ------------------------------------------------------- | ----------------------- |
 | `database`         | **Yes**  | Source database name                                    | `sales_data`            |
-| `table`            | No       | Table pattern (supports `*` wildcards, comma-separated) | `transactions_*` or `*` |
+| `table`            | Varies   | Table name or pattern. `hive_to_hive`: supports `*` wildcards, comma-separated. `iceberg_to_iceberg`: exact table name (required) | `transactions_*` or `*` |
 | `dest_database`    | No       | Destination database (defaults to source)               | `sales_data_dest`       |
 | `dest_bucket`      | No\*     | Destination S3 bucket                                   | `s3a://dest-lake`       |
 | `source_s3_prefix` | No\*     | Source S3 prefix for path remapping                     | `s3a://source-lake`     |
 | `dest_s3_prefix`   | No\*     | Destination S3 prefix for path remapping                | `s3a://dest-lake`       |
+| `source_table_path`| No\*\*  | S3 path to Iceberg table root (containing `metadata/`)  | `s3a://bucket/db/table` |
 
-- Either `dest_bucket` or both `source_s3_prefix` + `dest_s3_prefix` must be provided per row.
+\* Either `dest_bucket` or both `source_s3_prefix` + `dest_s3_prefix` must be provided per row.
+
+\*\* Required for `iceberg_to_iceberg` strategy. Ignored by `hive_to_hive`.
 
 **Path Remapping Behavior:**
 
 - If `source_s3_prefix` and `dest_s3_prefix` are provided, destination path is computed by replacing the source prefix with the destination prefix, preserving the relative path.
-- If only `dest_bucket` is provided, destination path defaults to `{dest_bucket}/{dest_database}/{table_name}`.
+- If only `dest_bucket` is provided:
+  - `hive_to_hive`: destination path defaults to `{dest_bucket}/{dest_database}/{table_name}`
+  - `iceberg_to_iceberg`: destination path equals `source_table_path` (in-place registration)
 
 ---
 
@@ -1323,16 +1335,16 @@ parse_s3_excel
 ┌───────────────────────────────────────────────┐
 │  Dynamic Task Mapping (per database config)   │
 │                                               │
-│  discover_source_hive_tables (PySpark)        │
-│    ↓                                          │
+│  discover_source_tables (PySpark)             │
+│    ↓  (dispatches to active strategy)         │
 │  record_s3_discovered_tables                  │
 │    ↓                                          │
 │  validate_data_presence (PySpark)             │
 │    ↓                                          │
 │  update_data_presence_status                  │
 │    ↓                                          │
-│  create_dest_hive_tables (PySpark)            │
-│    ↓                                          │
+│  create_dest_tables (PySpark)                 │
+│    ↓  (dispatches to active strategy)         │
 │  update_s3_table_create_status                │
 │    ↓                                          │
 │  validate_s3_destination_tables (PySpark)     │
@@ -1378,23 +1390,24 @@ finalize_s3_run
 #### Step 2 - `parse_s3_excel`
 
 **Type:** PySpark  
-**Purpose:** Read and parse the Excel configuration file
+**Purpose:** Read and parse the Excel configuration file, delegating row parsing to the active strategy
 
 - Reads Excel file from S3 using `pyspark.pandas.read_excel`
-- Normalizes column names and validates required fields
-- Groups rows by `(source_database, dest_database, dest_bucket, source_s3_prefix, dest_s3_prefix)`
-- Skips rows that provide neither a `dest_bucket` nor a `source_s3_prefix`+`dest_s3_prefix` pair
+- Normalizes column names and delegates to the strategy's `parse_excel_rows` function
+- `hive_to_hive`: groups rows by `(source_database, dest_database, dest_bucket, prefixes)`, supports wildcard table patterns
+- `iceberg_to_iceberg`: groups rows similarly, but requires `table` and `source_table_path` per row
+- Skips rows that provide neither a `dest_bucket` nor a `source_s3_prefix`+`dest_s3_prefix` pair (hive) or missing `source_table_path` (iceberg)
 
 ---
 
-#### Step 3 - `discover_source_hive_tables`
+#### Step 3 - `discover_source_tables`
 
 **Type:** PySpark (mapped per database)
-**Purpose:** Discover source Hive table metadata
+**Purpose:** Discover source table metadata — dispatches to the active strategy
 
-- Lists all tables in source database and filters by token patterns (supports wildcards and comma-separated names)
-- For each matched table, extracts schema, location, file format, partition columns, partition list, row count, and file size metrics from the source Hive metastore
-- Computes destination S3 path using prefix remapping or bucket-based logic
+- **`hive_to_hive`**: lists tables via `SHOW TABLES`, filters by token patterns (wildcards/comma-separated), extracts schema, location, format, partitions, row count, and file metrics from the Hive metastore
+- **`iceberg_to_iceberg`**: reads `metadata.json` directly from S3 at each `source_table_path`, extracts schema, partitions, row count, and format from the Iceberg metadata
+- Computes destination S3 path using prefix remapping or bucket-based/in-place logic
 
 ---
 
@@ -1433,16 +1446,19 @@ finalize_s3_run
 
 ---
 
-#### Step 7 - `create_dest_hive_tables`
+#### Step 7 - `create_dest_tables`
 
 **Type:** PySpark (mapped per database)
 
-**Purpose:** Create or repair destination Hive external tables for all `CONFIRMED` tables
+**Purpose:** Create destination tables — dispatches per-table creation to the active strategy
 
 - Skips tables whose data presence status is not `CONFIRMED`
-- For each confirmed table:
+- **`hive_to_hive`**: for each confirmed table:
   - **If table exists:** Runs `MSCK REPAIR TABLE` and `REFRESH TABLE`
   - **If table does not exist:** Generates and executes `CREATE EXTERNAL TABLE` DDL using schema from discovery, then runs `MSCK REPAIR TABLE` if partitioned
+- **`iceberg_to_iceberg`**: for each confirmed table:
+  - **If table exists:** Runs `REFRESH TABLE`
+  - **If table does not exist:** Resolves the latest `metadata.json` file and calls `register_table` to register in HMS
 - Applies per-bucket S3 credentials for destination paths
 
 ---

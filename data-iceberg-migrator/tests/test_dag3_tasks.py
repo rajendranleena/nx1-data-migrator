@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import migration_dags_combined as m
+import migration_dag_folder_copy as m
 import pandas as pd
 import pytest
 
@@ -329,7 +329,7 @@ class TestGenerateDataCopyHtmlReport:
 class TestSendDataCopyReportEmail:
 
     def test_skips_when_no_recipients(self, mock_spark, sample_folder_run_id):
-        with patch('migration_dags_combined.get_config') as cfg:
+        with patch('migration_dag_folder_copy.get_config') as cfg:
             cfg.return_value = {'smtp_conn_id': 'smtp_default', 'email_recipients': ''}
             result = m.send_data_copy_report_email.function(
                 report_result={'report_path': 's3a://b/r.html', 'html_content': '<html/>'},

@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
-import migration_dags_combined as m
+import migration_dag_metadata as m
 import pytest
 
 from .helpers import make_excel_bytes, setup_spark_excel
@@ -89,7 +89,7 @@ class TestParseS3Excel:
             'dest_bucket': 's3a://dest-bkt',
             'source_s3_prefix': '', 'dest_s3_prefix': '',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert len(result) == 1
         assert result[0]['source_database'] == 'sales'
         assert result[0]['dest_database'] == 'sales_dest'
@@ -106,7 +106,7 @@ class TestParseS3Excel:
             'database': 'db', 'table': '*', 'dest_database': '',
             'dest_bucket': raw_bucket, 'source_s3_prefix': '', 'dest_s3_prefix': '',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert result[0]['dest_bucket'] == expected
 
     def test_wildcard_collapses_specific_tokens(self, mock_spark, sample_s3_run_id):
@@ -114,7 +114,7 @@ class TestParseS3Excel:
             {'database': 'db', 'table': 'tbl_a', 'dest_database': '', 'dest_bucket': 's3a://b', 'source_s3_prefix': '', 'dest_s3_prefix': ''},
             {'database': 'db', 'table': '*',     'dest_database': '', 'dest_bucket': 's3a://b', 'source_s3_prefix': '', 'dest_s3_prefix': ''},
         ]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert result[0]['table_tokens'] == ['*']
 
     def test_comma_separated_tables_tokenized(self, mock_spark, sample_s3_run_id):
@@ -123,7 +123,7 @@ class TestParseS3Excel:
             'dest_database': '', 'dest_bucket': 's3a://b',
             'source_s3_prefix': '', 'dest_s3_prefix': '',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert set(result[0]['table_tokens']) == {'tbl_a', 'tbl_b', 'tbl_c'}
 
     def test_empty_rows_skipped(self, mock_spark, sample_s3_run_id):
@@ -131,7 +131,7 @@ class TestParseS3Excel:
             {'database': '',      'table': '*', 'dest_database': '', 'dest_bucket': '',   'source_s3_prefix': '', 'dest_s3_prefix': ''},
             {'database': 'mydb', 'table': '*', 'dest_database': '', 'dest_bucket': 's3a://b', 'source_s3_prefix': '', 'dest_s3_prefix': ''},
         ]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert len(result) == 1
         assert result[0]['source_database'] == 'mydb'
 
@@ -142,16 +142,16 @@ class TestParseS3Excel:
             'source_s3_prefix': 's3a://src/data',
             'dest_s3_prefix':   's3a://dst/data',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', sample_s3_run_id, spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
         assert result[0]['source_s3_prefix'] == 's3a://src/data'
         assert result[0]['dest_s3_prefix'] == 's3a://dst/data'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestDiscoverSourceHiveTables
+# TestDiscoverSourceTables
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestDiscoverSourceHiveTables:
+class TestDiscoverSourceTables:
 
     def _make_sql_router(self, tables, file_format='PARQUET', partitions=None, row_count=500):
         """Return a spark.sql side_effect that answers all queries discover makes."""
@@ -215,7 +215,7 @@ class TestDiscoverSourceHiveTables:
     def test_discovers_all_tables_with_wildcard(self, mock_spark, sample_s3_db_config):
         mock_spark.sql.side_effect = self._make_sql_router(['transactions', 'orders'])
         sample_s3_db_config['table_tokens'] = ['*']
-        result = m.discover_source_hive_tables.function.__wrapped__(
+        result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
         )
         assert result['source_database'] == 'sales_data'
@@ -224,7 +224,7 @@ class TestDiscoverSourceHiveTables:
     def test_discovers_specific_table_by_token(self, mock_spark, sample_s3_db_config):
         mock_spark.sql.side_effect = self._make_sql_router(['transactions', 'orders'])
         sample_s3_db_config['table_tokens'] = ['transactions']
-        result = m.discover_source_hive_tables.function.__wrapped__(
+        result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
         )
         assert len(result['tables']) == 1
@@ -232,7 +232,7 @@ class TestDiscoverSourceHiveTables:
 
     def test_detects_orc_format(self, mock_spark, sample_s3_db_config):
         mock_spark.sql.side_effect = self._make_sql_router(['transactions'], file_format='ORC')
-        result = m.discover_source_hive_tables.function.__wrapped__(
+        result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
         )
         assert result['tables'][0]['file_format'] == 'ORC'
@@ -241,7 +241,7 @@ class TestDiscoverSourceHiveTables:
         mock_spark.sql.side_effect = self._make_sql_router(
             ['transactions'], partitions=['dt=2024-01-01', 'dt=2024-01-02']
         )
-        result = m.discover_source_hive_tables.function.__wrapped__(
+        result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
         )
         tbl = result['tables'][0]
@@ -250,7 +250,7 @@ class TestDiscoverSourceHiveTables:
 
     def test_includes_source_row_count(self, mock_spark, sample_s3_db_config):
         mock_spark.sql.side_effect = self._make_sql_router(['transactions'], row_count=999)
-        result = m.discover_source_hive_tables.function.__wrapped__(
+        result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
         )
         assert result['tables'][0]['source_row_count'] == 999
@@ -281,7 +281,7 @@ class TestDiscoverSourceHiveTables:
             return df
 
         mock_spark.sql.side_effect = router
-        result = m.discover_source_hive_tables.function.__wrapped__(
+        result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
         )
         assert result['tables'][0]['dest_location'].startswith('s3a://dst/data')
@@ -365,7 +365,7 @@ class TestValidateDataPresence:
         mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.side_effect = Exception("S3 error")
         with pytest.raises(Exception, match="Data presence check FAILED"):
             m.validate_data_presence.function(
-                discovery=sample_s3_discovery, spark=mock_spark,
+                discovery=sample_s3_discovery, spark=mock_spark, ti=MagicMock(),
             )
 
     def test_skips_invalid_input(self, mock_spark):
@@ -394,10 +394,10 @@ class TestUpdateDataPresenceStatus:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestCreateDestHiveTables
+# TestCreateDestTables
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestCreateDestHiveTables:
+class TestCreateDestTables:
 
     def test_creates_new_table_when_not_existing(self, mock_spark, mock_iceberg_retry, sample_s3_presence_result):
         def sql_router(sql):
@@ -409,7 +409,7 @@ class TestCreateDestHiveTables:
             return df
         mock_spark.sql.side_effect = sql_router
 
-        result = m.create_dest_hive_tables.function.__wrapped__(
+        result = m.create_dest_tables.function.__wrapped__(
             presence_result=sample_s3_presence_result, spark=mock_spark, ti=MagicMock(),
         )
         assert result['table_results'][0]['status'] == 'COMPLETED'
@@ -418,7 +418,7 @@ class TestCreateDestHiveTables:
     def test_repairs_existing_table(self, mock_spark, mock_iceberg_retry, sample_s3_presence_result):
         mock_spark.sql.return_value.collect.return_value = []  # DESCRIBE doesn't raise
 
-        result = m.create_dest_hive_tables.function.__wrapped__(
+        result = m.create_dest_tables.function.__wrapped__(
             presence_result=sample_s3_presence_result, spark=mock_spark, ti=MagicMock(),
         )
         assert result['table_results'][0]['status'] == 'COMPLETED'
@@ -429,7 +429,7 @@ class TestCreateDestHiveTables:
     def test_skips_table_with_missing_data(self, mock_spark, mock_iceberg_retry, sample_s3_presence_result):
         sample_s3_presence_result['presence_results'][0]['status'] = 'MISSING'
 
-        result = m.create_dest_hive_tables.function.__wrapped__(
+        result = m.create_dest_tables.function.__wrapped__(
             presence_result=sample_s3_presence_result, spark=mock_spark, ti=MagicMock(),
         )
         assert result['table_results'][0]['status'] == 'SKIPPED'
@@ -446,13 +446,13 @@ class TestCreateDestHiveTables:
             return df
         mock_spark.sql.side_effect = sql_router
 
-        with pytest.raises(Exception, match="Hive table creation failed"):
-            m.create_dest_hive_tables.function.__wrapped__(
+        with pytest.raises(Exception, match="Table creation failed"):
+            m.create_dest_tables.function.__wrapped__(
                 presence_result=sample_s3_presence_result, spark=mock_spark, ti=MagicMock(),
             )
 
     def test_skips_invalid_input(self, mock_spark, mock_iceberg_retry):
-        result = m.create_dest_hive_tables.function.__wrapped__(
+        result = m.create_dest_tables.function.__wrapped__(
             presence_result={}, spark=mock_spark, ti=MagicMock(),
         )
         assert result == {}
@@ -661,7 +661,7 @@ class TestGenerateS3HtmlReport:
 class TestSendS3ReportEmail:
 
     def test_skips_when_no_recipients_configured(self, mock_spark, sample_s3_run_id):
-        with patch('migration_dags_combined.get_config') as mock_cfg:
+        with patch('migration_dag_metadata.get_config') as mock_cfg:
             mock_cfg.return_value = {
                 'smtp_conn_id': 'smtp_default',
                 'email_recipients': '',
@@ -682,7 +682,7 @@ class TestSendS3ReportEmail:
         mock_spark._jvm.java.io.BufferedReader.return_value = reader_mock
 
         send_email_mock = MagicMock()
-        with patch('migration_dags_combined.get_config') as mock_cfg, \
+        with patch('migration_dag_metadata.get_config') as mock_cfg, \
              patch('airflow.utils.email.send_email', send_email_mock):
             mock_cfg.return_value = {
                 'smtp_conn_id': 'smtp_default',

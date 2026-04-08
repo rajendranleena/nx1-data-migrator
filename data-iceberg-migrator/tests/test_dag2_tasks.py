@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import migration_dags_combined as m
+import migration_dag_iceberg as m
 import pytest
 
 from .helpers import make_excel_bytes, setup_spark_excel
