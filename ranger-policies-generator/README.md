@@ -212,8 +212,15 @@ Trigger the DAG via Airflow UI or CLI:
 airflow dags trigger ranger_policy_automation \
     --conf '{"excel_file_path": "s3a://your-bucket/configs/ranger_policies.xlsx"}'
 ```
-## Ranger Utils install
-place the utils under utils/migrations directory in airflow/jupyter
+## Deployment
+
+Use `deploy.py` from the repository root to upload the DAG and shared utilities to S3:
+
+```bash
+python deploy.py --project ranger --dag ranger --owner my-name --suffix dev1
+```
+
+This uploads the DAG file (with suffixed DAG ID and custom owner), shared utils (`utils/migrations/ranger_utils.py`), and env files to the correct S3 paths. See the root README for full deploy.py usage.
 
 ## Task Flow
 
@@ -307,7 +314,7 @@ Coverage settings (source, 80% threshold) are configured in `.coveragerc`.
 
 ## Notes for Dev
 
-Env files are loaded from `/opt/airflow/utils/migration_configs/`:
+Env files are loaded from `utils/migration_configs/` relative to the DAG file location:
 
 - `env.shared` — shared config (S3, SSH, Spark, Ranger, Keycloak credentials, etc.)
 - `env.<dag_stem>` — per-developer overrides (e.g. `env.ranger-policies-generator_airflow3`)

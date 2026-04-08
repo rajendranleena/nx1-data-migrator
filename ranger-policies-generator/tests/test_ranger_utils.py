@@ -72,17 +72,18 @@ def ranger_utils_module():
     stubs = _stub_apache_ranger()
     saved = {k: sys.modules.get(k) for k in stubs}
 
-    # Also save the ranger_utils stub that dag_module (session fixture) may have placed
-    saved_ranger_utils = sys.modules.get("ranger_utils")
+    # Also save the stubs that dag_module (session fixture) may have placed
+    saved_ranger_utils = sys.modules.get("utils.migrations.ranger_utils")
+    saved_utils_migrations = sys.modules.get("utils.migrations")
+    saved_utils = sys.modules.get("utils")
 
     for k, v in stubs.items():
         sys.modules[k] = v
 
-    # Re-import cleanly
     import importlib
-    mod_name = "ranger_utils"
-    if mod_name in sys.modules:
-        del sys.modules[mod_name]
+    mod_name = "utils.migrations.ranger_utils"
+    for m in ("utils.migrations.ranger_utils", "utils.migrations", "utils"):
+        sys.modules.pop(m, None)
 
     import sys as _sys
     from pathlib import Path
@@ -99,11 +100,18 @@ def ranger_utils_module():
                 sys.modules.pop(k, None)
             else:
                 sys.modules[k] = original
-        # Restore the ranger_utils stub (or remove if it wasn't there before)
         if saved_ranger_utils is None:
-            sys.modules.pop(mod_name, None)
+            sys.modules.pop("utils.migrations.ranger_utils", None)
         else:
-            sys.modules[mod_name] = saved_ranger_utils
+            sys.modules["utils.migrations.ranger_utils"] = saved_ranger_utils
+        if saved_utils_migrations is None:
+            sys.modules.pop("utils.migrations", None)
+        else:
+            sys.modules["utils.migrations"] = saved_utils_migrations
+        if saved_utils is None:
+            sys.modules.pop("utils", None)
+        else:
+            sys.modules["utils"] = saved_utils
 
 
 def _make_manager(ranger_utils_module):
@@ -1265,7 +1273,7 @@ class TestGetExistingPolicyNoneResponse:
         import logging
         mgr = _make_manager(ranger_utils_module)
         mgr.client.find_policies.return_value = None
-        logger = logging.getLogger("ranger_utils")
+        logger = logging.getLogger("utils.migrations.ranger_utils")
         with patch.object(logger, "warning") as mock_warn, \
              patch.object(logger, "error") as mock_err:
             mgr.get_existing_policy("iceberg.db1.t1")

@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 _MODULE_DIR = Path(__file__).resolve().parent.parent
-_MODULE_NAME = "migration_dags_combined"
 
 MOCK_VARIABLES = {
     'cluster_ssh_conn_id':          'cluster_edge_ssh',
@@ -169,7 +168,16 @@ def _install_airflow_stubs():
             sys.modules.pop(name, None)
         else:
             sys.modules[name] = original
-    sys.modules.pop(_MODULE_NAME, None)
+    sys.modules.pop("migration_dag_mapr_to_s3", None)
+    sys.modules.pop("migration_dag_iceberg", None)
+    sys.modules.pop("migration_dag_folder_copy", None)
+    sys.modules.pop("migration_dag_metadata", None)
+    sys.modules.pop("utils.migrations.metadata_strategies.iceberg_to_iceberg", None)
+    sys.modules.pop("utils.migrations.metadata_strategies.hive_to_hive", None)
+    sys.modules.pop("utils.migrations.metadata_strategies", None)
+    sys.modules.pop("utils.migrations.shared", None)
+    sys.modules.pop("utils.migrations", None)
+    sys.modules.pop("utils", None)
     if _str_dir in sys.path:
         sys.path.remove(_str_dir)
 
@@ -209,13 +217,13 @@ def mock_spark():
 
 @pytest.fixture
 def mock_ssh_hook():
-    """Patch SSHHook at both the provider path and the module-level reference.
+    """Patch SSHHook at both the provider path and DAG module-level references.
 
     Yields (hook_instance, client, stdout_mock, stderr_mock).
-    Tests no longer need ``with patch('migration_dags_combined.SSHHook', ...)``.
     """
     with patch('airflow.providers.ssh.hooks.ssh.SSHHook') as MockSSH, \
-         patch('migration_dags_combined.SSHHook', MockSSH):
+         patch('migration_dag_mapr_to_s3.SSHHook', MockSSH), \
+         patch('migration_dag_folder_copy.SSHHook', MockSSH):
         hook_instance = MagicMock()
         MockSSH.return_value = hook_instance
 
@@ -240,8 +248,11 @@ def mock_ssh_hook():
 
 @pytest.fixture
 def mock_iceberg_retry():
-    """Patch execute_with_iceberg_retry and yield the mock for SQL assertions."""
-    with patch('migration_dags_combined.execute_with_iceberg_retry') as retry:
+    """Patch execute_with_iceberg_retry across all DAG modules."""
+    with patch('migration_dag_mapr_to_s3.execute_with_iceberg_retry') as retry, \
+         patch('migration_dag_iceberg.execute_with_iceberg_retry', retry), \
+         patch('migration_dag_folder_copy.execute_with_iceberg_retry', retry), \
+         patch('migration_dag_metadata.execute_with_iceberg_retry', retry):
         yield retry
 
 
@@ -423,6 +434,7 @@ def sample_s3_db_config(sample_s3_run_id):
         'dest_s3_prefix':   's3a://dest-bucket/data',
         'table_tokens':     ['transactions'],
         'run_id':           sample_s3_run_id,
+        'migration_type':   'hive_to_hive',
     }
 
 
@@ -457,6 +469,7 @@ def sample_s3_discovery(sample_s3_run_id, sample_s3_table_metadata):
         'dest_bucket':      's3a://dest-bucket',
         'source_s3_prefix': 's3a://src-bucket/data',
         'dest_s3_prefix':   's3a://dest-bucket/data',
+        'migration_type':   'hive_to_hive',
         'tables':           sample_s3_table_metadata,
         '_task_duration':   4.2,
     }

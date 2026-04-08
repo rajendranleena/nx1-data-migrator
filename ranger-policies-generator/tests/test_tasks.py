@@ -237,7 +237,7 @@ class TestWriteSkippedRows:
 class TestCreateRangerGroupsAndPolicies:
     def _setup_mocks(self, sync_return=None):
         import sys
-        ranger_utils_mock = sys.modules["ranger_utils"]
+        ranger_utils_mock = sys.modules["utils.migrations.ranger_utils"]
         manager = MagicMock()
         ranger_utils_mock.RangerPolicyManager.return_value = manager
         manager.ensure_groups_exist.return_value = {"role_analyst": True, "grp1": False}
@@ -300,7 +300,7 @@ class TestCreateKeycloakRoles:
     def test_syncs_roles_and_builds_statuses(self, dag_module):
         fn = _unwrap(dag_module, "create_keycloak_roles")
         import sys
-        ranger_utils_mock = sys.modules["ranger_utils"]
+        ranger_utils_mock = sys.modules["utils.migrations.ranger_utils"]
         manager = MagicMock()
         ranger_utils_mock.KeycloakRoleManager.return_value = manager
         ranger_utils_mock.KeycloakRoleManager.side_effect = None
@@ -326,7 +326,7 @@ class TestCreateKeycloakRoles:
     def test_connection_error_returns_failure(self, dag_module):
         fn = _unwrap(dag_module, "create_keycloak_roles")
         import sys
-        ranger_utils_mock = sys.modules["ranger_utils"]
+        ranger_utils_mock = sys.modules["utils.migrations.ranger_utils"]
         ranger_utils_mock.KeycloakRoleManager.side_effect = ConnectionError("timeout")
 
         with patch.object(dag_module, "get_config", return_value=_CONFIG):
@@ -338,7 +338,7 @@ class TestCreateKeycloakRoles:
     def test_missing_group_fails_mapping(self, dag_module):
         fn = _unwrap(dag_module, "create_keycloak_roles")
         import sys
-        ranger_utils_mock = sys.modules["ranger_utils"]
+        ranger_utils_mock = sys.modules["utils.migrations.ranger_utils"]
         manager = MagicMock()
         ranger_utils_mock.KeycloakRoleManager.return_value = manager
         ranger_utils_mock.KeycloakRoleManager.side_effect = None
@@ -365,7 +365,7 @@ class TestCreateKeycloakRoles:
         """When two roles reference the same missing group, one FAILED group status and two failed mappings."""
         fn = _unwrap(dag_module, "create_keycloak_roles")
         import sys
-        ranger_utils_mock = sys.modules["ranger_utils"]
+        ranger_utils_mock = sys.modules["utils.migrations.ranger_utils"]
         manager = MagicMock()
         ranger_utils_mock.KeycloakRoleManager.return_value = manager
         ranger_utils_mock.KeycloakRoleManager.side_effect = None
@@ -414,7 +414,7 @@ class TestCreateKeycloakRoles:
         """When get_current_context is available, attempt_num should flow into failure statuses."""
         fn = _unwrap(dag_module, "create_keycloak_roles")
         import sys
-        ranger_utils_mock = sys.modules["ranger_utils"]
+        ranger_utils_mock = sys.modules["utils.migrations.ranger_utils"]
         ranger_utils_mock.KeycloakRoleManager.side_effect = ConnectionError("timeout")
 
         ctx_mock = MagicMock()
@@ -439,7 +439,7 @@ class TestCreateKeycloakRoles:
         """When get_current_context raises, attempt_num defaults to 1 gracefully."""
         fn = _unwrap(dag_module, "create_keycloak_roles")
         import sys
-        ranger_utils_mock = sys.modules["ranger_utils"]
+        ranger_utils_mock = sys.modules["utils.migrations.ranger_utils"]
         ranger_utils_mock.KeycloakRoleManager.side_effect = ConnectionError("timeout")
 
         with patch.object(dag_module, "get_config", return_value=_CONFIG), \

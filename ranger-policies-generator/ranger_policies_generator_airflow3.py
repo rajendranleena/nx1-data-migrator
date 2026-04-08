@@ -13,7 +13,6 @@ This DAG:
 """
 import logging
 import os
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -34,8 +33,6 @@ if os.path.isdir(_config_dir):
     load_dotenv(os.path.join(_config_dir, f'env.{_dag_stem}'), override=True)
 else:
     logger.warning(f"Config directory {_config_dir} not found — env files not loaded, using Airflow Variables / defaults")
-
-sys.path.append(str(_dag_dir / 'utils' / 'migrations'))
 
 # Default args for DAG
 default_args = {
@@ -1264,7 +1261,7 @@ with DAG(
         """
         from datetime import datetime as dt
 
-        from ranger_utils import RangerPolicyManager
+        from utils.migrations.ranger_utils import RangerPolicyManager
 
         cfg = get_config()
         manager = RangerPolicyManager(
@@ -1430,7 +1427,7 @@ with DAG(
         Health check task that verifies Keycloak connectivity before role creation.
         Returns connection status and diagnostic info.
         """
-        from ranger_utils import KeycloakRoleManager
+        from utils.migrations.ranger_utils import KeycloakRoleManager
 
         cfg = get_config()
         try:
@@ -1463,7 +1460,7 @@ with DAG(
         Create Keycloak roles and group mappings.
         Returns both summary (for finalize) and statuses (for tracking).
         """
-        from ranger_utils import KeycloakRoleManager
+        from utils.migrations.ranger_utils import KeycloakRoleManager
 
         cfg = get_config()
 
