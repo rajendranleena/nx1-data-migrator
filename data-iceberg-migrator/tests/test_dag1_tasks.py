@@ -134,7 +134,8 @@ class TestParseExcel:
         result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_xyz', spark=mock_spark)
         assert result[0]['run_id'] == 'run_xyz'
 
-    def test_dest_endpoint_emitted_when_present(self, mock_spark):
+    @patch('migration_dag_mapr_to_s3.validate_bucket_endpoint_pairs')
+    def test_dest_endpoint_emitted_when_present(self, _mock_validate, mock_spark):
         setup_spark_excel(mock_spark, make_excel_bytes([
             {'database': 'db1', 'table': '*', 'dest database': '', 'bucket': 's3a://bkt',
             'endpoint': 'https://s3.tenant-a.example.com'},
@@ -149,7 +150,8 @@ class TestParseExcel:
         result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
         assert result[0]['dest_endpoint'] == ''
 
-    def test_same_bucket_different_endpoint_produces_two_configs(self, mock_spark):
+    @patch('migration_dag_mapr_to_s3.validate_bucket_endpoint_pairs')
+    def test_same_bucket_different_endpoint_produces_two_configs(self, _mock_validate, mock_spark):
         """Same (src_db, dest_db, bucket) but different endpoints must not be merged."""
         setup_spark_excel(mock_spark, make_excel_bytes([
             {'database': 'db1', 'table': 'tbl_a', 'dest database': 'db1_s3', 'bucket': 's3a://data-lake',
@@ -162,7 +164,8 @@ class TestParseExcel:
         endpoints = {r['dest_endpoint'] for r in result}
         assert endpoints == {'https://s3.tenant-a.example.com', 'https://s3.tenant-b.example.com'}
 
-    def test_same_bucket_same_endpoint_merged_into_one_config(self, mock_spark):
+    @patch('migration_dag_mapr_to_s3.validate_bucket_endpoint_pairs')
+    def test_same_bucket_same_endpoint_merged_into_one_config(self, _mock_validate, mock_spark):
         """Same (src_db, dest_db, bucket, endpoint) on two rows must merge tokens."""
         setup_spark_excel(mock_spark, make_excel_bytes([
             {'database': 'db1', 'table': 'tbl_a', 'dest database': 'db1_s3', 'bucket': 's3a://data-lake',
