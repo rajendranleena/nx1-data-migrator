@@ -89,16 +89,27 @@ def validate_rowfilter(rowfilter: str) -> str:
         raise ValueError(f"Rowfilter contains forbidden characters (semicolon or newline): {rowfilter}")
     return rowfilter
 
+
+def _get_conf_value(key: str) -> str:
+    """Read a value from dag_run.conf (set by the API trigger). Returns empty string if missing."""
+    try:
+        from airflow.operators.python import get_current_context
+        ctx = get_current_context()
+        return ctx["dag_run"].conf.get(key, "") if ctx.get("dag_run") else ""
+    except Exception:
+        return ""
+
+
 def get_config() -> dict:
-    return {
+    cfg = {
         'ranger_url': Variable.get('ranger_url', default_var=os.getenv('RANGER_URL', 'http://ranger:6080')),
-        'ranger_username': Variable.get('ranger_username', default_var=os.getenv('RANGER_USERNAME')),
-        'ranger_password': Variable.get('ranger_password', default_var=os.getenv('RANGER_PASSWORD'), deserialize_json=False),
+        'ranger_username': Variable.get('ranger_username', default_var=os.getenv('RANGER_USERNAME', '')),
+        'ranger_password': Variable.get('ranger_password', default_var=os.getenv('RANGER_PASSWORD', ''), deserialize_json=False),
         'service_name': Variable.get('nx1_repo_name', default_var=os.getenv('NX1_REPO_NAME', 'nx1-unifiedsql')),
-        'keycloak_url': Variable.get('keycloak_url', default_var=os.getenv('KEYCLOAK_URL')),
-        'keycloak_realm': Variable.get('keycloak_realm', default_var=os.getenv('KEYCLOAK_REALM')),
-        'keycloak_client_id': Variable.get('keycloak_admin_client_id', default_var=os.getenv('KEYCLOAK_ADMIN_CLIENT_ID')),
-        'keycloak_client_secret': Variable.get('keycloak_admin_client_secret', default_var=os.getenv('KEYCLOAK_ADMIN_CLIENT_SECRET'), deserialize_json=False),
+        'keycloak_url': Variable.get('keycloak_url', default_var=os.getenv('KEYCLOAK_URL', '')),
+        'keycloak_realm': Variable.get('keycloak_realm', default_var=os.getenv('KEYCLOAK_REALM', '')),
+        'keycloak_client_id': Variable.get('keycloak_admin_client_id', default_var=os.getenv('KEYCLOAK_ADMIN_CLIENT_ID', '')),
+        'keycloak_client_secret': Variable.get('keycloak_admin_client_secret', default_var=os.getenv('KEYCLOAK_ADMIN_CLIENT_SECRET', ''), deserialize_json=False),
         'keycloak_verify_ssl': parse_bool_config(Variable.get('keycloak_verify_ssl', default_var=os.getenv('KEYCLOAK_VERIFY_SSL', 'false')), default=False),
         'keycloak_cacert': Variable.get('keycloak_cacert', default_var=os.getenv('KEYCLOAK_CACERT', '')),
         'smtp_conn_id': Variable.get('policy_smtp_conn_id', default_var=os.getenv('POLICY_SMTP_CONN_ID', 'smtp_default')),
@@ -108,6 +119,10 @@ def get_config() -> dict:
         'tracking_location': Variable.get('policy_tracking_location', default_var=os.getenv('POLICY_TRACKING_LOCATION', 's3a://data-lake/policy_tracking')),
         'report_output_location': Variable.get('policy_report_location', default_var=os.getenv('POLICY_REPORT_LOCATION', 's3a://data-lake/policy_reports'))
     }
+    conf_email = _get_conf_value("email_recipients")
+    if conf_email:
+        cfg['email_recipients'] = conf_email
+    return cfg
 
 def parse_permission_string(permissions: str) -> List[str]:
     """Parse permission string into list."""
@@ -987,7 +1002,8 @@ with DAG(
     catchup=False,
     tags=['ranger', 'keycloak', 'security', 'policy-automation'],
     params={
-        'excel_file_path': 's3a://your-bucket/configs/ranger_policies.xlsx'
+        'excel_file_path': 's3a://your-bucket/configs/ranger_policies.xlsx',
+        'run_id': '',
     }
 ) as dag:
 
@@ -2132,7 +2148,7 @@ with DAG(
     # -----------------------------
     # DAG flow
     # -----------------------------
-    excel_path = "{{ params.excel_file_path }}"
+    excel_path = "{{ dag_run.conf.excel_file_path | default(params.excel_file_path) }}"
     dag_run_identifier = "{{ run_id }}"
 
     init_tables = init_policy_tracking_tables()
