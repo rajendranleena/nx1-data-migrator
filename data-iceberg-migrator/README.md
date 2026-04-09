@@ -21,39 +21,39 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 
 ### Required Variables
 
-| Variable                      | Description                                     | Example                              |
-| ----------------------------- | ----------------------------------------------- | ------------------------------------ |
-| `cluster_ssh_conn_id`         | Airflow SSH connection ID for cluster edge node | `cluster_edge_ssh`                   |
-| `migration_default_s3_bucket` | Default S3 bucket for migrations                | `s3a://data-lake`                    |
-| `migration_tracking_database` | Database name for tracking tables               | `migration_tracking`                 |
-| `migration_tracking_location` | S3 location for tracking tables                 | `s3a://data-lake/migration_tracking` |
-| `migration_report_location`   | S3 location for HTML reports                    | `s3a://data-lake/migration_reports`  |
-| `migration_spark_conn_id`     | Airflow Spark connection ID                     | `spark_default`                      |
+| Variable                      | Description                                     | Example                              | Applies To                                            |
+| ----------------------------- | ----------------------------------------------- | ------------------------------------ | ----------------------------------------------------- |
+| `cluster_ssh_conn_id`         | Airflow SSH connection ID for cluster edge node | `cluster_edge_ssh`                   | `mapr_to_s3_migration`, `folder_only_data_copy`       |
+| `migration_default_s3_bucket` | Default S3 bucket for migrations                | `s3a://data-lake`                    | `mapr_to_s3_migration`, `s3_to_s3_metadata_migration` |
+| `migration_tracking_database` | Database name for tracking tables               | `migration_tracking`                 | All DAGs                                              |
+| `migration_tracking_location` | S3 location for tracking tables                 | `s3a://data-lake/migration_tracking` | All DAGs                                              |
+| `migration_report_location`   | S3 location for HTML reports                    | `s3a://data-lake/migration_reports`  | All DAGs                                              |
+| `migration_spark_conn_id`     | Airflow Spark connection ID                     | `spark_default`                      | Currently unused                |
 
 ### Authentication Variables
 
-| Variable                   | Description                                       | Required For           |
-| -------------------------- | ------------------------------------------------- | ---------------------- |
-| `auth_method`              | Authentication method: `mapr`, `kinit`, or `none` | MapR/Kerberos          |
-| `mapr_user`                | MapR username used to validate existing ticket    | MapR auth              |
-| `mapr_ticketfile_location` | MapR ticket file path                             | MapR auth              |
-| `kinit_principal`          | Kerberos principal                                | Kerberos auth          |
-| `kinit_keytab`             | Path to Kerberos keytab file                      | Kerberos keytab auth   |
-| `kinit_password`           | Kerberos password                                 | Kerberos password auth |
+| Variable                   | Description                                       | Required For           | Applies To                                            |
+| -------------------------- | ------------------------------------------------- | ---------------------- | ----------------------------------------------------- |
+| `auth_method`              | Authentication method: `mapr`, `kinit`, or `none` | MapR/Kerberos          | `mapr_to_s3_migration`, `folder_only_data_copy`       |
+| `mapr_user`                | MapR username used to validate existing ticket    | MapR auth              | `mapr_to_s3_migration`, `folder_only_data_copy`       |
+| `mapr_ticketfile_location` | MapR ticket file path                             | MapR auth              | `mapr_to_s3_migration`, `folder_only_data_copy`       |
+| `kinit_principal`          | Kerberos principal                                | Kerberos auth          | `mapr_to_s3_migration`, `folder_only_data_copy`       |
+| `kinit_keytab`             | Path to Kerberos keytab file                      | Kerberos keytab auth   | `mapr_to_s3_migration`, `folder_only_data_copy`       |
+| `kinit_password`           | Kerberos password                                 | Kerberos password auth | `mapr_to_s3_migration`, `folder_only_data_copy`       |
 
 ### Optional Variables
 
-| Variable                     | Default          | Description                                  |
-| ---------------------------- | ---------------- | -------------------------------------------- |
-| `cluster_edge_temp_path`     | `/tmp/migration` | Temporary directory on edge node             |
-| `s3_endpoint`                | _(empty)_        | Default S3 endpoint URL (all buckets)        |
-| `s3_access_key`              | _(empty)_        | Default S3 access key (all buckets)          |
-| `s3_secret_key`              | _(empty)_        | Default S3 secret key (all buckets)          |
-| `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                     |
-| `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)            |
-| `s3_listing_tool`            | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`     |
-| `migration_smtp_conn_id`     | `smtp_default`   | Airflow SMTP connection ID for email reports |
-| `migration_email_recipients` | _(empty)_        | Comma-separated email addresses for reports  |
+| Variable                     | Default          | Description                                  | Applies To                                                                            |
+| ---------------------------- | ---------------- | -------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `cluster_edge_temp_path`     | `/tmp/migration` | Temporary directory on edge node             | `mapr_to_s3_migration`, `folder_only_data_copy`                                       |
+| `s3_endpoint`                | _(empty)_        | Default S3 endpoint URL (all buckets)        | `mapr_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
+| `s3_access_key`              | _(empty)_        | Default S3 access key (all buckets)          | `mapr_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
+| `s3_secret_key`              | _(empty)_        | Default S3 secret key (all buckets)          | `mapr_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
+| `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                     | `mapr_to_s3_migration`, `folder_only_data_copy`                                       |
+| `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)            | `mapr_to_s3_migration`, `folder_only_data_copy`                                       |
+| `s3_listing_tool`            | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`     | Currently unused                                                                      |
+| `migration_smtp_conn_id`     | `smtp_default`   | Airflow SMTP connection ID for email reports | All DAGs                                                                              |
+| `migration_email_recipients` | _(empty)_        | Comma-separated email addresses for reports  | All DAGs                                                                              |
 
 ### Multi-Tenant S3 Credentials (endpoint-based overrides)
 
