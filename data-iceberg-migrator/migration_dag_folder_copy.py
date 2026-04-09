@@ -263,9 +263,9 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
 
         dest_bucket = normalize_s3(raw_bucket)
 
-        raw_dest_folder = str(row.get('dest_folder', '') or '').strip()
-        # Default dest_folder to the basename of source_path when not specified
-        dest_folder = raw_dest_folder if raw_dest_folder else os.path.basename(source_path.rstrip('/'))
+        raw_val = row.get('dest_folder', '')
+        dest_folder = '' if ps.isna(raw_val) else str(raw_val).strip().strip('/')
+        dest_folder = dest_folder or os.path.basename(source_path.rstrip('/'))
 
         raw_endpoint = row.get('endpoint', '')
         dest_endpoint = '' if (raw_endpoint is None or str(raw_endpoint).strip().lower() in ('', 'nan', 'none')) else str(raw_endpoint).strip()
