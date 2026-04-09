@@ -38,6 +38,7 @@ PROJECTS = {
             ("utils/__init__.py", "utils/__init__.py"),
             ("utils/migrations/__init__.py", "utils/migrations/__init__.py"),
             ("utils/migrations/shared.py", "utils/migrations/shared.py"),
+            ("utils/migrations/partition_utils.py", "utils/migrations/partition_utils.py"),
             (
                 "utils/migrations/metadata_strategies/__init__.py",
                 "utils/migrations/metadata_strategies/__init__.py",

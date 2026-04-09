@@ -6,7 +6,7 @@ import re
 import urllib
 
 
-def apply_partition_filter(partitions: list, filter_expr) -> list:
+def apply_partition_filter(partitions, filter_expr):
     """Filter Hive partition strings against a filter expression."""
 
     if not filter_expr:
@@ -50,29 +50,41 @@ def apply_partition_filter(partitions: list, filter_expr) -> list:
 
         op_match = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)(>=|<=|>|<)(.+)$', term.strip())
         if op_match:
-            key, op, threshold = op_match.group(1), op_match.group(2), op_match.group(3).strip()
+            key = op_match.group(1)
+            op = op_match.group(2)
+            threshold_raw = op_match.group(3).strip()
+            threshold_is_prefix = threshold_raw.endswith('*')
+            threshold = threshold_raw.rstrip('*')
             threshold_cmp = try_numeric(threshold)
             for p in partitions:
                 pdict = parse_partition(p)
                 if key not in pdict:
                     continue
-                pval_cmp = try_numeric(pdict[key])
+                pval = pdict[key]
+                pval_for_cmp = pval[:len(threshold)] if threshold_is_prefix else pval
+                pval_cmp = try_numeric(pval_for_cmp)
                 try:
-                    if op == '>=' and pval_cmp >= threshold_cmp or op == '<=' and pval_cmp <= threshold_cmp or op == '>' and pval_cmp > threshold_cmp or op == '<' and pval_cmp < threshold_cmp:  # noqa: SIM114
+                    if (  # noqa: SIM114
+                        (op == '>=' and pval_cmp >= threshold_cmp)
+                        or (op == '<=' and pval_cmp <= threshold_cmp)
+                        or (op == '>'  and pval_cmp >  threshold_cmp)
+                        or (op == '<'  and pval_cmp <  threshold_cmp)
+                    ):
                         matched.add(p)
                 except TypeError:
-                    if op == '>=' and str(pdict[key]) >= str(threshold) or op == '<=' and str(pdict[key]) <= str(threshold) or op == '>' and str(pdict[key]) > str(threshold) or op == '<' and str(pdict[key]) < str(threshold):  # noqa: SIM114
+                    if (  # noqa: SIM114
+                        (op == '>=' and pval_for_cmp >= threshold)
+                        or (op == '<=' and pval_for_cmp <= threshold)
+                        or (op == '>'  and pval_for_cmp >  threshold)
+                        or (op == '<'  and pval_for_cmp <  threshold)
+                    ):
                         matched.add(p)
             continue
-
-        # unrecognised term — log and skip (can't use logger here, print to stderr)
-        import sys
-        print(f"[PartitionFilter] Unrecognised filter term '{term}' — skipping.", file=sys.stderr)
 
     return [p for p in partitions if p in matched]
 
 
-def partitions_to_where_clause(partitions: list) -> str:
+def partitions_to_where_clause(partitions):
     """Convert partition strings to a SQL WHERE clause. Values are single-quote escaped."""
     if not partitions:
         return "1=0"
@@ -82,9 +94,7 @@ def partitions_to_where_clause(partitions: list) -> str:
         for segment in part_str.split('/'):
             if '=' in segment:
                 k, _, v = segment.partition('=')
-                safe_k = k.strip()
-                safe_v = v.strip().replace("'", "''")
-                conditions.append(f"`{safe_k}`='{safe_v}'")
+                conditions.append("`%s`='%s'" % (k.strip(), v.replace("'", "''").strip()))
         if conditions:
             clauses.append("(" + " AND ".join(conditions) + ")")
     return " OR ".join(clauses) if clauses else "1=1"

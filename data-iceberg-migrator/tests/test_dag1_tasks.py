@@ -413,9 +413,7 @@ class TestRunDistcpSsh:
                 ti=MagicMock(),
             )
 
-    def test_partition_filter_active_uses_pathlist_mode(self, mock_ssh_hook, sample_discovery):
-        """When partition_filter_active=True and filtered_partitions is non-empty,
-        DistCp must be invoked via a PATHLIST file, not a bare source path."""
+    def test_partition_filter_active_uses_per_partition_distcp(self, mock_ssh_hook, sample_discovery):
         hook, client, _, _ = mock_ssh_hook
         stderr = MagicMock()
         stderr.read.return_value = b''
@@ -445,9 +443,21 @@ class TestRunDistcpSsh:
         )
         assert result['distcp_results'][0]['status'] == 'COMPLETED'
         assert result['distcp_results'][0]['partition_filter_active'] is True
-        # The pathlist command includes the PATHLIST sentinel
+
         ssh_cmd = client.exec_command.call_args[0][0]
-        assert 'PATHLIST' in ssh_cmd
+
+        assert 'PATHLIST' not in ssh_cmd
+
+        source_loc = sample_discovery['tables'][0]['source_location']
+        s3_loc = sample_discovery['tables'][0]['s3_location']
+        for part in ['dt=2024-01-01', 'dt=2024-01-02']:
+            expected_src = f'"{source_loc}/{part}"'
+            expected_dst = f'"{s3_loc}/{part}"'
+            assert expected_src in ssh_cmd, f"Expected source partition path {expected_src} not found in SSH command"
+            assert expected_dst in ssh_cmd, f"Expected dest partition path {expected_dst} not found in SSH command"
+
+        assert s3_loc in ssh_cmd
+        assert 'PARTITIONS_REQUESTED=2' in ssh_cmd
 
     def test_zero_filtered_partitions_skips_table(self, mock_ssh_hook, sample_discovery):
         """If partition_filter_active=True but filtered_partitions=[], table must be SKIPPED
