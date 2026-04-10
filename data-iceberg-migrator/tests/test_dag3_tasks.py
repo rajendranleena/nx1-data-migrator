@@ -115,6 +115,28 @@ class TestParseFolderCopyExcel:
         configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
         assert configs[0]['dest_folder'] == 'mydir'
 
+    @pytest.mark.parametrize("empty_val", [None, float('nan')])
+    def test_empty_dest_folder_defaults_to_source_basename(self, mock_spark, sample_folder_run_id, empty_val):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'source_path': '/mapr/cluster1/data/raw/sales', 'target_bucket': 's3a://bkt', 'dest_folder': empty_val},
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
+        assert configs[0]['dest_folder'] == 'sales'
+
+    def test_dest_folder_with_only_whitespace_defaults_to_source_basename(self, mock_spark, sample_folder_run_id):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'source_path': '/data/raw/reports/', 'target_bucket': 's3a://bkt', 'dest_folder': '   '},
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
+        assert configs[0]['dest_folder'] == 'reports'
+
+    def test_leading_slash_stripped_from_dest_folder(self, mock_spark, sample_folder_run_id):
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'source_path': '/data/sales', 'target_bucket': 's3a://bkt', 'dest_folder': '/temp'},
+        ]))
+        configs = m.parse_folder_copy_excel.function('s3a://b/f.xlsx', sample_folder_run_id, spark=mock_spark)
+        assert configs[0]['dest_folder'] == 'temp'
+
     def test_endpoint_emitted_when_present(self, mock_spark, sample_folder_run_id):
         setup_spark_excel(mock_spark, make_excel_bytes([
             {'source_path': '/data/sales', 'target_bucket': 's3a://bkt', 'dest_folder': 'sales',
