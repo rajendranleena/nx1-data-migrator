@@ -398,7 +398,7 @@ def validate_bucket_endpoint_pairs(grouped: dict, config: dict) -> None:
     errors = []
     checked: set = set()
 
-    for (src_db, _dest_db, bucket_val, endpoint_val), _group in grouped.items():
+    for (src_db, _dest_db, bucket_val, endpoint_val, _partition_filter), _group in grouped.items():
         if not endpoint_val:
             continue
 

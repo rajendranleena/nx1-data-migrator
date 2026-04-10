@@ -177,6 +177,37 @@ class TestParseExcel:
         assert len(result) == 1
         assert set(result[0]['table_tokens']) == {'tbl_a', 'tbl_b'}
 
+    def test_partition_filter_emitted_in_config(self, mock_spark):
+        """partition_filter column is parsed and passed through to the config."""
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': '*', 'dest database': '',
+             'bucket': 's3a://bkt', 'partition_filter': 'dt>=2024-01-01'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert result[0]['partition_filter'] == 'dt>=2024-01-01'
+
+    def test_partition_filter_defaults_to_none_when_absent(self, mock_spark):
+        """Rows without a partition_filter column emit None."""
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': '*', 'dest database': '', 'bucket': 's3a://bkt'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert result[0]['partition_filter'] is None
+
+    def test_same_db_different_partition_filter_produces_two_configs(self, mock_spark):
+        """Two rows for the same db/bucket but different partition_filter values
+        must NOT be merged — partition_filter is part of the grouping key."""
+        setup_spark_excel(mock_spark, make_excel_bytes([
+            {'database': 'db1', 'table': 'tbl_a', 'dest database': 'db1_s3',
+             'bucket': 's3a://data-lake', 'partition_filter': 'dt>=2024-01-01'},
+            {'database': 'db1', 'table': 'tbl_b', 'dest database': 'db1_s3',
+             'bucket': 's3a://data-lake', 'partition_filter': 'dt>=2024-06-01'},
+        ]))
+        result = m.parse_excel.function('s3a://bucket/f.xlsx', 'run_test', spark=mock_spark)
+        assert len(result) == 2
+        filters = {r['partition_filter'] for r in result}
+        assert filters == {'dt>=2024-01-01', 'dt>=2024-06-01'}
+
 
 # ---------------------------------------------------------------------------
 # cluster_login_setup
@@ -229,6 +260,11 @@ class TestDiscoverTablesViaSshSpark:
             'row_count': 500, 'is_partitioned': False,
             'unregistered_partitions': False, 'table_type': 'EXTERNAL',
             'source_total_size_bytes': 1024, 'source_file_count': 1,
+            'serde_properties': {},
+            'partition_filter': None, 'filtered_partitions': [],
+            'partition_filter_active': False, 'filtered_row_count': 500,
+            'filtered_source_size_bytes': 1024, 'filtered_file_count': 1,
+            'full_table_row_count': 500, 'full_table_partition_count': 0,
         }]
         # First exec_command: mkdir, second: pyspark
         mkdir_stdout = mock_ssh_stdout(0, b'')
@@ -295,7 +331,12 @@ class TestDiscoverTablesViaSshSpark:
             'partition_columns': '', 'partition_count': 0, 'row_count': 0,
             'is_partitioned': False, 'unregistered_partitions': False,
             'table_type': 'UNKNOWN', 'source_total_size_bytes': 0,
-            'source_file_count': 0, 'error': 'Table not found',
+            'source_file_count': 0, 'serde_properties': {},
+            'partition_filter': None, 'filtered_partitions': [],
+            'partition_filter_active': False, 'filtered_row_count': 0,
+            'filtered_source_size_bytes': 0, 'filtered_file_count': 0,
+            'full_table_row_count': 0, 'full_table_partition_count': 0,
+            'error': 'Table not found',
         }]
         mkdir_stdout = mock_ssh_stdout(0, b'')
         pyspark_stdout = mock_ssh_stdout(0, self._make_discovery_output(json.dumps(metadata)))
@@ -375,6 +416,80 @@ class TestRunDistcpSsh:
                 ti=MagicMock(),
             )
 
+    def test_partition_filter_active_uses_per_partition_distcp(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+        )
+
+        filtered_discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'partition_filter': 'dt>=2024-01-01',
+                'filtered_partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
+                'partition_filter_active': True,
+                'filtered_row_count': 500,
+                'filtered_source_size_bytes': 5 * 1024 * 1024,
+                'filtered_file_count': 2,
+                'full_table_row_count': 1000,
+                'full_table_partition_count': 2,
+                'serde_properties': {},
+            }],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            discovery=filtered_discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        assert result['distcp_results'][0]['status'] == 'COMPLETED'
+        assert result['distcp_results'][0]['partition_filter_active'] is True
+
+        ssh_cmd = client.exec_command.call_args[0][0]
+
+        assert 'PATHLIST' not in ssh_cmd
+
+        source_loc = sample_discovery['tables'][0]['source_location']
+        s3_loc = sample_discovery['tables'][0]['s3_location']
+        for part in ['dt=2024-01-01', 'dt=2024-01-02']:
+            expected_src = f'"{source_loc}/{part}"'
+            expected_dst = f'"{s3_loc}/{part}"'
+            assert expected_src in ssh_cmd, f"Expected source partition path {expected_src} not found in SSH command"
+            assert expected_dst in ssh_cmd, f"Expected dest partition path {expected_dst} not found in SSH command"
+
+        assert s3_loc in ssh_cmd
+        assert 'PARTITIONS_REQUESTED=2' in ssh_cmd
+
+    def test_zero_filtered_partitions_skips_table(self, mock_ssh_hook, sample_discovery):
+        """If partition_filter_active=True but filtered_partitions=[], table must be SKIPPED
+        without calling SSH at all."""
+        hook, client, _, _ = mock_ssh_hook
+
+        empty_filter_discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'partition_filter': 'dt>=2099-01-01',
+                'filtered_partitions': [],
+                'partition_filter_active': True,
+                'filtered_row_count': 0,
+                'filtered_source_size_bytes': 0,
+                'filtered_file_count': 0,
+                'full_table_row_count': 1000,
+                'full_table_partition_count': 2,
+                'serde_properties': {},
+            }],
+        }
+        result = m.run_distcp_ssh.function.__wrapped__(
+            discovery=empty_filter_discovery,
+            cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+            ti=MagicMock(),
+        )
+        assert result['distcp_results'][0]['status'] == 'SKIPPED'
+        client.exec_command.assert_not_called()
+
 
 class TestUpdateDistcpStatus:
 
@@ -408,6 +523,37 @@ class TestCreateHiveTables:
         )
         assert result['table_results'][0]['existed'] is True
 
+    def test_partition_filter_active_uses_add_partition_not_msck(self, mock_spark, sample_distcp_result):
+        """When partition_filter_active=True, table creation must use
+        ALTER TABLE ADD PARTITION per filtered partition, not MSCK REPAIR."""
+        # Inject a filtered table into the distcp result
+        sample_distcp_result['tables'][0].update({
+            'partition_filter': 'dt>=2024-01-01',
+            'filtered_partitions': ['dt=2024-01-01'],
+            'partition_filter_active': True,
+        })
+        sample_distcp_result['distcp_results'][0]['status'] = 'COMPLETED'
+
+        sql_calls = []
+        def recording_sql(sql):
+            sql_calls.append(sql)
+            # Make DESCRIBE raise to simulate table not existing yet
+            if sql.strip().upper().startswith('DESCRIBE') and 'FORMATTED' not in sql.upper():
+                raise Exception("Table not found")
+            df = MagicMock()
+            df.collect.return_value = []
+            return df
+
+        mock_spark.sql.side_effect = recording_sql
+
+        m.create_hive_tables.function.__wrapped__(
+            distcp_result=sample_distcp_result, spark=mock_spark, ti=MagicMock(),
+        )
+
+        all_sql = ' '.join(sql_calls).upper()
+        assert 'ADD IF NOT EXISTS' in all_sql or 'ADD PARTITION' in all_sql
+        assert 'MSCK REPAIR' not in all_sql
+
 
 class TestUpdateTableCreateStatus:
 
@@ -426,7 +572,10 @@ class TestValidateDestinationTables:
         }[k]
         return row
 
-    def _make_router(self, dest_count):
+    def _make_router(self, dest_count, partition_filter=None):
+        _pf = partition_filter
+        _filtered_parts = ['dt=2024-01-01', 'dt=2024-01-02']
+
         def sql_router(sql):
             df = MagicMock()
             sql_lower = sql.strip().lower()
@@ -434,7 +583,11 @@ class TestValidateDestinationTables:
                 df.collect.return_value = [self._make_tracking_row()]
             elif 'source_row_count' in sql_lower:
                 r = MagicMock()
-                r.__getitem__ = lambda self, k: {'source_row_count': 1000, 'source_partition_count': 2}[k]
+                r.__getitem__ = lambda self, k: {
+                    'source_row_count': 1000,
+                    'source_partition_count': len(_filtered_parts) if _pf else 2,
+                    'partition_filter': _pf,
+                }[k]
                 df.collect.return_value = [r]
             elif 'count(*)' in sql_lower and 'as c' in sql_lower:
                 r = MagicMock()
@@ -468,6 +621,31 @@ class TestValidateDestinationTables:
             source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
         )
         assert result['validation_results'][0]['row_count_match'] is False
+
+    def test_validates_scoped_to_filtered_partitions_when_filter_active(
+        self, mock_spark, sample_table_result
+    ):
+        """When partition_filter is active, the validation COUNT(*) must use a
+        WHERE clause scoped to the filtered partitions, not a full-table scan."""
+        sample_table_result['tables'][0].update({
+            'partition_filter': 'dt>=2024-01-01',
+            'filtered_partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
+            'partition_filter_active': True,
+            'full_table_row_count': 1000,
+            'full_table_partition_count': 2,
+            'serde_properties': {},
+        })
+        mock_spark.sql.side_effect = self._make_router(1000, partition_filter='dt>=2024-01-01')
+        result = m.validate_destination_tables.function.__wrapped__(
+            source_validation=sample_table_result, spark=mock_spark, ti=MagicMock(),
+        )
+        # Confirm the scoped COUNT(*) with WHERE was issued
+        sql_calls = [str(c) for c in mock_spark.sql.call_args_list]
+        count_calls = [c for c in sql_calls if 'count(*)' in c.lower() and 'as c' in c.lower()]
+        assert any('WHERE' in c for c in count_calls), (
+            "Expected a scoped COUNT(*) with WHERE clause for filtered partitions"
+        )
+        assert result['validation_results'][0]['row_count_match'] is True
 
 
 class TestUpdateValidationStatus:
@@ -503,6 +681,8 @@ class TestGenerateHtmlReport:
             s3_files_transferred=5, file_count_match=True,
             distcp_status='COMPLETED',
             file_format='PARQUET',
+            partition_filter=None,
+            filtered_partition_count=None,
         )
         vs_row = MagicMock()
         vs_row.__getitem__ = lambda self, k: 1
@@ -522,6 +702,15 @@ class TestGenerateHtmlReport:
                 df.collect.return_value = [tbl_row]
             elif 'sum(case when row_count_match' in sl:
                 df.collect.return_value = [vs_row]
+            elif 'sum(case when file_size_match' in sl:
+                fm_row = MagicMock()
+                fm_row.tables_size_match = 1
+                fm_row.tables_size_mismatch = 0
+                fm_row.tables_file_count_match = 1
+                fm_row.tables_file_count_mismatch = 0
+                fm_row.total_source_bytes = 10 * 1024 * 1024
+                fm_row.total_dest_bytes = 10 * 1024 * 1024
+                df.collect.return_value = [fm_row]
             else:
                 df.collect.return_value = []
             return df

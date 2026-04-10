@@ -9,7 +9,7 @@ import migration_dag_metadata as m4
 class TestMaprToS3DagIntegrity:
 
     def test_dag_loads_with_correct_id(self):
-        assert m1.dag_mapr_to_s3.dag_id == 'mapr_to_s3_migration'
+        assert m1.dag_mapr_to_s3.dag_id == 'source_to_s3_migration'
 
     def test_excel_param_defined(self):
         assert 'excel_file_path' in m1.dag_mapr_to_s3.params

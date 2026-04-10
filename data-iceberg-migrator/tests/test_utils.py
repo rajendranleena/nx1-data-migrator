@@ -6,7 +6,7 @@ Tests for shared utility functions:
 """
 
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import utils.migrations.shared as m
@@ -262,3 +262,159 @@ class TestComputeDestPath:
             dest_s3_prefix='s3a://dest-bucket/data',
         )
         assert result == 's3a://dest-bucket/dest_db/tbl'
+
+# ---------------------------------------------------------------------------
+# cell_str
+# ---------------------------------------------------------------------------
+class TestCellStr:
+
+    def test_returns_stripped_string(self):
+        assert m.cell_str('  hello  ') == 'hello'
+
+    def test_returns_default_for_none(self):
+        assert m.cell_str(None) == ''
+        assert m.cell_str(None, default='N/A') == 'N/A'
+
+    def test_returns_default_for_nan(self):
+        assert m.cell_str(float('nan')) == ''
+        assert m.cell_str(float('nan'), default='EMPTY') == 'EMPTY'
+
+    def test_returns_default_for_blank_string(self):
+        assert m.cell_str('   ') == ''
+        assert m.cell_str('   ', default='EMPTY') == 'EMPTY'
+
+    def test_converts_int_and_float(self):
+        assert m.cell_str(42) == '42'
+        assert m.cell_str(3.14) == '3.14'
+
+
+# ---------------------------------------------------------------------------
+# normalize_s3
+# ---------------------------------------------------------------------------
+class TestNormalizeS3:
+
+    def test_s3n_prefix_converted(self):
+        assert m.normalize_s3('s3n://bucket/key') == 's3a://bucket/key'
+
+    def test_s3_prefix_converted(self):
+        assert m.normalize_s3('s3://bucket/key') == 's3a://bucket/key'
+
+    def test_s3a_prefix_unchanged(self):
+        assert m.normalize_s3('s3a://bucket/key') == 's3a://bucket/key'
+
+    def test_no_prefix_gets_s3a_prepended(self):
+        assert m.normalize_s3('bucket/key') == 's3a://bucket/key'
+
+    def test_empty_string_returned_as_is(self):
+        assert m.normalize_s3('') == ''
+
+    def test_none_returned_as_is(self):
+        assert m.normalize_s3(None) is None
+
+
+# ---------------------------------------------------------------------------
+# validate_bucket_endpoint_pairs — boto3-independent paths
+# ---------------------------------------------------------------------------
+class TestValidateBucketEndpointPairs:
+
+    def _make_grouped(self, bucket='s3a://data-lake', endpoint='https://s3.example.com', src_db='sales'):
+        return {(src_db, 'dest_db', bucket, endpoint, None): {'tokens': []}}
+
+    def test_skips_silently_when_boto3_unavailable(self):
+        import builtins
+        real_import = builtins.__import__
+        def mock_import(name, *args, **kwargs):
+            if name == 'boto3':
+                raise ImportError('no boto3')
+            return real_import(name, *args, **kwargs)
+        with patch('builtins.__import__', side_effect=mock_import):
+            m.validate_bucket_endpoint_pairs(self._make_grouped(), {})  # must not raise
+
+    def test_rows_with_no_endpoint_are_skipped(self):
+        grouped = {('db', 'dest_db', 's3a://bucket', '', None): {'tokens': []}}
+        import builtins
+        real_import = builtins.__import__
+        def mock_import(name, *args, **kwargs):
+            if name == 'boto3':
+                raise ImportError('no boto3')
+            return real_import(name, *args, **kwargs)
+        with patch('builtins.__import__', side_effect=mock_import):
+            m.validate_bucket_endpoint_pairs(grouped, {})  # no endpoint → skipped, no raise
+
+    def _inject_boto3(self, s3_client_mock, fake_client_error_cls):
+        import sys
+        import types
+
+        boto3_mod = types.ModuleType('boto3')
+        boto3_mod.client = MagicMock(return_value=s3_client_mock)
+
+        botocore_mod = types.ModuleType('botocore')
+        botocore_exc_mod = types.ModuleType('botocore.exceptions')
+        botocore_exc_mod.ClientError = fake_client_error_cls
+        botocore_mod.exceptions = botocore_exc_mod
+
+        return patch.dict(sys.modules, {
+            'boto3': boto3_mod,
+            'botocore': botocore_mod,
+            'botocore.exceptions': botocore_exc_mod,
+        })
+
+    def test_deduplicates_same_bucket_endpoint_pair(self):
+        """Same (bucket, endpoint) pair appearing in two rows is only validated once."""
+        s3_client_mock = MagicMock()
+        s3_client_mock.head_bucket.return_value = {}
+
+        class _CE(Exception):
+            pass
+
+        grouped = {
+            ('db1', 'dest1', 's3a://bucket', 'https://ep.com', None): {},
+            ('db2', 'dest2', 's3a://bucket', 'https://ep.com', None): {},
+        }
+        with self._inject_boto3(s3_client_mock, _CE), \
+             patch('airflow.models.Variable.get', return_value=''):
+            m.validate_bucket_endpoint_pairs(grouped, {})
+
+        assert s3_client_mock.head_bucket.call_count == 1
+
+    def test_raises_on_missing_bucket(self):
+        """404/NoSuchBucket causes a validation Exception listing the failure."""
+
+        class FakeClientError(Exception):
+            def __init__(self, *a, **kw):
+                self.response = {'Error': {'Code': 'NoSuchBucket'}}
+
+        s3_client_mock = MagicMock()
+        s3_client_mock.head_bucket.side_effect = FakeClientError()
+
+        with self._inject_boto3(s3_client_mock, FakeClientError), \
+             patch('airflow.models.Variable.get', return_value=''), \
+             pytest.raises(Exception, match='validation failed'):
+            m.validate_bucket_endpoint_pairs(self._make_grouped(), {})
+
+    def test_403_access_denied_does_not_raise(self):
+        """403 means bucket exists but creds lack full access — should warn and continue."""
+
+        class FakeClientError(Exception):
+            def __init__(self, *a, **kw):
+                self.response = {'Error': {'Code': '403'}}
+
+        s3_client_mock = MagicMock()
+        s3_client_mock.head_bucket.side_effect = FakeClientError()
+
+        with self._inject_boto3(s3_client_mock, FakeClientError), \
+             patch('airflow.models.Variable.get', return_value=''):
+            m.validate_bucket_endpoint_pairs(self._make_grouped(), {})
+
+    def test_general_connection_error_raises(self):
+        """Any non-ClientError (e.g. network timeout) is collected and raised."""
+        class _CE(Exception):
+            pass
+
+        s3_client_mock = MagicMock()
+        s3_client_mock.head_bucket.side_effect = ConnectionError('timeout')
+
+        with self._inject_boto3(s3_client_mock, _CE), \
+             patch('airflow.models.Variable.get', return_value=''), \
+             pytest.raises(Exception, match='validation failed'):
+            m.validate_bucket_endpoint_pairs(self._make_grouped(), {})

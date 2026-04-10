@@ -22,6 +22,9 @@ from airflow.decorators import task
 from airflow.models.param import Param
 from airflow.providers.ssh.hooks.ssh import SSHHook
 from dotenv import load_dotenv
+from utils.migrations.partition_utils import (
+    partitions_to_where_clause as _partitions_to_where_clause,
+)
 from utils.migrations.shared import (
     SSH_COMMAND_TIMEOUT,
     build_s3_opts,
@@ -253,6 +256,10 @@ def init_tracking_tables(spark) -> dict:
                 s3_files_transferred BIGINT,
                 file_size_match BOOLEAN,
                 file_count_match BOOLEAN,
+                partition_filter STRING,
+                filtered_partition_count INT,
+                full_table_row_count BIGINT,
+                full_table_partition_count INT,
                 discovery_status STRING,
                 discovery_completed_at TIMESTAMP,
                 discovery_duration_seconds DOUBLE,
@@ -321,6 +328,7 @@ def create_migration_run(excel_file_path: str, dag_run_id: str, spark) -> str:
 @task.pyspark(conn_id='spark_default')
 def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     """Read Excel config from S3 using pandas.read_excel."""
+    import math
     from io import BytesIO
 
     import pandas as ps
@@ -341,6 +349,13 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         if not src_db:
             continue
 
+        raw_pf = row.get('partition_filter', '')
+        partition_filter = None
+        if raw_pf is not None and not (isinstance(raw_pf, float) and math.isnan(raw_pf)):
+            stripped = str(raw_pf).strip()
+            if stripped and stripped.lower() not in ('', 'nan', 'none'):
+                partition_filter = stripped
+
         raw_cell_val = row.get('table', '')
         raw_cell = '*' if (raw_cell_val is None or (isinstance(raw_cell_val, float) and __import__('math').isnan(raw_cell_val)) or str(raw_cell_val).strip().lower() in ('', 'nan')) else str(raw_cell_val).strip() or '*'
         dest_db_val = row.get('dest_database', '')
@@ -352,10 +367,25 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
         raw_endpoint_val = row.get('endpoint', '')
         endpoint_val = '' if (raw_endpoint_val is None or (isinstance(raw_endpoint_val, float) and __import__('math').isnan(raw_endpoint_val)) or str(raw_endpoint_val).strip().lower() in ('', 'nan')) else str(raw_endpoint_val).strip()
 
+        if '*' in [t.strip() for t in raw_cell.split(',')] and partition_filter:
+            logger.warning(
+                f"[ParseExcel] Wildcard '*' combined with partition_filter='{partition_filter}' "
+                f"in {src_db}. Wildcard will be expanded per-table with filter applied to each."
+            )
+
+        # Warn if comma-separated tables used with a filter
+        tokens_in_row = [t.strip() for t in raw_cell.split(',') if t.strip()]
+        if len(tokens_in_row) > 1 and partition_filter:
+            logger.warning(
+                f"[ParseExcel] Comma-separated tables {tokens_in_row} combined with "
+                f"partition_filter='{partition_filter}' in {src_db}. "
+                f"Each table will inherit the same filter."
+            )
+
         # Grouping key includes endpoint so same bucket on different tenants gets separate task instances
-        key = (src_db, dest_db, bucket_val, endpoint_val)
+        key = (src_db, dest_db, bucket_val, endpoint_val, partition_filter)
         if key not in grouped:
-            grouped[key] = {'bucket': bucket_val, 'endpoint': endpoint_val, 'tokens': []}
+            grouped[key] = {'bucket': bucket_val, 'endpoint': endpoint_val, 'tokens': [], 'partition_filter': partition_filter}
 
         for tok in raw_cell.split(','):
             tok = tok.strip()
@@ -365,17 +395,19 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
     validate_bucket_endpoint_pairs(grouped, config)
     configs = []
 
-    for (src_db, dest_db, bucket_val, endpoint_val), group in grouped.items():
+    for (src_db, dest_db, bucket_val, endpoint_val, partition_filter), group in grouped.items():
         unique_tokens = list(dict.fromkeys(group['tokens']))
         if '*' in unique_tokens:
             unique_tokens = ['*']
 
         bucket_val = group['bucket']
         endpoint_val = group['endpoint']
+        partition_filter = group['partition_filter']
 
         logger.info(
             f"[ParseExcel] {src_db} -> dest={dest_db} | bucket={bucket_val}"
             + (f" | endpoint={endpoint_val}" if endpoint_val else "")
+            + (f" | partition_filter={partition_filter}" if partition_filter else "")
             + f" | tokens={unique_tokens[:10]}"
             + (" ..." if len(unique_tokens) > 10 else "")
         )
@@ -387,6 +419,7 @@ def parse_excel(excel_file_path: str, run_id: str, spark) -> list:
             'dest_bucket': bucket_val,
             'dest_endpoint': endpoint_val,
             'run_id': run_id,
+            'partition_filter': partition_filter,
         })
 
     logger.info(f"[ParseExcel] Total database configs emitted: {len(configs)}")
@@ -419,17 +452,29 @@ def discover_tables_via_spark_ssh(db_config: dict) -> dict:
     dest_bucket = db_config['dest_bucket']
     dest_endpoint = db_config.get('dest_endpoint', '')
     tokens_json = json.dumps(raw_tokens)
+    partition_filter = db_config.get('partition_filter') or ''
 
     dest_bucket_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', dest_bucket)
     if dest_endpoint:
         dest_endpoint_slug = re.sub(r'[^a-zA-Z0-9_-]', '_', dest_endpoint)
         dest_bucket_slug = f"{dest_bucket_slug}_{dest_endpoint_slug}"
 
-    pyspark_script = '''
+    if partition_filter:
+        pf_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", partition_filter)[:40]
+        dest_bucket_slug = f"{dest_bucket_slug}_{pf_slug}"
+
+    with ssh.get_conn() as client:
+        temp_dir = f"/tmp/discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}"
+        _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
+        cmd_stdout.channel.recv_exit_status()
+
+        pyspark_script = '''
 import json
 import sys
 import fnmatch
 from pyspark.sql import SparkSession
+sys.path.insert(0, "{temp_dir}")
+from partition_utils import apply_partition_filter, partitions_to_where_clause
 
 spark = SparkSession.builder \\
     .appName("table_discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}") \\
@@ -549,7 +594,7 @@ for tbl in table_list:
             row_count = spark.sql(
                 "SELECT COUNT(*) as c FROM {{0}}.{{1}}".format(src_db, tbl)
             ).collect()[0].c
-        except:
+        except Exception:
             pass
 
         partition_cols_from_describe = []
@@ -571,14 +616,59 @@ for tbl in table_list:
 
         partitions = []
         registered_partition_count = 0
+        filtered_partitions = []
+        partition_filter_active = False
+        filtered_source_size = source_total_size
+        filtered_file_count  = source_file_count
+        full_row_count = row_count
+        full_partition_count = 0
         try:
             parts_df = spark.sql(
                 "SHOW PARTITIONS {{0}}.{{1}}".format(src_db, tbl)
             )
             partitions = [row.partition for row in parts_df.collect()]
             registered_partition_count = len(partitions)
-        except:
+        except Exception:
             pass
+
+        # Apply partition filter
+        filter_expr = "{filter_expr_escaped}"
+        full_partition_count = len(partitions)
+        full_row_count = row_count  # already computed above
+        filtered_partitions = apply_partition_filter(partitions, filter_expr)
+        partition_filter_active = bool(filter_expr) and len(filtered_partitions) < len(partitions)
+
+        # Warn edge cases
+        if filter_expr and not partition_definition:
+            import sys as _sys
+            partition_filter_active = False
+            filtered_partitions = partitions
+
+        # Filtered size and file count
+        filtered_source_size = source_total_size
+        filtered_file_count  = source_file_count
+        if partition_filter_active and filtered_partitions and loc:
+            filtered_source_size = 0
+            filtered_file_count  = 0
+            for part_str in filtered_partitions:
+                try:
+                    part_path = spark._jvm.org.apache.hadoop.fs.Path(loc + "/" + part_str)
+                    if fs.exists(part_path):
+                        cs = fs.getContentSummary(part_path)
+                        filtered_source_size += int(cs.getLength())
+                        filtered_file_count  += int(cs.getFileCount())
+                except Exception:
+                    pass
+
+        # Filtered row count
+        if partition_filter_active and filtered_partitions:
+            try:
+                where_clause = partitions_to_where_clause(filtered_partitions)
+                row_count = spark.sql(
+                    "SELECT COUNT(*) as c FROM {{0}}.{{1}} WHERE ".format(src_db, tbl) + where_clause
+                ).collect()[0].c
+            except Exception:
+                pass
 
         is_partitioned = partition_definition
         unregistered_partitions = partition_definition and registered_partition_count == 0
@@ -607,7 +697,7 @@ for tbl in table_list:
             "s3_location": s3_location,
             "file_format": file_format,
             "schema": schema,
-            "partitions": partitions,
+            "partitions": filtered_partitions,
             "partition_columns": partition_columns,
             "partition_count": len(partitions),
             "row_count": row_count,
@@ -616,7 +706,15 @@ for tbl in table_list:
             "table_type": table_type,
             "source_total_size_bytes": source_total_size,
             "serde_properties": serde_properties,
-            "source_file_count": source_file_count
+            "source_file_count": source_file_count,
+            "partition_filter": filter_expr or None,
+            "filtered_partitions": filtered_partitions,
+            "partition_filter_active": partition_filter_active,
+            "filtered_row_count": row_count,
+            "filtered_source_size_bytes": filtered_source_size,
+            "filtered_file_count": filtered_file_count,
+            "full_table_row_count": full_row_count,
+            "full_table_partition_count": full_partition_count,
         }})
 
     except Exception as e:
@@ -639,6 +737,14 @@ for tbl in table_list:
             "source_total_size_bytes": 0,
             "source_file_count": 0,
             "serde_properties": serde_properties,
+            "partition_filter": filter_expr or None,
+            "filtered_partitions": filtered_partitions,
+            "partition_filter_active": partition_filter_active,
+            "filtered_row_count": row_count,
+            "filtered_source_size_bytes": filtered_source_size,
+            "filtered_file_count": filtered_file_count,
+            "full_table_row_count": full_row_count,
+            "full_table_partition_count": full_partition_count,
             "error": str(e)[:500]
         }})
 
@@ -657,17 +763,16 @@ spark.stop()
         dest_db=dest_db,
         dest_bucket=dest_bucket,
         dest_bucket_slug=dest_bucket_slug,
-    )
-
-    with ssh.get_conn() as client:
-        temp_dir = f"/tmp/discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}"
-        _, cmd_stdout, _ = client.exec_command(f"mkdir -p {temp_dir}", timeout=60)
-        cmd_stdout.channel.recv_exit_status()
+        filter_expr_escaped=partition_filter.replace("'", "\\'").replace('"', '\\"'),
+        temp_dir=temp_dir,
+        )
 
         script_path = f"{temp_dir}/discover_tables.py"
         sftp = client.open_sftp()
         with sftp.file(script_path, 'w') as f:
             f.write(pyspark_script)
+        local_utils = Path(__file__).resolve().parent / 'utils' / 'migrations' / 'partition_utils.py'
+        sftp.put(str(local_utils), f"{temp_dir}/partition_utils.py")
         sftp.close()
 
         source_profile = "source ~/.profile 2>/dev/null || true\n"
@@ -753,10 +858,24 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
 
         schema_json = json.dumps(t.get('schema', [])).replace("'", "''")
         parts_json = json.dumps(parts).replace("'", "''")
-        row_count = t.get('row_count', 0)
         table_type = t.get('table_type', 'UNKNOWN')
-        source_total_size = t.get('source_total_size_bytes', 0)
-        source_file_count = t.get('source_file_count', 0)
+        partition_filter_active = t.get('partition_filter_active', False)
+        if partition_filter_active:
+            tracking_row_count       = t.get('filtered_row_count', 0)
+            tracking_partition_count = len(t.get('filtered_partitions', []))
+            tracking_size_bytes      = t.get('filtered_source_size_bytes', 0)
+            tracking_file_count      = t.get('filtered_file_count', 0)
+        else:
+            tracking_row_count       = t.get('row_count', 0)
+            tracking_partition_count = t.get('partition_count', 0)
+            tracking_size_bytes      = t.get('source_total_size_bytes', 0)
+            tracking_file_count      = t.get('source_file_count', 0)
+
+        full_table_row_count       = t.get('full_table_row_count', t.get('row_count', 0))
+        full_table_partition_count = t.get('full_table_partition_count', t.get('partition_count', 0))
+        partition_filter_val       = (t.get('partition_filter') or '').replace("'", "''")
+        filtered_partition_count   = len(t.get('filtered_partitions', [])) if partition_filter_active else None
+        filtered_partition_count_sql = str(filtered_partition_count) if filtered_partition_count is not None else 'NULL'
 
         existing = spark.sql(f"""
             SELECT COUNT(*) as cnt
@@ -775,15 +894,20 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     source_location = '{t['source_location']}',
                     file_format = '{t['file_format']}',
                     table_type = '{table_type}',
-                    source_row_count = {row_count},
-                    source_total_size_bytes = {source_total_size},
-                    source_file_count = {source_file_count},
-                    source_partition_count = {t.get('partition_count', 0)},
+                    source_row_count = {tracking_row_count},
+                    source_total_size_bytes = {tracking_size_bytes},
+                    source_file_count = {tracking_file_count},
+                    source_partition_count = {tracking_partition_count},
                     unregistered_partitions = {str(t.get('unregistered_partitions', False)).lower()},
+                    partition_filter = '{partition_filter_val}',
+                    filtered_partition_count = {filtered_partition_count_sql},
+                    full_table_row_count = {full_table_row_count},
+                    full_table_partition_count = {full_table_partition_count},
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
                   AND source_database = '{t['source_database']}'
                   AND source_table = '{t['source_table']}'
+                  AND dest_database = '{t['dest_database']}'
             """,
             task_label=f"record_discovered_tables:{t['source_table']}")
         else:
@@ -809,16 +933,16 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     row_count_match, partition_count_match, schema_match,
                     schema_differences,
                     overall_status, error_message,
-                    updated_at
+                    updated_at, partition_filter, filtered_partition_count, full_table_row_count, full_table_partition_count
                 ) VALUES (
                     '{run_id}', '{t['source_database']}', '{t['source_table']}',
                     '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
                     '{t['source_location']}', '{t['file_format']}',
                     {t.get('partition_count', 0)}, {str(t.get('is_partitioned', False)).lower()},
                     '{schema_json}', '{parts_json}', '{t.get('partition_columns', '')}',
-                    '{table_type}', {row_count},
-                    {source_total_size}, {source_file_count},
-                    {t.get('partition_count', 0)}, {str(t.get('unregistered_partitions', False)).lower()},
+                    '{table_type}', {tracking_row_count},
+                    {tracking_size_bytes}, {tracking_file_count},
+                    {tracking_partition_count}, {str(t.get('unregistered_partitions', False)).lower()},
                     NULL, NULL, NULL, NULL, NULL, NULL,
                     NULL, NULL,
                     'COMPLETED', current_timestamp(), {discovery_duration},
@@ -831,7 +955,7 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     NULL, NULL, NULL,
                     NULL,
                     NULL, NULL,
-                    current_timestamp()
+                    current_timestamp(), '{partition_filter_val}', {filtered_partition_count_sql}, {full_table_row_count}, {full_table_partition_count}
                 )
             """,
             task_label=f"record_discovered_tables:{t['source_table']}")
@@ -865,22 +989,106 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
             results.append({
                 'source_database': t['source_database'],
                 'source_table': t['source_table'],
+                'dest_database': t['dest_database'],
                 'status': 'SKIPPED',
 
             })
             continue
 
+        if t.get('partition_filter_active') and len(t.get('filtered_partitions', [])) == 0:
+            logger.warning(
+                f"[DistCp] SKIPPED {t['source_database']}.{t['source_table']} — "
+                f"partition_filter '{t.get('partition_filter')}' matched 0 partitions. "
+                f"Full partition list: {t.get('partitions', [])[:20]}"
+            )
+            results.append({
+                'source_database': t['source_database'],
+                'source_table': t['source_table'],
+                'dest_database': t['dest_database'],
+                'status': 'SKIPPED',
+                'error': f"partition_filter matched 0 partitions: {t.get('partition_filter')}"
+            })
+            continue
+
         src_db = t['source_database']
         tbl = t['source_table']
+        dest_db_for_table = t['dest_database']
         source_loc = t['source_location']
         s3_loc = t['s3_location']
+
+        partition_filter_active = t.get('partition_filter_active', False)
+        filtered_partitions     = t.get('filtered_partitions', [])
 
         logger.info(f"[DistCp] Starting copy for {src_db}.{tbl}")
         logger.info(f"[DistCp]   Source : {source_loc}")
         logger.info(f"[DistCp]   Dest   : {s3_loc}")
         logger.info(f"[DistCp]   Mappers: {mappers} | Bandwidth: {bandwidth} MB/s")
 
-        cmd = f'''{source_profile}
+        if partition_filter_active and filtered_partitions:
+            partition_copy_pairs = []
+            for part_str in filtered_partitions:
+                src_part = f"{source_loc}/{part_str}"
+                dst_part = f"{s3_loc}/{part_str}"
+                partition_copy_pairs.append((src_part, dst_part))
+
+            distcp_calls = ""
+            for part_idx, (src_part, dst_part) in enumerate(partition_copy_pairs):
+                distcp_calls += f"""
+echo "=== Copying partition: {src_part} -> {dst_part} ==="
+hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+    -log {temp_dir}/distcp_{tbl}_part{part_idx}.log \\
+    "{src_part}" "{dst_part}"
+"""
+
+            cmd = f'''{source_profile}
+set -e
+
+calculate_s3_metrics_hadoop() {{
+    local location=$1
+    if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
+        echo "S3_FILE_COUNT=0"
+        echo "S3_TOTAL_SIZE=0"
+        return
+    fi
+    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
+    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
+    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
+    [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
+    echo "S3_FILE_COUNT=$FILE_COUNT"
+    echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
+}}
+
+INCR=false
+hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
+echo "INCREMENTAL=$INCR"
+
+echo "=== Calculating S3 metrics BEFORE distcp ==="
+S3_BEFORE=$(calculate_s3_metrics_hadoop "{s3_loc}")
+S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
+echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
+echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
+
+echo "=== Running distcp per-partition ==="
+{distcp_calls}
+echo "DISTCP_EXIT_CODE=0"
+
+echo "=== Calculating S3 metrics AFTER distcp ==="
+S3_AFTER=$(calculate_s3_metrics_hadoop "{s3_loc}")
+S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
+echo "S3_FILE_COUNT_AFTER=$S3_FILE_COUNT_AFTER"
+echo "S3_TOTAL_SIZE_AFTER=$S3_TOTAL_SIZE_AFTER"
+
+S3_FILES_TRANSFERRED=$((S3_FILE_COUNT_AFTER - S3_FILE_COUNT_BEFORE))
+S3_BYTES_TRANSFERRED=$((S3_TOTAL_SIZE_AFTER - S3_TOTAL_SIZE_BEFORE))
+echo "S3_FILES_TRANSFERRED=$S3_FILES_TRANSFERRED"
+echo "S3_BYTES_TRANSFERRED=$S3_BYTES_TRANSFERRED"
+echo "PARTITIONS_REQUESTED={len(filtered_partitions)}"
+exit 0
+'''
+        else:
+            cmd = f'''{source_profile}
 set -e
 
 calculate_s3_metrics_hadoop() {{
@@ -915,7 +1123,7 @@ echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
 echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
 
 echo "=== Running distcp ==="
-DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
 echo "DISTCP_EXIT_CODE=$DISTCP_EXIT"
@@ -1007,6 +1215,7 @@ exit 0
                 results.append({
                     'source_database': src_db,
                     'source_table': tbl,
+                    'dest_database': dest_db_for_table,
                     'status': 'COMPLETED',
                     'distcp_started_at': distcp_started_at,
                     'distcp_duration_secs': distcp_duration_secs,
@@ -1020,6 +1229,8 @@ exit 0
                     's3_file_count_after': s3_files_after,
                     's3_bytes_transferred': s3_bytes_transferred,
                     's3_files_transferred': s3_files_transferred,
+                    'partition_filter_active': partition_filter_active,
+                    'partitions_requested': len(filtered_partitions) if partition_filter_active else None,
                     'error': None
                 })
         except Exception as e:
@@ -1028,6 +1239,7 @@ exit 0
             results.append({
                 'source_database': src_db,
                 'source_table': tbl,
+                'dest_database': dest_db_for_table,
                 'status': 'FAILED',
                 'distcp_started_at': distcp_started_at,
                 'distcp_completed_at': _fail_dt.strftime('%Y-%m-%d %H:%M:%S'),
@@ -1041,6 +1253,8 @@ exit 0
                 's3_file_count_after': 0,
                 's3_bytes_transferred': 0,
                 's3_files_transferred': 0,
+                'partition_filter_active': partition_filter_active,
+                'partitions_requested': len(filtered_partitions) if partition_filter_active else None,
                 'error': str(e)[:2000]
             })
             logger.error(f"ERROR: {error_msg}")
@@ -1110,14 +1324,23 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 s3_file_count_after = {s3_files_after},
                 s3_bytes_transferred = {s3_bytes_transfer},
                 s3_files_transferred = {s3_files_transfer},
-                file_count_match = (source_file_count = {s3_files_after}),
-                file_size_match = (ABS(source_total_size_bytes - {s3_size_after}) / GREATEST(source_total_size_bytes, 1) < 0.01),
+                file_count_match = CASE
+                    WHEN partition_filter IS NOT NULL AND partition_filter != ''
+                    THEN (source_file_count = {s3_files_transfer})
+                    ELSE (source_file_count = {s3_files_after})
+                END,
+                file_size_match = CASE
+                    WHEN partition_filter IS NOT NULL AND partition_filter != ''
+                    THEN (ABS(source_total_size_bytes - {s3_bytes_transfer}) / GREATEST(source_total_size_bytes, 1) < 0.01)
+                    ELSE (ABS(source_total_size_bytes - {s3_size_after}) / GREATEST(source_total_size_bytes, 1) < 0.01)
+                END,
                 overall_status = '{overall}',
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
               AND source_database = '{r['source_database']}'
               AND source_table = '{r['source_table']}'
+              AND dest_database='{r['dest_database']}'
         """,
         task_label=f"update_distcp_status:{r['source_table']}")
 
@@ -1137,18 +1360,36 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
             """,
             task_label=f"update_distcp_status:failure_patch:{r['source_table']}")
 
-    execute_with_iceberg_retry(spark, f"""
-        UPDATE {tracking_db}.migration_table_status
-        SET distcp_status = 'FAILED',
-            overall_status = 'FAILED',
-            error_message = COALESCE(error_message, 'S3 copy task did not process this table'),
-            updated_at = current_timestamp()
-        WHERE run_id = '{run_id}'
-          AND source_database = '{src_db}'
-          AND distcp_status IS NULL
-          AND discovery_status = 'COMPLETED'
-    """,
-    task_label="update_distcp_status:catchall")
+    _distcp_processed_dbs = set(
+        r.get('dest_database', distcp_result['dest_database'])
+        for r in distcp_result.get('distcp_results', [])
+    )
+    _distcp_processed_tables = set(
+        r['source_table']
+        for r in distcp_result.get('distcp_results', [])
+    )
+    _distcp_not_in = ', '.join(f"'{t}'" for t in _distcp_processed_tables) if _distcp_processed_tables else "'__no_tables__'"
+
+    from collections import defaultdict
+    _slot_tables_by_db = defaultdict(set)
+    for t in distcp_result.get('tables', []):
+        _slot_tables_by_db[t.get('dest_database', distcp_result['dest_database'])].add(t['source_table'])
+    if not _slot_tables_by_db:
+        _slot_tables_by_db[distcp_result['dest_database']] = set()
+
+    for _pddb, _slot_tbls in _slot_tables_by_db.items():
+        _slot_in = ', '.join(f"'{t}'" for t in _slot_tbls) if _slot_tbls else "'__no_tables__'"
+        execute_with_iceberg_retry(spark, f"""
+            UPDATE {tracking_db}.migration_table_status
+            SET distcp_status='FAILED', overall_status='FAILED',
+                error_message=COALESCE(error_message,'S3 copy task did not process this table'),
+                updated_at=current_timestamp()
+            WHERE run_id='{run_id}' AND source_database='{src_db}'
+              AND dest_database='{_pddb}'
+              AND source_table IN ({_slot_in})
+              AND source_table NOT IN ({_distcp_not_in})
+              AND distcp_status IS NULL AND discovery_status='COMPLETED'
+        """, task_label=f"update_distcp:catchall:{_pddb}")
 
     return distcp_result
 
@@ -1162,21 +1403,36 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
         logger.warning(f"[create_hive_tables] Skipping invalid input: {type(distcp_result)}")
         return {}
 
-    dest_db = distcp_result['dest_database']
     tables = distcp_result['tables']
 
     results = []
-    spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
+    created_dbs = set()
 
     for t in tables:
-        distcp_status = next(
-            (r['status'] for r in distcp_result.get('distcp_results', [])
-             if r['source_table'] == t['source_table']),
-            'UNKNOWN'
+        tbl = t['source_table']
+        dest_db = t.get('dest_database') or distcp_result['dest_database']
+
+        if dest_db not in created_dbs:
+            spark.sql(f"CREATE DATABASE IF NOT EXISTS {dest_db}")
+            created_dbs.add(dest_db)
+
+        distcp_entry = next(
+            (r for r in distcp_result.get('distcp_results', [])
+             if r['source_table'] == tbl and r.get('dest_database') == dest_db),
+            None
         )
+        if distcp_entry is None:
+            distcp_entry = next(
+                (r for r in distcp_result.get('distcp_results', [])
+                 if r['source_table'] == tbl),
+                None
+            )
+
+        distcp_status = distcp_entry['status'] if distcp_entry else 'UNKNOWN'
         if distcp_status in ('FAILED', 'SKIPPED', 'UNKNOWN'):
             results.append({
                 'source_table': t['source_table'],
+                'dest_database': dest_db,
                 'status': 'SKIPPED',
                 'error': f'DistCp status was {distcp_status}',
                 'existed': False
@@ -1204,11 +1460,32 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
 
             if exists:
                 if is_part:
-                    spark.sql(f"MSCK REPAIR TABLE {full_name}")
+                    if t.get('partition_filter_active') and t.get('filtered_partitions'):
+                        for part_str in t['filtered_partitions']:
+                            part_kv = {}
+                            for segment in part_str.split('/'):
+                                if '=' in segment:
+                                    k, _, v = segment.partition('=')
+                                    part_kv[k.strip()] = v.strip()
+                            partition_spec = ", ".join(f"{k}='{v}'" for k, v in part_kv.items())
+                            part_location = f"{s3_loc}/{part_str}"
+                            try:
+                                spark.sql(
+                                    f"ALTER TABLE {full_name} ADD IF NOT EXISTS "
+                                    f"PARTITION ({partition_spec}) LOCATION '{part_location}'"
+                                )
+                            except Exception as add_e:
+                                logger.warning(
+                                    f"[HiveTable] Could not add partition {partition_spec} "
+                                    f"to {full_name}: {str(add_e)[:200]}"
+                                )
+                    else:
+                        spark.sql(f"MSCK REPAIR TABLE {full_name}")
                 spark.sql(f"REFRESH TABLE {full_name}")
                 logger.info(f"[HiveTable] REPAIRED (already existed): {full_name}")
                 results.append({
                     'source_table': tbl,
+                    'dest_database': dest_db,
                     'status': 'COMPLETED',
                     'action': 'repaired',
                     'existed': True,
@@ -1265,12 +1542,33 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
                 spark.sql(ddl)
 
                 if is_part:
-                    spark.sql(f"MSCK REPAIR TABLE {full_name}")
+                    if t.get('partition_filter_active') and t.get('filtered_partitions'):
+                        for part_str in t['filtered_partitions']:
+                            part_kv = {}
+                            for segment in part_str.split('/'):
+                                if '=' in segment:
+                                    k, _, v = segment.partition('=')
+                                    part_kv[k.strip()] = v.strip()
+                            partition_spec = ", ".join(f"{k}='{v}'" for k, v in part_kv.items())
+                            part_location = f"{s3_loc}/{part_str}"
+                            try:
+                                spark.sql(
+                                    f"ALTER TABLE {full_name} ADD IF NOT EXISTS "
+                                    f"PARTITION ({partition_spec}) LOCATION '{part_location}'"
+                                )
+                            except Exception as add_e:
+                                logger.warning(
+                                    f"[HiveTable] Could not add partition {partition_spec} "
+                                    f"to {full_name}: {str(add_e)[:200]}"
+                                )
+                    else:
+                        spark.sql(f"MSCK REPAIR TABLE {full_name}")
                 spark.sql(f"REFRESH TABLE {full_name}")
 
                 logger.info(f"[HiveTable] CREATED: {full_name} | location={s3_loc}")
                 results.append({
                     'source_table': tbl,
+                    'dest_database': dest_db,
                     'status': 'COMPLETED',
                     'action': 'created',
                     'existed': False,
@@ -1280,6 +1578,7 @@ def create_hive_tables(distcp_result: dict, spark, **context) -> dict:
             error_msg = f"Table creation failed for {dest_db}.{tbl}: {str(e)[:2000]}"
             results.append({
                 'source_table': tbl,
+                'dest_database': dest_db,
                 'status': 'FAILED',
                 'action': 'error',
                 'existed': False,
@@ -1319,12 +1618,12 @@ def update_table_create_status(table_result: dict, spark) -> dict:
     config = get_config()
     tracking_db = config['tracking_database']
     run_id = table_result['run_id']
-    dest_db = table_result['dest_database']
     src_db = table_result['source_database']
 
     table_duration = table_result.get('_task_duration', 0.0)
 
     for r in table_result.get('table_results', []):
+        per_table_dest_db = r.get('dest_database', table_result['dest_database'])
         overall = 'TABLE_CREATED' if r['status'] == 'COMPLETED' else ('FAILED' if r['status'] == 'FAILED' else 'SKIPPED')
         error_msg = (r.get('error', '') or '').replace("'", "''")[:2000]
 
@@ -1338,13 +1637,15 @@ def update_table_create_status(table_result: dict, spark) -> dict:
                 error_message = CASE WHEN '{r['status']}' = 'FAILED' THEN '{error_msg}' ELSE error_message END,
                 updated_at = current_timestamp()
             WHERE run_id = '{run_id}'
-              AND dest_database = '{dest_db}'
+              AND source_database = '{src_db}'
+              AND dest_database = '{per_table_dest_db}'
               AND source_table = '{r['source_table']}'
         """,
         task_label=f"update_table_create_status:{r['source_table']}")
 
     for r in table_result.get('table_results', []):
         if r.get('status') == 'FAILED' and r.get('error'):
+            per_table_dest_db = r.get('dest_database', table_result['dest_database'])
             per_table_error = str(r['error'])[:2000].replace("'", "''")
             execute_with_iceberg_retry(spark, f"""
                 UPDATE {tracking_db}.migration_table_status
@@ -1353,24 +1654,41 @@ def update_table_create_status(table_result: dict, spark) -> dict:
                     error_message = '{per_table_error}',
                     updated_at = current_timestamp()
                 WHERE run_id = '{run_id}'
-                  AND dest_database = '{dest_db}'
+                  AND source_database = '{src_db}'
+                  AND dest_database = '{per_table_dest_db}'
                   AND source_table = '{r['source_table']}'
                   AND table_create_status IS NULL
             """,
             task_label=f"update_table_create_status:failure_patch:{r['source_table']}")
 
-    execute_with_iceberg_retry(spark, f"""
-        UPDATE {tracking_db}.migration_table_status
-        SET table_create_status = 'FAILED',
-            overall_status = 'FAILED',
-            error_message = COALESCE(error_message, 'Table creation task did not process this table'),
-            updated_at = current_timestamp()
-        WHERE run_id = '{run_id}'
-          AND source_database = '{src_db}'
-          AND table_create_status IS NULL
-          AND discovery_status = 'COMPLETED'
-    """,
-    task_label="update_table_create_status:catchall")
+    _tbl_processed_tables = set(
+        r['source_table']
+        for r in table_result.get('table_results', [])
+    )
+    _tbl_not_in = ', '.join(f"'{t}'" for t in _tbl_processed_tables) if _tbl_processed_tables else "'__no_tables__'"
+    from collections import defaultdict
+    _tbl_slot_tables_by_db = defaultdict(set)
+    for t in table_result.get('tables', []):
+        _tbl_slot_tables_by_db[t.get('dest_database', table_result['dest_database'])].add(t['source_table'])
+    if not _tbl_slot_tables_by_db:
+        _tbl_slot_tables_by_db[table_result['dest_database']] = set()
+    for _pddb, _slot_tbls in _tbl_slot_tables_by_db.items():
+        _slot_in = ', '.join(f"'{t}'" for t in _slot_tbls) if _slot_tbls else "'__no_tables__'"
+        execute_with_iceberg_retry(spark, f"""
+            UPDATE {tracking_db}.migration_table_status
+            SET table_create_status = 'FAILED',
+                overall_status = 'FAILED',
+                error_message = COALESCE(error_message, 'Table creation task did not process this table'),
+                updated_at = current_timestamp()
+            WHERE run_id = '{run_id}'
+              AND source_database = '{src_db}'
+              AND dest_database = '{_pddb}'
+              AND source_table IN ({_slot_in})
+              AND source_table NOT IN ({_tbl_not_in})
+              AND table_create_status IS NULL
+              AND discovery_status = 'COMPLETED'
+        """,
+        task_label=f"update_table_create_status:catchall:{_pddb}")
 
     return table_result
 
@@ -1396,13 +1714,15 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
 
     for t in tables:
         tbl = t['source_table']
-        dest_tbl = f"{dest_db}.{tbl}"
+        per_table_dest_db = t.get('dest_database', dest_db)
+        dest_tbl = f"{per_table_dest_db}.{tbl}"
 
         upstream = spark.sql(f"""
             SELECT distcp_status, table_create_status, overall_status, error_message
             FROM {tracking_db}.migration_table_status
             WHERE run_id = '{run_id}'
               AND source_database = '{src_db}'
+              AND dest_database = '{per_table_dest_db}'
               AND source_table = '{tbl}'
         """).collect()
 
@@ -1416,15 +1736,16 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
                 })
                 continue
 
-        logger.info(f"[Validation] Starting validation for {dest_db}.{tbl}")
+        logger.info(f"[Validation] Starting validation for {per_table_dest_db}.{tbl}")
 
         try:
             source_metrics = spark.sql(f"""
-                SELECT source_row_count, source_partition_count
+                SELECT source_row_count, source_partition_count, partition_filter
                 FROM {tracking_db}.migration_table_status
                 WHERE run_id = '{run_id}'
                   AND source_database = '{src_db}'
                   AND source_table = '{tbl}'
+                  AND dest_database = '{per_table_dest_db}'
             """).collect()
 
             if not source_metrics:
@@ -1438,18 +1759,42 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             source_row_count = source_metrics[0]['source_row_count'] or 0
             source_partition_count = source_metrics[0]['source_partition_count'] or t.get('partition_count', 0)
 
-            # Get destination row count
-            dest_row_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_tbl}").collect()[0]['c']
+            partition_filter = source_metrics[0]['partition_filter'] if source_metrics else None
+            if partition_filter:
+                logger.info(
+                    f"[Validation] {per_table_dest_db}.{tbl} — partition filter active: '{partition_filter}'. "
+                    f"Comparing against filtered baseline: {source_row_count} rows, "
+                    f"{source_partition_count} partitions."
+                )
 
-            # Get destination partition count
+            # Get destination row count — scope to filtered partitions if a filter was active
+            if partition_filter:
+                filtered_parts = t.get('filtered_partitions', [])
+                if filtered_parts:
+                    where_clause = _partitions_to_where_clause(filtered_parts)
+                    dest_row_count = spark.sql(
+                        f"SELECT COUNT(*) as c FROM {dest_tbl} WHERE {where_clause}"
+                    ).collect()[0]['c']
+                else:
+                    dest_row_count = spark.sql(
+                        f"SELECT COUNT(*) as c FROM {dest_tbl}"
+                    ).collect()[0]['c']
+            else:
+                dest_row_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_tbl}").collect()[0]['c']
+
+            # Get destination partition count — scope to filtered partitions if a filter was active
             dest_partition_count = 0
             try:
-                dest_partitions_df = spark.sql(f"SHOW PARTITIONS {dest_tbl}")
-                dest_partition_count = dest_partitions_df.count()
+                if partition_filter:
+                    filtered_parts = t.get('filtered_partitions', [])
+                    dest_partition_count = len(filtered_parts)
+                else:
+                    dest_partitions_df = spark.sql(f"SHOW PARTITIONS {dest_tbl}")
+                    dest_partition_count = dest_partitions_df.count()
             except Exception:
                 pass
 
-            logger.info(f"[Validation] {dest_db}.{tbl} | source_rows={source_row_count} | dest_rows={dest_row_count} | source_parts={source_partition_count} | dest_parts={dest_partition_count}")
+            logger.info(f"[Validation] {per_table_dest_db}.{tbl} | source_rows={source_row_count} | dest_rows={dest_row_count} | source_parts={source_partition_count} | dest_parts={dest_partition_count}")
 
             # Schema comparison
             src_schema = t.get('schema', [])
@@ -1485,9 +1830,9 @@ def validate_destination_tables(source_validation: dict, spark, **context) -> di
             partition_count_match = (source_partition_count == dest_partition_count)
 
             match_summary = f"rows={'✓' if row_count_match else '✗'} partitions={'✓' if partition_count_match else '✗'} schema={'✓' if schema_match else '✗'}"
-            logger.info(f"[Validation] DONE: {dest_db}.{tbl} | {match_summary}")
+            logger.info(f"[Validation] DONE: {per_table_dest_db}.{tbl} | {match_summary}")
             if schema_diffs:
-                logger.warning(f"[Validation] Schema diffs for {dest_db}.{tbl}: {'; '.join(schema_diffs[:5])}")
+                logger.warning(f"[Validation] Schema diffs for {per_table_dest_db}.{tbl}: {'; '.join(schema_diffs[:5])}")
 
             mismatch_parts = []
             if not row_count_match:
@@ -1656,18 +2001,36 @@ def update_validation_status(validation_result: dict, spark) -> dict:
             """,
             task_label=f"update_validation_status:failure_patch:{v['source_table']}")
 
-    execute_with_iceberg_retry(spark, f"""
-        UPDATE {tracking_db}.migration_table_status
-        SET validation_status = 'SKIPPED',
-            overall_status = CASE WHEN overall_status = 'FAILED' THEN 'FAILED' ELSE 'VALIDATION_FAILED' END,
-            error_message = COALESCE(error_message, 'Validation task did not process this table'),
-            updated_at = current_timestamp()
-        WHERE run_id = '{run_id}'
-          AND source_database = '{src_db}'
-          AND table_create_status = 'COMPLETED'
-          AND validation_status IS NULL
-    """,
-    task_label="update_validation_status:catchall")
+    _val_processed_tables = set(
+        v['source_table']
+        for v in validation_result.get('validation_results', [])
+    )
+    _val_not_in = ', '.join(f"'{t}'" for t in _val_processed_tables) if _val_processed_tables else "'__no_tables__'"
+
+    from collections import defaultdict
+    _slot_tables_by_db = defaultdict(set)
+    for t in validation_result.get('tables', []):
+        _slot_tables_by_db[t.get('dest_database', dest_db)].add(t['source_table'])
+    if not _slot_tables_by_db:
+        _slot_tables_by_db[dest_db] = set()
+
+    for _vpddb, _slot_tbls in _slot_tables_by_db.items():
+        _slot_in = ', '.join(f"'{t}'" for t in _slot_tbls) if _slot_tbls else "'__no_tables__'"
+        execute_with_iceberg_retry(spark, f"""
+            UPDATE {tracking_db}.migration_table_status
+            SET validation_status = 'SKIPPED',
+                overall_status = CASE WHEN overall_status = 'FAILED' THEN 'FAILED' ELSE 'VALIDATION_FAILED' END,
+                error_message = COALESCE(error_message, 'Validation task did not process this table'),
+                updated_at = current_timestamp()
+            WHERE run_id = '{run_id}'
+              AND source_database = '{src_db}'
+              AND dest_database = '{_vpddb}'
+              AND source_table IN ({_slot_in})
+              AND source_table NOT IN ({_val_not_in})
+              AND table_create_status = 'COMPLETED'
+              AND validation_status IS NULL
+        """,
+        task_label=f"update_validation_status:catchall:{_vpddb}")
 
     return validation_result
 
@@ -1875,7 +2238,7 @@ def generate_html_report(run_id: str, spark) -> str:
             </div>
             <div class="summary-card info">
                 <h3>TOTAL DATA</h3>
-                <p class="value">{total_data_gb:.5f} GB</p>
+                <p class="value">{total_data_gb:.6f} GB</p>
             </div>
             <div class="summary-card info">
                 <h3>TOTAL FILES</h3>
@@ -1908,8 +2271,35 @@ def generate_html_report(run_id: str, spark) -> str:
           AND validation_status = 'COMPLETED'
     """).collect()
 
+    file_metrics_data = spark.sql(f"""
+        SELECT
+            SUM(CASE WHEN file_size_match = true THEN 1 ELSE 0 END)  as tables_size_match,
+            SUM(CASE WHEN file_size_match = false THEN 1 ELSE 0 END) as tables_size_mismatch,
+            SUM(CASE WHEN file_count_match = true THEN 1 ELSE 0 END)  as tables_file_count_match,
+            SUM(CASE WHEN file_count_match = false THEN 1 ELSE 0 END) as tables_file_count_mismatch,
+            SUM(source_total_size_bytes) as total_source_bytes,
+            SUM(s3_total_size_bytes_after) as total_dest_bytes
+        FROM {tracking_db}.migration_table_status
+        WHERE run_id = '{run_id}'
+          AND distcp_status = 'COMPLETED'
+    """).collect()
+
+    fm = file_metrics_data[0] if file_metrics_data else None
+
     if validation_summary_data and validation_summary_data[0]['total_tables_validated']:
         vs = validation_summary_data[0]
+
+        size_match_count      = (fm.tables_size_match      or 0) if fm else 0
+        size_mismatch_count   = (fm.tables_size_mismatch   or 0) if fm else 0
+        fcount_match_count    = (fm.tables_file_count_match   or 0) if fm else 0
+        fcount_mismatch_count = (fm.tables_file_count_mismatch or 0) if fm else 0
+        total_src_gb  = (fm.total_source_bytes or 0) / (1024**3) if fm else 0.0
+        total_dest_gb = (fm.total_dest_bytes   or 0) / (1024**3) if fm else 0.0
+        size_diff_pct = (
+            abs(total_src_gb - total_dest_gb) / total_src_gb * 100
+            if total_src_gb > 0 else 0.0
+        )
+
         html += f"""
         <div class="summary-grid">
             <div class="summary-card info">
@@ -1936,6 +2326,26 @@ def generate_html_report(run_id: str, spark) -> str:
                 <h3>SCHEMA MISMATCHES</h3>
                 <p class="value">{vs.total_schema_mismatches}</p>
             </div>
+            <div class="summary-card {'success' if size_mismatch_count == 0 else 'warning'}">
+                <h3>SIZE MATCH</h3>
+                <p class="value">{size_match_count} / {size_match_count + size_mismatch_count}</p>
+            </div>
+            <div class="summary-card {'success' if fcount_mismatch_count == 0 else 'warning'}">
+                <h3>FILE COUNT MATCH</h3>
+                <p class="value">{fcount_match_count} / {fcount_match_count + fcount_mismatch_count}</p>
+            </div>
+            <div class="summary-card info">
+                <h3>SOURCE SIZE</h3>
+                <p class="value">{total_src_gb:.6f} GB</p>
+            </div>
+            <div class="summary-card info">
+                <h3>DEST SIZE</h3>
+                <p class="value">{total_dest_gb:.6f} GB</p>
+            </div>
+            <div class="summary-card {'success' if size_diff_pct < 1.0 else 'warning'}">
+                <h3>SIZE DELTA</h3>
+                <p class="value">{size_diff_pct:.2f}%</p>
+            </div>
         </div>
 """
     else:
@@ -1953,6 +2363,7 @@ def generate_html_report(run_id: str, spark) -> str:
                     <th>Database</th>
                     <th>Table</th>
                     <th>Status</th>
+                    <th>Partition Filter</th>
                     <th>Discovery</th>
                     <th>DistCp</th>
                     <th>Table Create</th>
@@ -1984,11 +2395,21 @@ def generate_html_report(run_id: str, spark) -> str:
         total_dur = (t.discovery_duration_seconds or 0) + (t.distcp_duration_seconds or 0) + \
                     (t.table_create_duration_seconds or 0) + (t.validation_duration_seconds or 0)
 
+        pf_display = t.partition_filter or ''
+        if pf_display:
+            fpc = t.filtered_partition_count
+            pf_display = f"<span style='background-color:#e8f4fd;color:#1a6fa3;padding:2px 6px;border-radius:4px;font-size:11px;font-weight:bold;'>{pf_display}</span>"
+            if fpc is not None:
+                pf_display += f"<br><small style='color:#7f8c8d;'>({fpc} partition{'s' if fpc != 1 else ''})</small>"
+        else:
+            pf_display = "<span style='color:#bdc3c7;font-size:11px;'>—</span>"
+
         html += f"""
                 <tr>
                     <td>{t.source_database}</td>
                     <td><strong>{t.source_table}</strong></td>
                     <td><span class="status-badge {status_class}">{t.overall_status}</span></td>
+                    <td>{pf_display}</td>
                     <td class="duration">{discovery_dur}</td>
                     <td class="duration">{distcp_dur}{distcp_detail}</td>
                     <td class="duration">{table_dur}</td>
@@ -2094,10 +2515,10 @@ def generate_html_report(run_id: str, spark) -> str:
                 <tr>
                     <td>{t.source_database}</td>
                     <td><strong>{t.source_table}</strong></td>
-                    <td class="metric">{source_total_size_gb:.5f}</td>
-                    <td class="metric">{s3_size_before_gb:.5f}</td>
-                    <td class="metric">{s3_size_after_gb:.5f}</td>
-                    <td class="metric">{s3_transferred_gb:.5f}</td>
+                    <td class="metric">{source_total_size_gb:.6f}</td>
+                    <td class="metric">{s3_size_before_gb:.6f}</td>
+                    <td class="metric">{s3_size_after_gb:.6f}</td>
+                    <td class="metric">{s3_transferred_gb:.6f}</td>
                     <td class="{size_match_class}">{size_match_icon}</td>
                     <td class="metric">{(t.source_file_count or 0):,}</td>
                     <td class="metric">{(t.s3_file_count_before or 0):,}</td>
@@ -2141,8 +2562,8 @@ def generate_html_report(run_id: str, spark) -> str:
                 <tr>
                     <td>{t.source_database}</td>
                     <td><strong>{t.source_table}</strong></td>
-                    <td class="metric">{data_gb:.5f} GB</td>
-                    <td class="metric">{distcp_speed:.5f} MB/s</td>
+                    <td class="metric">{data_gb:.6f} GB</td>
+                    <td class="metric">{distcp_speed:.6f} MB/s</td>
                     <td class="metric">{rows_per_sec:,.0f}</td>
                     <td class="metric">{total_dur:.1f}s ({total_dur/60:.1f}m)</td>
                 </tr>
@@ -2192,7 +2613,7 @@ def finalize_run(run_id: str, spark) -> dict:
         stats_result = spark.sql(f"""
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS') THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN overall_status IN ('VALIDATED', 'VALIDATED_WITH_WARNINGS', 'TABLE_CREATED') THEN 1 ELSE 0 END) as successful,
                 SUM(CASE WHEN overall_status IN ('FAILED', 'VALIDATION_FAILED') THEN 1 ELSE 0 END) as failed
             FROM {tracking_db}.migration_table_status
             WHERE run_id = '{run_id}'
@@ -2256,7 +2677,7 @@ def cleanup_edge(cluster_setup: dict, run_id: str) -> dict:
             with ssh.get_conn() as client:
                 _, stdout, _ = client.exec_command(f"rm -rf {temp_dir}", timeout=60)
                 stdout.channel.recv_exit_status()
-        except:
+        except Exception:
             pass
 
     return {'cleaned': temp_dir}
@@ -2330,7 +2751,7 @@ def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict
 # =============================================================================
 
 with DAG(
-    dag_id='mapr_to_s3_migration',
+    dag_id='source_to_s3_migration',
     default_args=default_args,
     description='Migrate Hive tables from MapR-FS to S3',
     schedule=None,
