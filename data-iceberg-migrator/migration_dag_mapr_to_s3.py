@@ -27,6 +27,7 @@ from utils.migrations.partition_utils import (
 )
 from utils.migrations.shared import (
     SSH_COMMAND_TIMEOUT,
+    _login_shell,
     build_s3_opts,
     cluster_login,
     execute_with_iceberg_retry,
@@ -55,7 +56,7 @@ default_args = {
 }
 
 # =============================================================================
-# DAG 1: MAPR TO S3 MIGRATION TASKS
+# DAG 1: SOURCE (MapR or HDP) TO S3 MIGRATION TASKS
 # =============================================================================
 
 @task
@@ -64,11 +65,15 @@ def validate_prerequisites(run_id: str) -> dict:
     config = get_config()
     validation_results = {
         'ssh_connectivity': False,
+        'cluster_auth': False,
         'pyspark_available': False,
         'hive_available': False,
         'hadoop_fs_available': False,
         'errors': []
     }
+
+    auth_method = config.get('auth_method', 'mapr')
+    mapr_user = config.get('mapr_user', '')
 
     logger.info("="*60)
     logger.info("STARTING PRE-DAG VALIDATION")
@@ -80,10 +85,10 @@ def validate_prerequisites(run_id: str) -> dict:
 
             # 1. SSH Connectivity
             logger.info("[1/4] Testing SSH connectivity...")
-            _, stdout, stderr = client.exec_command('echo "SSH_TEST_OK"', timeout=30)
-            exit_code = stdout.channel.recv_exit_status()
+            _, stdout, stderr = client.exec_command(_login_shell('echo "SSH_TEST_OK"', config.get('cluster_type', 'MapR')), timeout=30)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
 
             if exit_code == 0 and "SSH_TEST_OK" in output:
                 validation_results['ssh_connectivity'] = True
@@ -93,66 +98,97 @@ def validate_prerequisites(run_id: str) -> dict:
                 validation_results['errors'].append(f"SSH: {error_msg}")
                 logger.error(f"SSH connectivity: FAILED - {error_msg}")
 
-            # 2. PySpark
-            logger.info("[2/4] Testing PySpark availability...")
-            test_cmd = """
-    source ~/.profile 2>/dev/null || true
-    which pyspark && pyspark --version 2>&1 | head -5
-    """
-            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
-            exit_code = stdout.channel.recv_exit_status()
+            # 2. Cluster authentication
+            # MapR:     maprlogin print — verifies a valid ticket exists
+            # Kerberos: klist -s       — exits 0 if valid TGT in ccache, 1 if not
+            # none:     skipped
+            logger.info(f"[2/4] Testing cluster authentication (auth_method={auth_method})...")
+            if auth_method == 'mapr':
+                inner_cmd = f"""
+if maprlogin print 2>/dev/null | grep -q "{mapr_user}"; then
+    echo "CLUSTER_AUTH_OK"
+else
+    echo "CLUSTER_AUTH_FAIL: No valid MapR ticket found for user '{mapr_user}'. Run maprlogin on the edge node."
+    exit 1
+fi
+"""
+            elif auth_method == 'kinit':
+                inner_cmd = """
+if klist -s 2>/dev/null; then
+    echo "CLUSTER_AUTH_OK"
+    klist 2>/dev/null | head -4
+else
+    echo "CLUSTER_AUTH_FAIL: No valid Kerberos TGT found. Ensure ~/.profile runs kinit or a valid ticket exists."
+    exit 1
+fi
+"""
+            else:
+                inner_cmd = 'echo "CLUSTER_AUTH_OK"'
+
+            _, stdout, stderr = client.exec_command(_login_shell(inner_cmd, config.get('cluster_type', 'MapR')), timeout=30)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
 
-            if exit_code == 0 and ('pyspark' in output.lower() or 'spark' in output.lower()):
+            if exit_code == 0 and 'CLUSTER_AUTH_OK' in output:
+                validation_results['cluster_auth'] = True
+                logger.info(f"Cluster auth ({auth_method}): PASSED")
+                if auth_method == 'kinit':
+                    logger.info(f"TGT info: {output.strip()[:300]}")
+            else:
+                error_msg = output.replace('CLUSTER_AUTH_FAIL: ', '').strip() or f"Auth check failed (exit={exit_code})"
+                validation_results['errors'].append(f"Cluster auth: {error_msg}")
+                logger.error(f"Cluster auth ({auth_method}): FAILED - {error_msg}")
+
+            # 3. PySpark + Hive metastore
+            # Runs a real SparkSession with enableHiveSupport() + SHOW DATABASES.
+            logger.info("[3/4] Testing PySpark with Hive metastore support (enableHiveSupport + SHOW DATABASES)...")
+            pyspark_inner = """
+pyspark --master local[*] << 'PYSPARK_VALIDATION_EOF'
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.enableHiveSupport().getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
+spark.sql("SHOW DATABASES").collect()
+spark.stop()
+print("PYSPARK_HIVE_OK")
+PYSPARK_VALIDATION_EOF
+"""
+            _, stdout, stderr = client.exec_command(_login_shell(pyspark_inner, config.get('cluster_type', 'MapR')), timeout=180, get_pty=True)
+            output = stdout.read().decode()
+            stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
+
+            if exit_code == 0 and 'PYSPARK_HIVE_OK' in output:
                 validation_results['pyspark_available'] = True
-                logger.info("PySpark: PASSED")
-                logger.info(f"Version info: {output.strip()[:200]}")
-            else:
-                error_msg = f"PySpark not found or failed. Output: {output[:200]}"
-                validation_results['errors'].append(f"PySpark: {error_msg}")
-                logger.error(f"PySpark: FAILED - {error_msg}")
-
-            # 3. Hive
-            logger.info("[3/4] Testing Hive availability...")
-            test_cmd = """
-    source ~/.profile 2>/dev/null || true
-    hive --version 2>&1 | head -3
-    """
-            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
-            exit_code = stdout.channel.recv_exit_status()
-            output = stdout.read().decode()
-            stderr.read()
-
-            if exit_code == 0 and 'hive' in output.lower():
                 validation_results['hive_available'] = True
-                logger.info("Hive: PASSED")
-                logger.info(f"Version info: {output.strip()[:200]}")
+                logger.info("PySpark + Hive metastore: PASSED")
             else:
-                error_msg = f"Hive not found or failed. Output: {output[:200]}"
-                validation_results['errors'].append(f"Hive: {error_msg}")
-                logger.error(f"Hive: FAILED - {error_msg}")
+                error_msg = f"PySpark/Hive check failed (exit={exit_code}). Output: {output[-400:]}"
+                validation_results['errors'].append(f"PySpark/Hive: {error_msg}")
+                logger.error(f"PySpark + Hive metastore: FAILED - {error_msg}")
 
-            # 4. Hadoop FS
-            logger.info("[4/4] Testing Hadoop FS commands...")
-            test_cmd = """
-    source ~/.profile 2>/dev/null || true
-    hadoop version 2>&1 | head -3
-    hadoop fs -ls / > /dev/null 2>&1 && echo "HADOOP_FS_OK"
-    """
-            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
-            exit_code = stdout.channel.recv_exit_status()
+            # 4. Hadoop FS access (works for both MapR-FS and HDFS sources)
+            # For HDFS HA clusters set hdfs_nameservice; MapR/non-HA uses / directly.
+            logger.info("[4/4] Testing Hadoop FS access...")
+            hdfs_nameservice = config.get('hdfs_nameservice', '')
+            fs_root = f"hdfs://{hdfs_nameservice}/" if hdfs_nameservice else "/"
+            hadoop_inner = f"""
+if hadoop fs -ls {fs_root} > /dev/null 2>&1; then
+    echo "HADOOP_FS_OK"
+else
+    echo "HADOOP_FS_FAIL: hadoop fs -ls returned non-zero"
+fi
+"""
+            _, stdout, stderr = client.exec_command(_login_shell(hadoop_inner, config.get('cluster_type', 'MapR')), timeout=60)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
 
-            if exit_code == 0 and 'HADOOP_FS_OK' in output:
+            if 'HADOOP_FS_OK' in output:
                 validation_results['hadoop_fs_available'] = True
                 logger.info("Hadoop FS: PASSED")
-                version_line = [line for line in output.split('\n') if 'hadoop' in line.lower()]
-                if version_line:
-                    logger.info(f"Version info: {version_line[0].strip()}")
             else:
-                error_msg = f"Hadoop FS commands failed. Output: {output[:200]}"
+                error_msg = output.replace('HADOOP_FS_FAIL: ', '').strip() or f"Hadoop FS access failed (exit={exit_code})"
                 validation_results['errors'].append(f"Hadoop FS: {error_msg}")
                 logger.error(f"Hadoop FS: FAILED - {error_msg}")
 
@@ -161,12 +197,12 @@ def validate_prerequisites(run_id: str) -> dict:
         if not validation_results['ssh_connectivity']:
             validation_results['errors'].append(f"SSH: {error_msg}")
             logger.error(f"SSH connectivity: FAILED - {error_msg}")
+        if not validation_results['cluster_auth']:
+            validation_results['errors'].append("Cluster auth: Skipped due to SSH failure")
+            logger.warning("Cluster auth: SKIPPED (SSH failed)")
         if not validation_results['pyspark_available']:
-            validation_results['errors'].append("PySpark: Skipped due to SSH failure")
-            logger.warning("PySpark: SKIPPED (SSH failed)")
-        if not validation_results['hive_available']:
-            validation_results['errors'].append("Hive: Skipped due to SSH failure")
-            logger.warning("Hive: SKIPPED (SSH failed)")
+            validation_results['errors'].append("PySpark/Hive: Skipped due to SSH failure")
+            logger.warning("PySpark/Hive: SKIPPED (SSH failed)")
         if not validation_results['hadoop_fs_available']:
             validation_results['errors'].append("Hadoop FS: Skipped due to SSH failure")
             logger.warning("Hadoop FS: SKIPPED (SSH failed)")
@@ -178,6 +214,7 @@ def validate_prerequisites(run_id: str) -> dict:
 
     all_passed = all([
         validation_results['ssh_connectivity'],
+        validation_results['cluster_auth'],
         validation_results['pyspark_available'],
         validation_results['hive_available'],
         validation_results['hadoop_fs_available']
@@ -775,17 +812,15 @@ spark.stop()
         sftp.put(str(local_utils), f"{temp_dir}/partition_utils.py")
         sftp.close()
 
-        source_profile = "source ~/.profile 2>/dev/null || true\n"
-
         # Use pyspark < script.py instead of spark-submit
         cmd = f"""
-    {source_profile} cd {temp_dir}
-    pyspark < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}.log
-    """
-        _, stdout, stderr = client.exec_command(cmd, timeout=3600)
-        exit_code = stdout.channel.recv_exit_status()
+cd {temp_dir}
+pyspark --master local[*] < {script_path} 2>&1 | tee discovery_{run_id}_{src_db}_{dest_db}_{dest_bucket_slug}.log
+"""
+        _, stdout, stderr = client.exec_command(_login_shell(cmd, config.get('cluster_type', 'MapR')), timeout=3600, get_pty=True)
         output = stdout.read().decode()
         error_output = stderr.read().decode()
+        exit_code = stdout.channel.recv_exit_status()
 
         logger.info("=== Spark Discovery Output ===")
         logger.info(output[-1000:])
@@ -981,8 +1016,6 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
 
     s3_opts = build_s3_opts(discovery['dest_bucket'], config, discovery.get('dest_endpoint', ''))
 
-    source_profile = "source ~/.profile 2>/dev/null || true\n"
-
     results = []
     for t in tables:
         if t.get('error'):
@@ -1040,8 +1073,7 @@ hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -stra
     "{src_part}" "{dst_part}"
 """
 
-            cmd = f'''{source_profile}
-set -e
+            cmd = f'''set -e
 
 calculate_s3_metrics_hadoop() {{
     local location=$1
@@ -1060,36 +1092,43 @@ calculate_s3_metrics_hadoop() {{
 
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
-echo "INCREMENTAL=$INCR"
 
 echo "=== Calculating S3 metrics BEFORE distcp ==="
 S3_BEFORE=$(calculate_s3_metrics_hadoop "{s3_loc}")
-S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
-S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
-echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
-echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
+S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
+[ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
+[ -z "$S3_TOTAL_SIZE_BEFORE" ] && S3_TOTAL_SIZE_BEFORE=0
 
 echo "=== Running distcp per-partition ==="
 {distcp_calls}
-echo "DISTCP_EXIT_CODE=0"
 
 echo "=== Calculating S3 metrics AFTER distcp ==="
 S3_AFTER=$(calculate_s3_metrics_hadoop "{s3_loc}")
-S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
-S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
-echo "S3_FILE_COUNT_AFTER=$S3_FILE_COUNT_AFTER"
-echo "S3_TOTAL_SIZE_AFTER=$S3_TOTAL_SIZE_AFTER"
+S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
+[ -z "$S3_FILE_COUNT_AFTER" ] && S3_FILE_COUNT_AFTER=0
+[ -z "$S3_TOTAL_SIZE_AFTER" ] && S3_TOTAL_SIZE_AFTER=0
 
 S3_FILES_TRANSFERRED=$((S3_FILE_COUNT_AFTER - S3_FILE_COUNT_BEFORE))
 S3_BYTES_TRANSFERRED=$((S3_TOTAL_SIZE_AFTER - S3_TOTAL_SIZE_BEFORE))
+
+echo "===DISTCP_METRICS_START==="
+echo "INCREMENTAL=$INCR"
+echo "BYTES_COPIED=0"
+echo "FILES_COPIED=0"
+echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
+echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
+echo "S3_FILE_COUNT_AFTER=$S3_FILE_COUNT_AFTER"
+echo "S3_TOTAL_SIZE_AFTER=$S3_TOTAL_SIZE_AFTER"
 echo "S3_FILES_TRANSFERRED=$S3_FILES_TRANSFERRED"
 echo "S3_BYTES_TRANSFERRED=$S3_BYTES_TRANSFERRED"
+echo "===DISTCP_METRICS_END==="
 echo "PARTITIONS_REQUESTED={len(filtered_partitions)}"
 exit 0
 '''
         else:
-            cmd = f'''{source_profile}
-set -e
+            cmd = f'''set -e
 
 calculate_s3_metrics_hadoop() {{
     local location=$1
@@ -1111,46 +1150,45 @@ calculate_s3_metrics_hadoop() {{
 
 INCR=false
 hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
-echo "INCREMENTAL=$INCR"
 
 echo "=== Calculating S3 metrics BEFORE distcp ==="
 S3_BEFORE=$(calculate_s3_metrics_hadoop "{s3_loc}")
-
-S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
-S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
-
-echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
-echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
+S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
+[ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
+[ -z "$S3_TOTAL_SIZE_BEFORE" ] && S3_TOTAL_SIZE_BEFORE=0
 
 echo "=== Running distcp ==="
 DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
-echo "DISTCP_EXIT_CODE=$DISTCP_EXIT"
 
 BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | awk '{{print $NF}}' | tr -d ',')
 FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Number of files copied" | awk '{{print $NF}}' | tr -d ',')
-
 [ -z "$BYTES_COPIED" ] && BYTES_COPIED=0
 [ -z "$FILES_COPIED" ] && FILES_COPIED=0
 
-echo "BYTES_COPIED=$BYTES_COPIED"
-echo "FILES_COPIED=$FILES_COPIED"
-
 echo "=== Calculating S3 metrics AFTER distcp ==="
 S3_AFTER=$(calculate_s3_metrics_hadoop "{s3_loc}")
-
-S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "S3_FILE_COUNT=" | cut -d'=' -f2)
-S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "S3_TOTAL_SIZE=" | cut -d'=' -f2)
-
-echo "S3_FILE_COUNT_AFTER=$S3_FILE_COUNT_AFTER"
-echo "S3_TOTAL_SIZE_AFTER=$S3_TOTAL_SIZE_AFTER"
+S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
+[ -z "$S3_FILE_COUNT_AFTER" ] && S3_FILE_COUNT_AFTER=0
+[ -z "$S3_TOTAL_SIZE_AFTER" ] && S3_TOTAL_SIZE_AFTER=0
 
 S3_FILES_TRANSFERRED=$((S3_FILE_COUNT_AFTER - S3_FILE_COUNT_BEFORE))
 S3_BYTES_TRANSFERRED=$((S3_TOTAL_SIZE_AFTER - S3_TOTAL_SIZE_BEFORE))
 
+echo "===DISTCP_METRICS_START==="
+echo "INCREMENTAL=$INCR"
+echo "BYTES_COPIED=$BYTES_COPIED"
+echo "FILES_COPIED=$FILES_COPIED"
+echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
+echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
+echo "S3_FILE_COUNT_AFTER=$S3_FILE_COUNT_AFTER"
+echo "S3_TOTAL_SIZE_AFTER=$S3_TOTAL_SIZE_AFTER"
 echo "S3_FILES_TRANSFERRED=$S3_FILES_TRANSFERRED"
 echo "S3_BYTES_TRANSFERRED=$S3_BYTES_TRANSFERRED"
+echo "===DISTCP_METRICS_END==="
 
 [ "$DISTCP_EXIT" -ne 0 ] && exit $DISTCP_EXIT
 exit 0
@@ -1159,16 +1197,15 @@ exit 0
         distcp_started_at = _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         try:
             with ssh.get_conn() as client:
-                _, stdout, stderr = client.exec_command(cmd, timeout=SSH_COMMAND_TIMEOUT)
-                exit_code = stdout.channel.recv_exit_status()
+                _, stdout, stderr = client.exec_command(_login_shell(cmd, config.get('cluster_type', 'MapR')), timeout=SSH_COMMAND_TIMEOUT)
                 output = stdout.read().decode()
                 error_output = stderr.read().decode()
+                exit_code = stdout.channel.recv_exit_status()
 
                 logger.info(f"=== DistCp for {src_db}.{tbl} (last 1000 chars) ===")
                 logger.info(output[-1000:])
 
-                is_incr = "INCREMENTAL=true" in output
-
+                is_incr = False
                 bytes_copied = 0
                 files_copied = 0
                 s3_size_before = 0
@@ -1178,27 +1215,48 @@ exit 0
                 s3_bytes_transferred = 0
                 s3_files_transferred = 0
 
-                try:
-                    for line in output.split('\n'):
+                m_start = output.find('===DISTCP_METRICS_START===')
+                m_end   = output.find('===DISTCP_METRICS_END===')
+                if m_start != -1 and m_end != -1:
+                    metrics = {
+                        'INCREMENTAL': 'false',
+                        'BYTES_COPIED': 0,
+                        'FILES_COPIED': 0,
+                        'S3_FILE_COUNT_BEFORE': 0,
+                        'S3_TOTAL_SIZE_BEFORE': 0,
+                        'S3_FILE_COUNT_AFTER': 0,
+                        'S3_TOTAL_SIZE_AFTER': 0,
+                        'S3_FILES_TRANSFERRED': 0,
+                        'S3_BYTES_TRANSFERRED': 0,
+                    }
+                    metrics_block = output[m_start + len('===DISTCP_METRICS_START==='):m_end]
+                    for line in metrics_block.splitlines():
                         line = line.strip()
-                        if 'BYTES_COPIED=' in line:
-                            bytes_copied = int(line.split('=')[1].strip() or 0)
-                        elif 'FILES_COPIED=' in line:
-                            files_copied = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_TOTAL_SIZE_BEFORE=' in line:
-                            s3_size_before = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_FILE_COUNT_BEFORE=' in line:
-                            s3_files_before = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_TOTAL_SIZE_AFTER=' in line:
-                            s3_size_after = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_FILE_COUNT_AFTER=' in line:
-                            s3_files_after = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_BYTES_TRANSFERRED=' in line:
-                            s3_bytes_transferred = int(line.split('=')[1].strip() or 0)
-                        elif 'S3_FILES_TRANSFERRED=' in line:
-                            s3_files_transferred = int(line.split('=')[1].strip() or 0)
-                except Exception:
-                    pass
+                        if '=' not in line:
+                            continue
+                        key, _, val = line.partition('=')
+                        key = key.strip()
+                        if key not in metrics:
+                            continue
+                        val = val.strip()
+                        if key == 'INCREMENTAL':
+                            metrics[key] = val
+                        else:
+                            try:
+                                metrics[key] = int(val or 0)
+                            except ValueError:
+                                logger.warning(f"[DistCp] Could not parse metric '{key}={val}' for {src_db}.{tbl}")
+                    is_incr              = metrics['INCREMENTAL'].lower() == 'true'
+                    bytes_copied         = metrics['BYTES_COPIED']
+                    files_copied         = metrics['FILES_COPIED']
+                    s3_size_before       = metrics['S3_TOTAL_SIZE_BEFORE']
+                    s3_files_before      = metrics['S3_FILE_COUNT_BEFORE']
+                    s3_size_after        = metrics['S3_TOTAL_SIZE_AFTER']
+                    s3_files_after       = metrics['S3_FILE_COUNT_AFTER']
+                    s3_bytes_transferred = metrics['S3_BYTES_TRANSFERRED']
+                    s3_files_transferred = metrics['S3_FILES_TRANSFERRED']
+                else:
+                    logger.warning(f"[DistCp] Metrics block not found in output for {src_db}.{tbl} — all metrics will be 0")
 
                 if exit_code != 0:
                     logger.error(f"=== DistCp Error for {src_db}.{tbl} ===")
@@ -2066,6 +2124,8 @@ def generate_html_report(run_id: str, spark) -> str:
     total_rows = sum(t.source_row_count or 0 for t in table_status)
     incremental_runs = sum(1 for t in table_status if t.distcp_is_incremental)
 
+    cluster_type = config.get('cluster_type', 'MapR')
+
     # Generate HTML
     html = f"""
 <!DOCTYPE html>
@@ -2073,7 +2133,7 @@ def generate_html_report(run_id: str, spark) -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MapR to S3 Migration Report - {run_id}</title>
+    <title>{cluster_type} to S3 Migration Report - {run_id}</title>
     <style>
         body {{
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -2211,7 +2271,7 @@ def generate_html_report(run_id: str, spark) -> str:
 </head>
 <body>
     <div class="container">
-        <h1>MapR to S3 Migration Report</h1>
+        <h1>{cluster_type} to S3 Migration Report</h1>
 
         <div class="timestamp">
             Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC<br>
@@ -2481,12 +2541,12 @@ def generate_html_report(run_id: str, spark) -> str:
                 <tr>
                     <th>Database</th>
                     <th>Table</th>
-                    <th>MapR Size (GB)</th>
+                    <th>{cluster_type} Size (GB)</th>
                     <th>S3 Size Before (GB)</th>
                     <th>S3 Size After (GB)</th>
                     <th>S3 Size - Transferred (GB)</th>
                     <th>Size Match</th>
-                    <th>MapR Files</th>
+                    <th>{cluster_type} Files</th>
                     <th>S3 Files Before</th>
                     <th>S3 Files After</th>
                     <th>S3 Files - Transferred</th>
@@ -2574,7 +2634,7 @@ def generate_html_report(run_id: str, spark) -> str:
         </table>
 
         <div style="margin-top: 50px; padding-top: 20px; border-top: 1px solid #ecf0f1; color: #95a5a6; font-size: 12px;">
-            <p>This report was automatically generated by the MapR to S3 Migration DAG.</p>
+            <p>This report was automatically generated by the {cluster_type} to S3 Migration DAG.</p>
         </div>
     </div>
 </body>
@@ -2753,12 +2813,12 @@ def send_migration_report_email(report_result: dict, run_id: str, spark) -> dict
 with DAG(
     dag_id='source_to_s3_migration',
     default_args=default_args,
-    description='Migrate Hive tables from MapR-FS to S3',
+    description='Migrate Hive tables from source cluster (MapR/HDP) to S3',
     schedule=None,
     start_date=datetime(2025, 1, 1),
     catchup=False,
     max_active_runs=5,
-    tags=['migration', 'mapr', 's3', 'hive'],
+    tags=['migration', 'source-cluster', 's3', 'hive'],
     params={
         'excel_file_path': Param(
             default='s3a://config-bucket/migration.xlsx',

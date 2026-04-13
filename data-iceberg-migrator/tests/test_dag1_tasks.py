@@ -15,9 +15,9 @@ class TestValidatePrerequisites:
         hook, client, stdout_mock, _ = mock_ssh_hook
         responses = [
             (MagicMock(), mock_ssh_stdout(0, b'SSH_TEST_OK'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'PySpark 3.4.0'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'Hive 3.1.0'), MagicMock()),
-            (MagicMock(), mock_ssh_stdout(0, b'Hadoop 3.3.0\nHADOOP_FS_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b'CLUSTER_AUTH_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b'PYSPARK_HIVE_OK'), MagicMock()),
+            (MagicMock(), mock_ssh_stdout(0, b'HADOOP_FS_OK'), MagicMock()),
         ]
         for r in responses:
             r[2].read.return_value = b''
@@ -25,6 +25,7 @@ class TestValidatePrerequisites:
 
         result = m.validate_prerequisites.function(run_id='test_run')
         assert result['ssh_connectivity'] is True
+        assert result['cluster_auth'] is True
         assert result['pyspark_available'] is True
         assert result['hive_available'] is True
         assert result['hadoop_fs_available'] is True
@@ -379,11 +380,13 @@ class TestRunDistcpSsh:
 
     def _make_distcp_stdout(self, incremental=False):
         return mock_ssh_stdout(0, (
+            "===DISTCP_METRICS_START===\n"
             f"INCREMENTAL={'true' if incremental else 'false'}\n"
             "S3_FILE_COUNT_BEFORE=0\nS3_TOTAL_SIZE_BEFORE=0\nDISTCP_EXIT_CODE=0\n"
             "BYTES_COPIED=10485760\nFILES_COPIED=5\n"
             "S3_FILE_COUNT_AFTER=5\nS3_TOTAL_SIZE_AFTER=10485760\n"
             "S3_FILES_TRANSFERRED=5\nS3_BYTES_TRANSFERRED=10485760\n"
+            "===DISTCP_METRICS_END===\n"
         ).encode())
 
     def test_successful_copy_detects_incremental(self, mock_ssh_hook, sample_discovery):

@@ -19,6 +19,7 @@ from airflow.providers.ssh.hooks.ssh import SSHHook
 from dotenv import load_dotenv
 from utils.migrations.shared import (
     SSH_COMMAND_TIMEOUT,
+    _login_shell,
     build_s3_opts,
     cluster_login,
     execute_with_iceberg_retry,
@@ -75,10 +76,10 @@ def validate_prerequisites_folder_copy() -> dict:
 
             # 1. SSH connectivity
             logger.info("[1/3] Testing SSH connectivity...")
-            _, stdout, stderr = client.exec_command('echo "SSH_TEST_OK"', timeout=30)
-            exit_code = stdout.channel.recv_exit_status()
+            _, stdout, stderr = client.exec_command(_login_shell('echo "SSH_TEST_OK"', config.get('cluster_type', 'MapR')), timeout=30)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
             if exit_code == 0 and "SSH_TEST_OK" in output:
                 checks['ssh_connectivity'] = True
                 logger.info("SSH connectivity: PASSED")
@@ -89,11 +90,11 @@ def validate_prerequisites_folder_copy() -> dict:
 
             # 2. Hadoop DistCp
             logger.info("[2/3] Testing hadoop distcp availability...")
-            test_cmd = "source ~/.profile 2>/dev/null || true\nhadoop distcp --help > /dev/null 2>&1 && echo DISTCP_OK || echo DISTCP_FAIL"
-            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
-            exit_code = stdout.channel.recv_exit_status()
+            test_cmd = "hadoop distcp --help > /dev/null 2>&1 && echo DISTCP_OK || echo DISTCP_FAIL"
+            _, stdout, stderr = client.exec_command(_login_shell(test_cmd, config.get('cluster_type', 'MapR')), timeout=60)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
             if "DISTCP_OK" in output:
                 checks['hadoop_distcp_available'] = True
                 logger.info("Hadoop DistCp: PASSED")
@@ -104,11 +105,13 @@ def validate_prerequisites_folder_copy() -> dict:
 
             # 3. Hadoop FS
             logger.info("[3/3] Testing Hadoop FS commands...")
-            test_cmd = "source ~/.profile 2>/dev/null || true\nhadoop fs -ls / > /dev/null 2>&1 && echo HADOOP_FS_OK || echo HADOOP_FS_FAIL"
-            _, stdout, stderr = client.exec_command(test_cmd, timeout=60)
-            exit_code = stdout.channel.recv_exit_status()
+            hdfs_nameservice = config.get('hdfs_nameservice', '')
+            fs_root = f"hdfs://{hdfs_nameservice}/" if hdfs_nameservice else "/"
+            test_cmd = f"if hadoop fs -ls {fs_root} > /dev/null 2>&1; then echo HADOOP_FS_OK; else echo HADOOP_FS_FAIL; fi"
+            _, stdout, stderr = client.exec_command(_login_shell(test_cmd, config.get('cluster_type', 'MapR')), timeout=60)
             output = stdout.read().decode()
             stderr.read()
+            exit_code = stdout.channel.recv_exit_status()
             if "HADOOP_FS_OK" in output:
                 checks['hadoop_fs_available'] = True
                 logger.info("Hadoop FS: PASSED")
@@ -226,7 +229,7 @@ def parse_folder_copy_excel(excel_file_path: str, run_id: str, spark) -> list:
     """Read folder copy Excel config from S3.
 
     Expected columns:
-      - source_path   (required) : Full MapR/HDFS source path
+      - source_path   (required) : Full source cluster path (MapR-FS or HDFS)
       - target_bucket (required) : S3 bucket, normalised to s3a://
       - dest_folder   (optional) : Destination folder inside the bucket;
                                    defaults to the basename of source_path
@@ -311,10 +314,7 @@ def run_folder_distcp_ssh(folder_config: dict, **context) -> dict:
 
     s3_opts = build_s3_opts(dest_bucket, config, dest_endpoint)
 
-    source_profile = "source ~/.profile 2>/dev/null || true\n"
-
-    cmd = f'''{source_profile}
-set -e
+    cmd = f'''set -e
 
 calculate_s3_metrics() {{
     local location=$1
@@ -372,10 +372,10 @@ exit 0
 
     try:
         with ssh.get_conn() as client:
-            _, stdout, stderr = client.exec_command(cmd, timeout=SSH_COMMAND_TIMEOUT)
-            exit_code = stdout.channel.recv_exit_status()
+            _, stdout, stderr = client.exec_command(_login_shell(cmd, config.get('cluster_type', 'MapR')), timeout=SSH_COMMAND_TIMEOUT)
             output = stdout.read().decode()
             error_output = stderr.read().decode()
+            exit_code = stdout.channel.recv_exit_status()
 
             logger.info(f"[FolderDistCp] {source_path} -> {s3_dest} (last 1000 chars):")
             logger.info(output[-1000:])
@@ -558,8 +558,7 @@ def validate_data_copy(copy_status: dict, **context) -> dict:
         context['ti'].xcom_push(key='return_value', value=result)
         raise Exception(f"Validation skipped — upstream copy FAILED for {source_path}")
 
-    cmd = f"""source ~/.profile 2>/dev/null || true
-
+    cmd = f"""
 if ! hadoop fs{s3_opts} -test -d "{s3_dest}" 2>/dev/null; then
     echo "DEST_EXISTS=false"
     echo "DEST_FILE_COUNT=0"
@@ -582,10 +581,10 @@ fi
 
     try:
         with ssh.get_conn() as client:
-            _, stdout, stderr = client.exec_command(cmd, timeout=SSH_COMMAND_TIMEOUT)
-            stdout.channel.recv_exit_status()
+            _, stdout, stderr = client.exec_command(_login_shell(cmd, config.get('cluster_type', 'MapR')), timeout=SSH_COMMAND_TIMEOUT)
             output = stdout.read().decode()
             stderr.read()
+            stdout.channel.recv_exit_status()
 
             for line in output.split('\n'):
                 line = line.strip()
@@ -1009,12 +1008,12 @@ def send_data_copy_report_email(report_result: dict, run_id: str, spark) -> dict
 with DAG(
     dag_id='folder_only_data_copy',
     default_args=default_args,
-    description='Copy folders from MapR/HDFS to S3 via DistCp — no Hive metadata',
+    description='Copy folders from source cluster (MapR/HDP) to S3 via DistCp — no Hive metadata',
     schedule=None,
     start_date=datetime(2025, 1, 1),
     catchup=False,
     max_active_runs=3,
-    tags=['migration', 'mapr', 's3', 'folder-copy'],
+    tags=['migration', 'source-cluster', 's3', 'folder-copy'],
     params={
         'excel_file_path': Param(
             default='s3a://config-bucket/folder_copy.xlsx',

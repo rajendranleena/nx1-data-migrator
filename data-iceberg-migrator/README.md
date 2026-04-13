@@ -1,6 +1,6 @@
-# MapR to S3 Migration DAG
+# Source (MapR-FS/HDP-HDFS) to S3 Migration DAG
 
-An automated **Airflow TaskFlow-based migration pipeline** consisting of two independent DAGs for orchestrating large-scale Hive table migrations from MapR-FS/HDFS to S3 and converting existing tables to Iceberg format.
+An automated **Airflow TaskFlow-based migration pipeline** consisting of two independent DAGs for orchestrating large-scale Hive table migrations from source (MapR-FS or HDP-HDFS) to S3 and converting existing tables to Iceberg format.
 
 ---
 
@@ -8,9 +8,9 @@ An automated **Airflow TaskFlow-based migration pipeline** consisting of two ind
 
 This implementation provides three independent but complementary migration DAGs:
 
-1. **`mapr_to_s3_migration`** - Migrates Hive tables from MapR-FS/HDFS to S3
+1. **`source_to_s3_migration`** - Migrates Hive tables from source (MapR-FS/HDP-HDFS) to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
-3. **`folder_only_data_copy`** - Copies raw folders from MapR/HDFS to S3 via DistCp — no Hive metadata
+3. **`folder_only_data_copy`** - Copies raw folders from source cluster (MapR-FS/HDP-HDFS) to S3 via DistCp — no Hive metadata
 4. **`s3_to_s3_metadata_migration`** - Metadata-only migration with pluggable strategies: recreate Hive external tables (`hive_to_hive`) or register file-based Iceberg tables into HMS (`iceberg_to_iceberg`)
 
 ---
@@ -23,8 +23,8 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 
 | Variable                      | Description                                     | Example                              | Applies To                                            |
 | ----------------------------- | ----------------------------------------------- | ------------------------------------ | ----------------------------------------------------- |
-| `cluster_ssh_conn_id`         | Airflow SSH connection ID for cluster edge node | `cluster_edge_ssh`                   | `mapr_to_s3_migration`, `folder_only_data_copy`       |
-| `migration_default_s3_bucket` | Default S3 bucket for migrations                | `s3a://data-lake`                    | `mapr_to_s3_migration`, `s3_to_s3_metadata_migration` |
+| `cluster_ssh_conn_id`         | Airflow SSH connection ID for cluster edge node | `cluster_edge_ssh`                   | `source_to_s3_migration`, `folder_only_data_copy`       |
+| `migration_default_s3_bucket` | Default S3 bucket for migrations                | `s3a://data-lake`                    | `source_to_s3_migration`, `s3_to_s3_metadata_migration` |
 | `migration_tracking_database` | Database name for tracking tables               | `migration_tracking`                 | All DAGs                                              |
 | `migration_tracking_location` | S3 location for tracking tables                 | `s3a://data-lake/migration_tracking` | All DAGs                                              |
 | `migration_report_location`   | S3 location for HTML reports                    | `s3a://data-lake/migration_reports`  | All DAGs                                              |
@@ -34,26 +34,25 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 
 | Variable                   | Description                                       | Required For           | Applies To                                            |
 | -------------------------- | ------------------------------------------------- | ---------------------- | ----------------------------------------------------- |
-| `auth_method`              | Authentication method: `mapr`, `kinit`, or `none` | MapR/Kerberos          | `mapr_to_s3_migration`, `folder_only_data_copy`       |
-| `mapr_user`                | MapR username used to validate existing ticket    | MapR auth              | `mapr_to_s3_migration`, `folder_only_data_copy`       |
-| `mapr_ticketfile_location` | MapR ticket file path                             | MapR auth              | `mapr_to_s3_migration`, `folder_only_data_copy`       |
-| `kinit_principal`          | Kerberos principal                                | Kerberos auth          | `mapr_to_s3_migration`, `folder_only_data_copy`       |
-| `kinit_keytab`             | Path to Kerberos keytab file                      | Kerberos keytab auth   | `mapr_to_s3_migration`, `folder_only_data_copy`       |
-| `kinit_password`           | Kerberos password                                 | Kerberos password auth | `mapr_to_s3_migration`, `folder_only_data_copy`       |
+| `auth_method`              | Authentication method: `mapr`, `kinit`, or `none` | MapR/Kerberos          | `source_to_s3_migration`, `folder_only_data_copy`       |
+| `mapr_user`                | MapR username used to validate existing ticket    | MapR auth              | `source_to_s3_migration`, `folder_only_data_copy`       |
+| `mapr_ticketfile_location` | MapR ticket file path                             | MapR auth              | `source_to_s3_migration`, `folder_only_data_copy`       |
+| `cluster_type`             | Display label for reports: `MapR`, `HDP`, etc.    | HTML reports           | `source_to_s3_migration`                                |
 
 ### Optional Variables
 
 | Variable                     | Default          | Description                                  | Applies To                                                                            |
 | ---------------------------- | ---------------- | -------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `cluster_edge_temp_path`     | `/tmp/migration` | Temporary directory on edge node             | `mapr_to_s3_migration`, `folder_only_data_copy`                                       |
-| `s3_endpoint`                | _(empty)_        | Default S3 endpoint URL (all buckets)        | `mapr_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
-| `s3_access_key`              | _(empty)_        | Default S3 access key (all buckets)          | `mapr_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
-| `s3_secret_key`              | _(empty)_        | Default S3 secret key (all buckets)          | `mapr_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
-| `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                     | `mapr_to_s3_migration`, `folder_only_data_copy`                                       |
-| `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)            | `mapr_to_s3_migration`, `folder_only_data_copy`                                       |
+| `cluster_edge_temp_path`     | `/tmp/migration` | Temporary directory on edge node             | `source_to_s3_migration`, `folder_only_data_copy`                                       |
+| `s3_endpoint`                | _(empty)_        | Default S3 endpoint URL (all buckets)        | `source_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
+| `s3_access_key`              | _(empty)_        | Default S3 access key (all buckets)          | `source_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
+| `s3_secret_key`              | _(empty)_        | Default S3 secret key (all buckets)          | `source_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
+| `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                     | `source_to_s3_migration`, `folder_only_data_copy`                                       |
+| `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)            | `source_to_s3_migration`, `folder_only_data_copy`                                       |
 | `s3_listing_tool`            | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`     | Currently unused                                                                      |
 | `migration_smtp_conn_id`     | `smtp_default`   | Airflow SMTP connection ID for email reports | All DAGs                                                                              |
 | `migration_email_recipients` | _(empty)_        | Comma-separated email addresses for reports  | All DAGs                                                                              |
+| `hdfs_nameservice`           | _(empty)_        | HDFS HA nameservice (e.g. `mycluster`); leave empty for MapR | `source_to_s3_migration`, `folder_only_data_copy` |
 
 ### Multi-Tenant S3 Credentials (endpoint-based overrides)
 
@@ -136,9 +135,9 @@ single-tenant setups.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ DAG 1: MapR to S3                                           │
+│ DAG 1: Source (MapR-FS/HDP-HDFS) to S3                              │
 │                                                             │
-│ MapR-FS/HDFS (Hive Tables)                                  │
+│ Source MapR-FS/HDP-HDFS (Hive Tables)                               │
 │ │                                                           │
 │ │ [PySpark: Metadata Discovery]                             │
 │ ▼                                                           │
@@ -203,9 +202,9 @@ single-tenant setups.
 ### Migration Strategy Decision Tree
 
 ```
-Do you need to migrate from MapR-FS/HDFS to S3?
+Do you need to migrate from source cluster (MapR-FS/HDFS) to S3?
 │
-├─ YES → Run DAG 1 (mapr_to_s3_migration)
+├─ YES → Run DAG 1 (source_to_s3_migration)
 │ │
 │ │
 │ └─ Need Iceberg format?
@@ -233,17 +232,17 @@ Do you need to migrate from MapR-FS/HDFS to S3?
 
 ---
 
-## DAG 1: MapR to S3 Migration
+## DAG 1: Source Cluster to S3 Migration
 
 ### Purpose
 
-Orchestrates the complete migration of Hive tables from MapR-FS/HDFS to S3, including data transfer, metadata recreation, and validation.
+Orchestrates the complete migration of Hive tables from a source cluster (MapR-FS or HDP/HDFS) to S3, including data transfer, metadata recreation, and validation.
 
 ---
 
 ### Key Features
 
-- **SSH Operations** - All MapR interactions via SSH to edge node
+- **SSH Operations** - All source (MapR/HDP) cluster interactions via SSH to edge node
 - **Beeline Discovery** - Automated metadata extraction using HiveServer2
 - **Hadoop DistCp** - Efficient bulk data transfer with 24-hour timeout
 - **Incremental Support** - Automatic detection and `update` flag usage
@@ -289,7 +288,7 @@ Tasks decorated with `@track_duration` automatically capture execution time:
 ### Task Flow
 
 ```
-validate_prerequisites (SSH: connectivity, PySpark, Hive, Hadoop FS checks)
+validate_prerequisites (SSH: connectivity, cluster auth, PySpark+Hive, Hadoop FS checks)
 ↓
 init_tracking_tables
 ↓
@@ -340,10 +339,13 @@ cleanup_edge (SSH: Cleanup temp files)
 - Connects to the cluster edge node via SSH
 - Runs four sequential checks:
   1. **SSH Connectivity** - Verifies SSH connection works with a simple echo command
-  2. **PySpark Availability** - Checks `pyspark --version` is accessible on the edge node
-  3. **Hive Availability** - Checks `hive --version` is accessible on the edge node
-  4. **Hadoop FS** - Verifies `hadoop fs -ls /` executes successfully
-- Sources `~/.profile` before each check to ensure environment variables are loaded
+  2. **Cluster Authentication** - Verifies a valid ticket/TGT exists before attempting any cluster operations:
+     - `mapr`: `maprlogin print | grep -q <mapr_user>` — confirms a valid MapR ticket for the configured user
+     - `kinit`: `klist -s` — confirms a valid Kerberos TGT in the ccache (populated by the login shell)
+     - `none`: skipped (auto-passes)
+  3. **PySpark + Hive Metastore** - Starts a real `SparkSession` with `enableHiveSupport()` and runs `SHOW DATABASES`
+  4. **Hadoop FS** - Runs `hadoop fs -ls /` (MapR) or `hadoop fs -ls hdfs://<nameservice>/` (HDFS HA) to confirm filesystem access
+- Sources `/etc/profile.d/*.sh` via a bash login shell before each check to ensure cluster auth and environment variables are loaded
 - If **all four checks pass**, proceeds with migration
 - If **any check fails**, raises an exception with a detailed summary of which checks failed and why, halting the DAG before any tracking tables or run records are created
 
@@ -398,8 +400,8 @@ cleanup_edge (SSH: Cleanup temp files)
 
 - Connects to the cluster edge node via SSH
 - Authenticates using one of the following methods, based on configuration:
-  1. **Kerberos authentication** - Uses `kinit_principal` and `kinit_keytab` or `kinit_password`
-  2. **Existing MapR or Kerberos ticket** - Validates and uses existing valid ticket
+  1. **Kerberos authentication** - Assumes a valid Kerberos ticket sourced via the login shell
+  2. **Existing MapR ticket** - Validates existing valid ticket with `maprlogin print`
 - Verifies ticket validity with `maprlogin print` or `klist`
 - Creates temporary working directory on edge node (`/tmp/migration/{run_id}`)
 - Ensures all subsequent SSH operations can access the source filesystem
@@ -1101,23 +1103,7 @@ send_data_copy_report_email
   1. **SSH Connectivity** — verifies SSH connection with a simple echo command
   2. **Hadoop DistCp** — checks `hadoop distcp` is available on the edge node
   3. **Hadoop FS** — verifies `hadoop fs -ls /` executes successfully
-- Sources `~/.profile` before each check to ensure environment variables are loaded
-- If **all checks pass**, returns a `checks` dict and proceeds
-- If **any check fails**, raises an exception with a detailed summary, halting the DAG before any tracking tables or run records are created
-
----
-
-#### Step 2 - `init_folder_copy_tracking_tables`
-
-**Type:** SSH
-**Purpose:** Validate SSH connectivity and Hadoop tooling before starting the folder copy
-
-- Connects to the cluster edge node via SSH
-- Runs three sequential checks:
-  1. **SSH Connectivity** — verifies SSH connection with a simple echo command
-  2. **Hadoop DistCp** — checks `hadoop distcp` is available on the edge node
-  3. **Hadoop FS** — verifies `hadoop fs -ls /` executes successfully
-- Sources `~/.profile` before each check to ensure environment variables are loaded
+- Sources environment via the login shell before each check to ensure environment variables are loaded
 - If **all checks pass**, returns a `checks` dict and proceeds
 - If **any check fails**, raises an exception with a detailed summary, halting the DAG before any tracking tables or run records are created
 
