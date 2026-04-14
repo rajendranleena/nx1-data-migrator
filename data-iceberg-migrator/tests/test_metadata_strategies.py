@@ -103,22 +103,18 @@ class TestIcebergParseExcelRows:
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
-            'database': 'warehouse',
+            'database': 'analytics',
             'table': 'orders',
-            'dest_database': 'analytics',
-            'dest_bucket': 's3a://dest-bkt',
-            'source_s3_prefix': '',
-            'dest_s3_prefix': '',
             'source_table_path': 's3a://bucket/warehouse/orders',
         }])
         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
-        config = {'default_s3_bucket': 's3a://default-bucket'}
-        result = parse_excel_rows(df, config, 'run_123')
+        result = parse_excel_rows(df, {}, 'run_123')
 
         assert len(result) == 1
-        assert result[0]['source_database'] == 'warehouse'
+        assert result[0]['source_database'] == 'analytics'
         assert result[0]['dest_database'] == 'analytics'
+        assert 'dest_bucket' not in result[0]
         assert len(result[0]['table_entries']) == 1
         assert result[0]['table_entries'][0]['table_name'] == 'orders'
         assert result[0]['table_entries'][0]['source_table_path'] == 's3a://bucket/warehouse/orders'
@@ -129,73 +125,63 @@ class TestIcebergParseExcelRows:
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
-            'database': 'warehouse',
+            'database': 'analytics',
             'table': 'orders',
-            'dest_database': 'analytics',
-            'dest_bucket': 's3a://dest-bkt',
-            'source_s3_prefix': '',
-            'dest_s3_prefix': '',
             'source_table_path': '',
         }])
         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
-        config = {'default_s3_bucket': 's3a://default-bucket'}
-        result = parse_excel_rows(df, config, 'run_123')
+        result = parse_excel_rows(df, {}, 'run_123')
         assert len(result) == 0
 
-    def test_groups_by_dest_database(self):
+    def test_groups_by_database(self):
         import pandas as pd
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([
-            {'database': 'wh', 'table': 'orders', 'dest_database': 'analytics',
-             'dest_bucket': 's3a://bkt', 'source_s3_prefix': '', 'dest_s3_prefix': '',
+            {'database': 'analytics', 'table': 'orders',
              'source_table_path': 's3a://bucket/wh/orders'},
-            {'database': 'wh', 'table': 'users', 'dest_database': 'analytics',
-             'dest_bucket': 's3a://bkt', 'source_s3_prefix': '', 'dest_s3_prefix': '',
+            {'database': 'analytics', 'table': 'users',
              'source_table_path': 's3a://bucket/wh/users'},
         ])
         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
-        config = {'default_s3_bucket': 's3a://default-bucket'}
-        result = parse_excel_rows(df, config, 'run_123')
+        result = parse_excel_rows(df, {}, 'run_123')
 
         assert len(result) == 1
         assert len(result[0]['table_entries']) == 2
 
-    def test_normalizes_s3_paths(self):
+    def test_different_databases_produce_separate_configs(self):
+        import pandas as pd
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+
+        df = pd.DataFrame([
+            {'database': 'analytics', 'table': 'orders',
+             'source_table_path': 's3a://bucket/wh/orders'},
+            {'database': 'reporting', 'table': 'summary',
+             'source_table_path': 's3a://bucket/wh/summary'},
+        ])
+        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+
+        result = parse_excel_rows(df, {}, 'run_123')
+
+        assert len(result) == 2
+        dbs = {r['dest_database'] for r in result}
+        assert dbs == {'analytics', 'reporting'}
+
+    def test_normalizes_source_table_path(self):
         import pandas as pd
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
-            'database': 'wh', 'table': 'orders', 'dest_database': 'analytics',
-            'dest_bucket': 's3://bkt', 'source_s3_prefix': '', 'dest_s3_prefix': '',
+            'database': 'analytics', 'table': 'orders',
             'source_table_path': 's3n://bucket/wh/orders',
         }])
         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
-        config = {'default_s3_bucket': 's3a://default-bucket'}
-        result = parse_excel_rows(df, config, 'run_123')
+        result = parse_excel_rows(df, {}, 'run_123')
 
-        assert result[0]['dest_bucket'] == 's3a://bkt'
         assert result[0]['table_entries'][0]['source_table_path'] == 's3a://bucket/wh/orders'
-
-    def test_skips_row_with_both_dest_bucket_and_prefix_pair(self):
-        import pandas as pd
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
-
-        df = pd.DataFrame([{
-            'database': 'wh', 'table': 'orders', 'dest_database': 'analytics',
-            'dest_bucket': 's3a://explicit-bkt',
-            'source_s3_prefix': 's3a://src/data',
-            'dest_s3_prefix': 's3a://dst/data',
-            'source_table_path': 's3a://src/data/wh/orders',
-        }])
-        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
-
-        config = {'default_s3_bucket': 's3a://default-bucket'}
-        result = parse_excel_rows(df, config, 'run_123')
-        assert len(result) == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,11 +197,8 @@ class TestIcebergDiscoverTables:
         _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
 
         db_config = {
-            'source_database': 'warehouse',
+            'source_database': 'analytics',
             'dest_database': 'analytics',
-            'dest_bucket': 's3a://dest-bkt',
-            'source_s3_prefix': '',
-            'dest_s3_prefix': '',
             'table_entries': [
                 {'table_name': 'orders', 'source_table_path': 's3a://bucket/warehouse/orders'},
             ],
@@ -227,9 +210,10 @@ class TestIcebergDiscoverTables:
         assert len(result) == 1
         tbl = result[0]
         assert tbl['source_table'] == 'orders'
-        assert tbl['source_database'] == 'warehouse'
+        assert tbl['source_database'] == 'analytics'
         assert tbl['dest_database'] == 'analytics'
         assert tbl['source_location'] == 's3a://bucket/warehouse/orders'
+        assert tbl['dest_location'] == 's3a://bucket/warehouse/orders'
         assert tbl['source_row_count'] == 5000
         assert tbl['is_partitioned'] is True
         assert 'dt' in tbl['partition_columns']
@@ -241,8 +225,7 @@ class TestIcebergDiscoverTables:
         _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
 
         db_config = {
-            'source_database': 'wh', 'dest_database': 'dest',
-            'dest_bucket': 's3a://bkt', 'source_s3_prefix': '', 'dest_s3_prefix': '',
+            'source_database': 'analytics', 'dest_database': 'analytics',
             'table_entries': [{'table_name': 'orders', 'source_table_path': 's3a://bucket/wh/orders'}],
             'run_id': 'run_123',
         }
@@ -263,8 +246,7 @@ class TestIcebergDiscoverTables:
         _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA, has_version_hint=False)
 
         db_config = {
-            'source_database': 'wh', 'dest_database': 'dest',
-            'dest_bucket': 's3a://bkt', 'source_s3_prefix': '', 'dest_s3_prefix': '',
+            'source_database': 'analytics', 'dest_database': 'analytics',
             'table_entries': [{'table_name': 'orders', 'source_table_path': 's3a://bucket/wh/orders'}],
             'run_id': 'run_123',
         }
@@ -280,8 +262,7 @@ class TestIcebergDiscoverTables:
         fs_mock.exists.side_effect = Exception("S3 connection refused")
 
         db_config = {
-            'source_database': 'wh', 'dest_database': 'dest',
-            'dest_bucket': 's3a://bkt', 'source_s3_prefix': '', 'dest_s3_prefix': '',
+            'source_database': 'analytics', 'dest_database': 'analytics',
             'table_entries': [{'table_name': 'orders', 'source_table_path': 's3a://bucket/wh/orders'}],
             'run_id': 'run_123',
         }
@@ -290,33 +271,14 @@ class TestIcebergDiscoverTables:
         assert 'error' in result[0]
         assert result[0]['source_table'] == 'orders'
 
-    def test_uses_prefix_remapping_for_dest_path(self, mock_spark):
+    def test_dest_location_equals_source(self, mock_spark):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
         from utils.migrations.shared import get_config
 
         _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
 
         db_config = {
-            'source_database': 'wh', 'dest_database': 'dest',
-            'dest_bucket': 's3a://dest-bkt',
-            'source_s3_prefix': 's3a://bucket/warehouse',
-            'dest_s3_prefix': 's3a://dest-bkt/warehouse',
-            'table_entries': [{'table_name': 'orders', 'source_table_path': 's3a://bucket/warehouse/orders'}],
-            'run_id': 'run_123',
-        }
-        result = discover_tables(db_config, mock_spark, get_config())
-        assert result[0]['dest_location'] == 's3a://dest-bkt/warehouse/orders'
-
-    def test_data_stays_in_place_without_prefix(self, mock_spark):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
-        from utils.migrations.shared import get_config
-
-        _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
-
-        db_config = {
-            'source_database': 'wh', 'dest_database': 'dest',
-            'dest_bucket': 's3a://dest-bkt',
-            'source_s3_prefix': '', 'dest_s3_prefix': '',
+            'source_database': 'analytics', 'dest_database': 'analytics',
             'table_entries': [{'table_name': 'orders', 'source_table_path': 's3a://bucket/warehouse/orders'}],
             'run_id': 'run_123',
         }
@@ -354,11 +316,20 @@ class TestIcebergCreateDestTable:
         assert 'register_table' in calls_str
         assert 'analytics.orders' in calls_str
 
-    def test_refreshes_existing_table(self, mock_spark):
+    def test_refreshes_existing_table_at_same_location(self, mock_spark):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
         from utils.migrations.shared import get_config
 
-        mock_spark.sql.return_value = MagicMock()  # DESCRIBE succeeds
+        def sql_router(sql):
+            sl = sql.lower().strip()
+            df = MagicMock()
+            if sl.startswith('describe formatted'):
+                loc = MagicMock()
+                loc.col_name = 'Location'
+                loc.data_type = 's3a://bucket/warehouse/orders'
+                df.collect.return_value = [loc]
+            return df
+        mock_spark.sql.side_effect = sql_router
 
         table_info = {
             'source_table': 'orders',
@@ -371,6 +342,34 @@ class TestIcebergCreateDestTable:
         assert result['existed'] is True
         calls_str = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
         assert 'REFRESH TABLE' in calls_str
+
+    def test_fails_when_existing_table_points_to_different_location(self, mock_spark):
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
+        from utils.migrations.shared import get_config
+
+        def sql_router(sql):
+            sl = sql.lower().strip()
+            df = MagicMock()
+            if sl.startswith('describe formatted'):
+                loc = MagicMock()
+                loc.col_name = 'Location'
+                loc.data_type = 's3a://other-bucket/old/orders'
+                df.collect.return_value = [loc]
+            return df
+        mock_spark.sql.side_effect = sql_router
+
+        table_info = {
+            'source_table': 'orders',
+            'dest_location': 's3a://bucket/warehouse/orders',
+            'file_format': 'PARQUET',
+        }
+        result = create_dest_table(table_info, 'analytics', mock_spark, get_config())
+
+        assert result['status'] == 'FAILED'
+        assert result['existed'] is True
+        assert 'LOCATION MISMATCH' not in result['error']  # that's in the log, not the error
+        assert 'already exists' in result['error']
+        assert 's3a://other-bucket/old/orders' in result['error']
 
     def test_returns_error_on_failure(self, mock_spark):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table

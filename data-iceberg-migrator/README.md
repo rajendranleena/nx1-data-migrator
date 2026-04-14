@@ -1286,9 +1286,9 @@ Metadata-only migration: discovers source table schemas and recreates them at a 
 ### Key Features
 
 - **Strategy Pattern** - Pluggable migration types (`hive_to_hive`, `iceberg_to_iceberg`) with a shared pipeline
-- **No Data Movement** - Assumes data already exists at destination S3 paths
+- **No Data Movement** - `hive_to_hive` assumes data already exists at destination S3 paths; `iceberg_to_iceberg` registers tables in place
 - **Data Presence Validation** - Verifies destination S3 paths contain files before creating tables
-- **Path Remapping** - Supports prefix-based path translation (`source_s3_prefix` → `dest_s3_prefix`) or simple bucket-based destination
+- **Path Remapping** (hive_to_hive only) - Supports prefix-based path translation (`source_s3_prefix` → `dest_s3_prefix`) or simple bucket-based destination
 - **Partition Support** - Automatic partition discovery and repair (Hive) or partition-aware registration (Iceberg)
 - **Format Preservation** - Supports Parquet, ORC, Avro, and TextFile
 - **Comprehensive Validation** - Row counts, partition counts, schema comparison
@@ -1298,28 +1298,33 @@ Metadata-only migration: discovers source table schemas and recreates them at a 
 
 ### Excel Configuration Format
 
-**Required Columns:**
+**Columns for `hive_to_hive`:**
 
 | Column             | Required | Description                                             | Example                 |
 | ------------------ | -------- | ------------------------------------------------------- | ----------------------- |
 | `database`         | **Yes**  | Source database name                                    | `sales_data`            |
-| `table`            | Varies   | Table name or pattern. `hive_to_hive`: supports `*` wildcards, comma-separated. `iceberg_to_iceberg`: exact table name (required) | `transactions_*` or `*` |
+| `table`            | **Yes**  | Table name or pattern (`*` wildcards, comma-separated)  | `transactions_*` or `*` |
 | `dest_database`    | No       | Destination database (defaults to source)               | `sales_data_dest`       |
 | `dest_bucket`      | No\*     | Destination S3 bucket                                   | `s3a://dest-lake`       |
 | `source_s3_prefix` | No\*     | Source S3 prefix for path remapping                     | `s3a://source-lake`     |
 | `dest_s3_prefix`   | No\*     | Destination S3 prefix for path remapping                | `s3a://dest-lake`       |
-| `source_table_path`| No\*\*  | S3 path to Iceberg table root (containing `metadata/`)  | `s3a://bucket/db/table` |
 
-\* Either `dest_bucket` or both `source_s3_prefix` + `dest_s3_prefix` must be provided per row.
+\* Either `dest_bucket` or both `source_s3_prefix` + `dest_s3_prefix` must be provided per row. Specifying both is an error.
 
-\*\* Required for `iceberg_to_iceberg` strategy. Ignored by `hive_to_hive`.
-
-**Path Remapping Behavior:**
+**Path Remapping Behavior (hive_to_hive):**
 
 - If `source_s3_prefix` and `dest_s3_prefix` are provided, destination path is computed by replacing the source prefix with the destination prefix, preserving the relative path.
-- If only `dest_bucket` is provided:
-  - `hive_to_hive`: destination path defaults to `{dest_bucket}/{dest_database}/{table_name}`
-  - `iceberg_to_iceberg`: destination path equals `source_table_path` (in-place registration)
+- If only `dest_bucket` is provided, destination path defaults to `{dest_bucket}/{dest_database}/{table_name}`.
+
+**Columns for `iceberg_to_iceberg`:**
+
+| Column             | Required | Description                                             | Example                 |
+| ------------------ | -------- | ------------------------------------------------------- | ----------------------- |
+| `database`         | **Yes**  | HMS database to register the table into                 | `analytics`             |
+| `table`            | **Yes**  | Table name to register                                  | `transactions`          |
+| `source_table_path`| **Yes**  | S3 path to Iceberg table root (containing `metadata/`)  | `s3a://bucket/db/table` |
+
+Tables are registered in the metastore at their existing `source_table_path` location — no data is moved and no path remapping is performed. `dest_database`, `dest_bucket`, `source_s3_prefix`, and `dest_s3_prefix` columns are ignored for this strategy.
 
 ---
 
@@ -1394,9 +1399,8 @@ finalize_s3_run
 
 - Reads Excel file from S3 using `pyspark.pandas.read_excel`
 - Normalizes column names and delegates to the strategy's `parse_excel_rows` function
-- `hive_to_hive`: groups rows by `(source_database, dest_database, dest_bucket, prefixes)`, supports wildcard table patterns
-- `iceberg_to_iceberg`: groups rows similarly, but requires `table` and `source_table_path` per row
-- Skips rows that provide neither a `dest_bucket` nor a `source_s3_prefix`+`dest_s3_prefix` pair (hive) or missing `source_table_path` (iceberg)
+- `hive_to_hive`: groups rows by `(source_database, dest_database, dest_bucket, prefixes)`, supports wildcard table patterns. Skips rows that provide neither `dest_bucket` nor a `source_s3_prefix`+`dest_s3_prefix` pair, or that provide both.
+- `iceberg_to_iceberg`: groups rows by `database` (the HMS database to register into), requires `table` and `source_table_path` per row. Ignores `dest_database`, `dest_bucket`, and prefix columns.
 
 ---
 
@@ -1406,8 +1410,7 @@ finalize_s3_run
 **Purpose:** Discover source table metadata — dispatches to the active strategy
 
 - **`hive_to_hive`**: lists tables via `SHOW TABLES`, filters by token patterns (wildcards/comma-separated), extracts schema, location, format, partitions, row count, and file metrics from the Hive metastore
-- **`iceberg_to_iceberg`**: reads `metadata.json` directly from S3 at each `source_table_path`, extracts schema, partitions, row count, and format from the Iceberg metadata
-- Computes destination S3 path using prefix remapping or bucket-based/in-place logic
+- **`iceberg_to_iceberg`**: reads `metadata.json` directly from S3 at each `source_table_path`, extracts schema, partitions, row count, and format from the Iceberg metadata. Destination path is always the source path (in-place registration).
 
 ---
 

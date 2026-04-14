@@ -17,8 +17,9 @@ Pipeline stages:
   6. Validate destination tables (row count, partition, schema comparison)
   7. Generate HTML report & send email
 
-Excel columns: database | table | dest_database | dest_bucket |
-               source_s3_prefix | dest_s3_prefix | source_table_path (iceberg only)
+Excel columns (hive_to_hive):      database | table | dest_database | dest_bucket |
+                                   source_s3_prefix | dest_s3_prefix
+Excel columns (iceberg_to_iceberg): database | table | source_table_path
 """
 
 import contextlib
@@ -212,7 +213,7 @@ def discover_source_tables(db_config: dict, spark, **context) -> dict:
         'run_id': db_config['run_id'],
         'source_database': db_config['source_database'],
         'dest_database': db_config['dest_database'],
-        'dest_bucket': db_config['dest_bucket'],
+        'dest_bucket': db_config.get('dest_bucket', ''),
         'source_s3_prefix': db_config.get('source_s3_prefix', ''),
         'dest_s3_prefix': db_config.get('dest_s3_prefix', ''),
         'migration_type': migration_type,
@@ -295,7 +296,7 @@ def record_s3_discovered_tables(discovery: dict, spark) -> dict:
                     overall_status, error_message, updated_at
                 ) VALUES (
                     '{run_id}', '{t['source_database']}', '{t['source_table']}',
-                    '{t['dest_database']}', '{t['dest_bucket']}',
+                    '{t['dest_database']}', '{t.get('dest_bucket', '')}',
                     '{t['source_location']}', '{t['dest_location']}', '{t['file_format']}',
                     {str(t['is_partitioned']).lower()}, '{t['partition_columns']}', {t['partition_count']},
                     '{schema_json}', '{parts_json}', '{t['table_type']}',

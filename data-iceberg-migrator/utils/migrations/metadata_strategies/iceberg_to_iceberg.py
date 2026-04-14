@@ -9,7 +9,6 @@ import json
 import logging
 
 from utils.migrations.metadata_strategies import cell_str, normalize_s3
-from utils.migrations.shared import compute_dest_path
 
 logger = logging.getLogger(__name__)
 
@@ -209,12 +208,17 @@ def parse_excel_rows(df, config, run_id):
     """Parse Excel rows for Iceberg-to-Iceberg metadata migration.
 
     Each row specifies a single Iceberg table via source_table_path.
-    Rows are grouped by (src_db, dest_db, dest_bucket, prefixes).
+    Tables are registered in the metastore at their existing S3 location —
+    no data is copied, so dest_bucket and s3 prefix columns are not used.
+
+    The `database` column is the HMS database to register tables into
+    (there is no source metastore for file-based Iceberg tables).
+    Rows are grouped by database.
     """
     grouped = {}
     for _, row in df.iterrows():
-        src_db = cell_str(row.get('database'))
-        if not src_db:
+        database = cell_str(row.get('database'))
+        if not database:
             continue
 
         table_name = cell_str(row.get('table'))
@@ -222,52 +226,29 @@ def parse_excel_rows(df, config, run_id):
 
         if not table_name or not source_table_path:
             logger.warning(
-                f"[parse_iceberg_excel] Skipping row for database '{src_db}' — "
+                f"[parse_iceberg_excel] Skipping row for database '{database}' — "
                 f"missing 'table' or 'source_table_path'"
             )
             continue
 
-        dest_db = cell_str(row.get('dest_database'), src_db)
-        raw_bucket = cell_str(row.get('dest_bucket'))
-        src_prefix = normalize_s3(cell_str(row.get('source_s3_prefix')))
-        dest_prefix = normalize_s3(cell_str(row.get('dest_s3_prefix')))
+        if database not in grouped:
+            grouped[database] = {'entries': []}
 
-        has_prefix = bool(src_prefix and dest_prefix)
-        has_explicit_bucket = bool(raw_bucket)
-
-        if has_prefix and has_explicit_bucket:
-            logger.warning(
-                f"[parse_iceberg_excel] Skipping row for database '{src_db}', "
-                f"table '{table_name}' — specifies both dest_bucket ('{raw_bucket}') "
-                f"and s3 prefix pair. These build destination paths differently "
-                f"and cannot be combined."
-            )
-            continue
-
-        dest_bucket_norm = normalize_s3(raw_bucket) if raw_bucket else config['default_s3_bucket']
-
-        key = (src_db, dest_db, dest_bucket_norm, src_prefix, dest_prefix)
-        if key not in grouped:
-            grouped[key] = {'entries': []}
-
-        grouped[key]['entries'].append({
+        grouped[database]['entries'].append({
             'table_name': table_name,
             'source_table_path': source_table_path.rstrip('/'),
         })
 
     configs = []
-    for (src_db, dest_db, dest_bucket, src_prefix, dest_prefix), group in grouped.items():
+    for database, group in grouped.items():
         configs.append({
-            'source_database': src_db,
-            'dest_database': dest_db,
-            'dest_bucket': dest_bucket,
-            'source_s3_prefix': src_prefix,
-            'dest_s3_prefix': dest_prefix,
+            'source_database': database,
+            'dest_database': database,
             'table_entries': group['entries'],
             'run_id': run_id,
         })
         logger.info(
-            f"[parse_iceberg_excel] {src_db} → {dest_db} | bucket={dest_bucket} | "
+            f"[parse_iceberg_excel] {database} | "
             f"tables={len(group['entries'])}"
         )
 
@@ -276,14 +257,10 @@ def parse_excel_rows(df, config, run_id):
 
 def discover_tables(db_config, spark, config):
     """Discover Iceberg table metadata by reading metadata.json from S3."""
-    src_db = db_config['source_database']
-    dest_db = db_config['dest_database']
-    dest_bucket = db_config['dest_bucket']
-    src_prefix = db_config.get('source_s3_prefix', '')
-    dest_prefix = db_config.get('dest_s3_prefix', '')
+    database = db_config['dest_database']
     entries = db_config.get('table_entries', [])
 
-    logger.info(f"[iceberg_discover] '{src_db}': discovering {len(entries)} table(s)")
+    logger.info(f"[iceberg_discover] '{database}': discovering {len(entries)} table(s)")
 
     metadata_list = []
     for entry in entries:
@@ -300,30 +277,17 @@ def discover_tables(db_config, spark, config):
             ).upper()
             file_count, total_size = _get_fs_stats(spark, table_path)
 
-            if src_prefix and dest_prefix:
-                dest_path = compute_dest_path(
-                    source_location=table_path,
-                    dest_database=dest_db,
-                    table_name=tbl_name,
-                    dest_bucket=dest_bucket,
-                    source_s3_prefix=src_prefix,
-                    dest_s3_prefix=dest_prefix,
-                )
-            else:
-                dest_path = table_path
-
             logger.info(
-                f"[iceberg_discover] {src_db}.{tbl_name} | fmt={file_format} | "
-                f"rows={row_count} | size={total_size / (1024 ** 2):.1f}MB | dest={dest_path}"
+                f"[iceberg_discover] {database}.{tbl_name} | fmt={file_format} | "
+                f"rows={row_count} | size={total_size / (1024 ** 2):.1f}MB | path={table_path}"
             )
 
             metadata_list.append({
-                'source_database': src_db,
+                'source_database': database,
                 'source_table': tbl_name,
-                'dest_database': dest_db,
-                'dest_bucket': dest_bucket,
+                'dest_database': database,
                 'source_location': table_path,
-                'dest_location': dest_path,
+                'dest_location': table_path,
                 'file_format': file_format,
                 'table_type': 'ICEBERG',
                 'schema': schema,
@@ -337,12 +301,11 @@ def discover_tables(db_config, spark, config):
             })
 
         except Exception as e:
-            logger.error(f"[iceberg_discover] FAILED for {src_db}.{tbl_name}: {e}")
+            logger.error(f"[iceberg_discover] FAILED for {database}.{tbl_name}: {e}")
             metadata_list.append({
-                'source_database': src_db,
+                'source_database': database,
                 'source_table': tbl_name,
-                'dest_database': dest_db,
-                'dest_bucket': dest_bucket,
+                'dest_database': database,
                 'source_location': table_path,
                 'dest_location': '',
                 'file_format': 'UNKNOWN',
@@ -385,8 +348,22 @@ def create_dest_table(table_info, dest_db, spark, config):
             pass
 
         if exists:
+            existing_location = None
+            for row in spark.sql(f"DESCRIBE FORMATTED {full_name}").collect():
+                if (row.col_name or '').strip() == 'Location':
+                    existing_location = (row.data_type or '').strip()
+                    break
+
+            if existing_location and existing_location.rstrip('/') != dest_path.rstrip('/'):
+                error_msg = (
+                    f"Table {full_name} already exists at '{existing_location}' "
+                    f"but expected '{dest_path}'"
+                )
+                logger.error(f"[iceberg_create] LOCATION MISMATCH for {full_name}: {error_msg}")
+                return {'source_table': tbl, 'status': 'FAILED', 'existed': True, 'error': error_msg}
+
             spark.sql(f"REFRESH TABLE {full_name}")
-            logger.info(f"[iceberg_create] REFRESHED (already existed): {full_name}")
+            logger.info(f"[iceberg_create] REFRESHED (already existed): {full_name} at {dest_path}")
             return {'source_table': tbl, 'status': 'COMPLETED', 'existed': True, 'error': None}
 
         metadata_file = _resolve_metadata_file(spark, dest_path)
