@@ -231,6 +231,19 @@ def parse_excel_rows(df, config, run_id):
         raw_bucket = cell_str(row.get('dest_bucket'))
         src_prefix = normalize_s3(cell_str(row.get('source_s3_prefix')))
         dest_prefix = normalize_s3(cell_str(row.get('dest_s3_prefix')))
+
+        has_prefix = bool(src_prefix and dest_prefix)
+        has_explicit_bucket = bool(raw_bucket)
+
+        if has_prefix and has_explicit_bucket:
+            logger.warning(
+                f"[parse_iceberg_excel] Skipping row for database '{src_db}', "
+                f"table '{table_name}' — specifies both dest_bucket ('{raw_bucket}') "
+                f"and s3 prefix pair. These build destination paths differently "
+                f"and cannot be combined."
+            )
+            continue
+
         dest_bucket_norm = normalize_s3(raw_bucket) if raw_bucket else config['default_s3_bucket']
 
         key = (src_db, dest_db, dest_bucket_norm, src_prefix, dest_prefix)

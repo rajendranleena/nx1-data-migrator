@@ -146,6 +146,16 @@ class TestParseS3Excel:
         assert result[0]['source_s3_prefix'] == 's3a://src/data'
         assert result[0]['dest_s3_prefix'] == 's3a://dst/data'
 
+    def test_skips_row_with_both_dest_bucket_and_prefix_pair(self, mock_spark, sample_s3_run_id):
+        setup_spark_excel(mock_spark, make_excel_bytes([{
+            'database': 'db', 'table': '*', 'dest_database': 'db2',
+            'dest_bucket': 's3a://explicit-bkt',
+            'source_s3_prefix': 's3a://src/data',
+            'dest_s3_prefix':   's3a://dst/data',
+        }]))
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
+        assert len(result) == 0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TestDiscoverSourceTables
@@ -168,7 +178,7 @@ class TestDiscoverSourceTables:
                 # location
                 loc_row = MagicMock()
                 loc_row.col_name = 'Location'
-                loc_row.data_type = 's3a://src/db/tbl'
+                loc_row.data_type = 's3a://src-bucket/data/db/tbl'
                 rows.append(loc_row)
                 # table type
                 type_row = MagicMock()

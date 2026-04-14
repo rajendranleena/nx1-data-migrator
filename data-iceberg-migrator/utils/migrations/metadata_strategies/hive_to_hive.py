@@ -28,16 +28,25 @@ def parse_excel_rows(df, config, run_id):
         raw_bucket = cell_str(row.get('dest_bucket'))
         src_prefix = normalize_s3(cell_str(row.get('source_s3_prefix')))
         dest_prefix = normalize_s3(cell_str(row.get('dest_s3_prefix')))
-        dest_bucket_norm = normalize_s3(raw_bucket) if raw_bucket else config['default_s3_bucket']
 
         has_prefix = bool(src_prefix and dest_prefix)
-        has_bucket = bool(dest_bucket_norm)
-        if not has_prefix and not has_bucket:
+        has_explicit_bucket = bool(raw_bucket)
+
+        if has_prefix and has_explicit_bucket:
+            logger.warning(
+                f"[parse_s3_excel] Skipping row for database '{src_db}' — "
+                f"specifies both dest_bucket ('{raw_bucket}') and s3 prefix pair. "
+                f"These build destination paths differently and cannot be combined."
+            )
+            continue
+        if not has_prefix and not has_explicit_bucket:
             logger.warning(
                 f"[parse_s3_excel] Skipping row for database '{src_db}' — "
                 f"must supply either (source_s3_prefix + dest_s3_prefix) or dest_bucket"
             )
             continue
+
+        dest_bucket_norm = normalize_s3(raw_bucket) if raw_bucket else config['default_s3_bucket']
 
         key = (src_db, dest_db, dest_bucket_norm, src_prefix, dest_prefix)
         if key not in grouped:

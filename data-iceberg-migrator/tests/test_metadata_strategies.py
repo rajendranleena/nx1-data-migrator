@@ -180,6 +180,23 @@ class TestIcebergParseExcelRows:
         assert result[0]['dest_bucket'] == 's3a://bkt'
         assert result[0]['table_entries'][0]['source_table_path'] == 's3a://bucket/wh/orders'
 
+    def test_skips_row_with_both_dest_bucket_and_prefix_pair(self):
+        import pandas as pd
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+
+        df = pd.DataFrame([{
+            'database': 'wh', 'table': 'orders', 'dest_database': 'analytics',
+            'dest_bucket': 's3a://explicit-bkt',
+            'source_s3_prefix': 's3a://src/data',
+            'dest_s3_prefix': 's3a://dst/data',
+            'source_table_path': 's3a://src/data/wh/orders',
+        }])
+        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+
+        config = {'default_s3_bucket': 's3a://default-bucket'}
+        result = parse_excel_rows(df, config, 'run_123')
+        assert len(result) == 0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test iceberg_to_iceberg discover_tables

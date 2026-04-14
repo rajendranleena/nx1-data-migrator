@@ -252,16 +252,16 @@ class TestComputeDestPath:
         )
         assert result == 's3a://dest-bucket/dest_db/tbl'
 
-    def test_falls_back_when_source_doesnt_match_prefix(self):
-        result = m.compute_dest_path(
-            source_location='s3a://other-bucket/data/db/tbl',
-            dest_database='dest_db',
-            table_name='tbl',
-            dest_bucket='s3a://dest-bucket',
-            source_s3_prefix='s3a://src-bucket/data',
-            dest_s3_prefix='s3a://dest-bucket/data',
-        )
-        assert result == 's3a://dest-bucket/dest_db/tbl'
+    def test_raises_when_source_doesnt_match_prefix(self):
+        with pytest.raises(ValueError, match="does not start with source_s3_prefix"):
+            m.compute_dest_path(
+                source_location='s3a://other-bucket/data/db/tbl',
+                dest_database='dest_db',
+                table_name='tbl',
+                dest_bucket='s3a://dest-bucket',
+                source_s3_prefix='s3a://src-bucket/data',
+                dest_s3_prefix='s3a://dest-bucket/data',
+            )
 
 # ---------------------------------------------------------------------------
 # cell_str
