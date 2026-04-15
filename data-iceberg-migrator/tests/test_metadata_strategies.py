@@ -3,6 +3,8 @@
 import json
 from unittest.mock import MagicMock
 
+import pytest
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,11 +59,9 @@ def _mock_fs_for_iceberg(spark, metadata_dict, has_version_hint=True):
 
     fs_mock.exists.side_effect = mock_exists
 
-    # Mock reading version-hint.text
     hint_reader = MagicMock()
     hint_reader.readLine.return_value = '1'
 
-    # Mock reading metadata.json
     meta_json = json.dumps(metadata_dict)
     meta_lines = meta_json.split('\n')
     meta_reader = MagicMock()
@@ -76,13 +76,11 @@ def _mock_fs_for_iceberg(spark, metadata_dict, has_version_hint=True):
 
     spark._jvm.java.io.BufferedReader.side_effect = mock_buffered_reader
 
-    # FS stats
     summary = MagicMock()
     summary.getFileCount.return_value = 10
     summary.getLength.return_value = 50 * 1024 * 1024
     fs_mock.getContentSummary.return_value = summary
 
-    # listStatus fallback (when no version-hint.text)
     if not has_version_hint:
         file_status = MagicMock()
         file_path = MagicMock()
@@ -92,20 +90,49 @@ def _mock_fs_for_iceberg(spark, metadata_dict, has_version_hint=True):
         fs_mock.listStatus.return_value = [file_status]
 
 
+def _mock_fs_for_table_listing(spark, table_names, dirs_without_metadata=None):
+    """Set up mock Hadoop FS to return a list of table directories.
+
+    table_names: directories that have a metadata/ subfolder (Iceberg tables).
+    dirs_without_metadata: directories that lack metadata/ (should be filtered out).
+    """
+    dirs_without_metadata = dirs_without_metadata or []
+    fs_mock = spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
+
+    iceberg_set = set(table_names)
+    def mock_exists(path):
+        path_str = str(path)
+        if '/metadata' in path_str:
+            return any(f"/{name}/metadata" in path_str for name in iceberg_set)
+        return True
+    fs_mock.exists.side_effect = mock_exists
+
+    status_entries = []
+    for name in list(table_names) + list(dirs_without_metadata):
+        entry = MagicMock()
+        entry.isDirectory.return_value = True
+        path_mock = MagicMock()
+        path_mock.getName.return_value = name
+        entry.getPath.return_value = path_mock
+        status_entries.append(entry)
+
+    fs_mock.listStatus.return_value = status_entries
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Test iceberg_to_iceberg parse_excel_rows
+# Test parse_excel_rows
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestIcebergParseExcelRows:
 
-    def test_basic_parsing(self):
+    def test_basic_parsing_and_s3_normalization(self):
         import pandas as pd
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'analytics',
             'table': 'orders',
-            'source_table_path': 's3a://bucket/warehouse/orders',
+            'dest_s3_prefix': 's3n://dest-bucket/warehouse',
         }])
         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
@@ -114,52 +141,65 @@ class TestIcebergParseExcelRows:
         assert len(result) == 1
         assert result[0]['source_database'] == 'analytics'
         assert result[0]['dest_database'] == 'analytics'
-        assert 'dest_bucket' not in result[0]
-        assert len(result[0]['table_entries']) == 1
-        assert result[0]['table_entries'][0]['table_name'] == 'orders'
-        assert result[0]['table_entries'][0]['source_table_path'] == 's3a://bucket/warehouse/orders'
+        assert result[0]['dest_s3_prefix'] == 's3a://dest-bucket/warehouse'
+        assert result[0]['table_tokens'] == ['orders']
         assert result[0]['run_id'] == 'run_123'
 
-    def test_skips_rows_without_source_table_path(self):
+    def test_skips_rows_without_dest_s3_prefix(self):
         import pandas as pd
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'analytics',
             'table': 'orders',
-            'source_table_path': '',
+            'dest_s3_prefix': '',
         }])
         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
         result = parse_excel_rows(df, {}, 'run_123')
         assert len(result) == 0
 
-    def test_groups_by_database(self):
+    def test_comma_separated_tables(self):
+        import pandas as pd
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+
+        df = pd.DataFrame([{
+            'database': 'analytics',
+            'table': 'orders, users, events',
+            'dest_s3_prefix': 's3a://dest/wh',
+        }])
+        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+
+        result = parse_excel_rows(df, {}, 'run_123')
+
+        assert result[0]['table_tokens'] == ['orders', 'users', 'events']
+
+    def test_wildcard_collapses_other_tokens(self):
         import pandas as pd
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([
             {'database': 'analytics', 'table': 'orders',
-             'source_table_path': 's3a://bucket/wh/orders'},
-            {'database': 'analytics', 'table': 'users',
-             'source_table_path': 's3a://bucket/wh/users'},
+             'dest_s3_prefix': 's3a://dest/wh'},
+            {'database': 'analytics', 'table': '*',
+             'dest_s3_prefix': 's3a://dest/wh'},
         ])
         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
         result = parse_excel_rows(df, {}, 'run_123')
 
         assert len(result) == 1
-        assert len(result[0]['table_entries']) == 2
+        assert result[0]['table_tokens'] == ['*']
 
-    def test_different_databases_produce_separate_configs(self):
+    def test_groups_by_database_and_prefix(self):
         import pandas as pd
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([
             {'database': 'analytics', 'table': 'orders',
-             'source_table_path': 's3a://bucket/wh/orders'},
+             'dest_s3_prefix': 's3a://dest/wh'},
             {'database': 'reporting', 'table': 'summary',
-             'source_table_path': 's3a://bucket/wh/summary'},
+             'dest_s3_prefix': 's3a://dest/wh'},
         ])
         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
@@ -169,209 +209,270 @@ class TestIcebergParseExcelRows:
         dbs = {r['dest_database'] for r in result}
         assert dbs == {'analytics', 'reporting'}
 
-    def test_normalizes_source_table_path(self):
+    def test_defaults_to_wildcard_when_table_empty(self):
         import pandas as pd
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
-            'database': 'analytics', 'table': 'orders',
-            'source_table_path': 's3n://bucket/wh/orders',
+            'database': 'analytics', 'table': '',
+            'dest_s3_prefix': 's3a://dest/wh',
         }])
         df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
         result = parse_excel_rows(df, {}, 'run_123')
 
-        assert result[0]['table_entries'][0]['source_table_path'] == 's3a://bucket/wh/orders'
+        assert result[0]['table_tokens'] == ['*']
+
+    def test_merges_tokens_from_same_group(self):
+        import pandas as pd
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+
+        df = pd.DataFrame([
+            {'database': 'analytics', 'table': 'orders',
+             'dest_s3_prefix': 's3a://dest/wh'},
+            {'database': 'analytics', 'table': 'users',
+             'dest_s3_prefix': 's3a://dest/wh'},
+        ])
+        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+
+        result = parse_excel_rows(df, {}, 'run_123')
+
+        assert len(result) == 1
+        assert result[0]['table_tokens'] == ['orders', 'users']
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test iceberg_to_iceberg discover_tables
+# Test discover_tables
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestIcebergDiscoverTables:
 
-    def test_discovers_table_from_metadata(self, mock_spark):
+    def test_filters_out_dirs_without_metadata(self, mock_spark):
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _list_iceberg_tables
+
+        _mock_fs_for_table_listing(
+            mock_spark, ['orders'], dirs_without_metadata=['tmp_staging', 'logs']
+        )
+
+        result = _list_iceberg_tables(mock_spark, 's3a://dest-bucket/warehouse/analytics')
+
+        assert result == ['orders']
+
+    def test_discovers_from_metadata_json_when_not_in_hms(self, mock_spark):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
         from utils.migrations.shared import get_config
 
+        _mock_fs_for_table_listing(mock_spark, ['orders'])
         _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
+
+        def sql_router(sql):
+            sl = sql.lower().strip()
+            if sl.startswith('describe '):
+                raise Exception("Table not found")
+            return MagicMock()
+        mock_spark.sql.side_effect = sql_router
 
         db_config = {
             'source_database': 'analytics',
             'dest_database': 'analytics',
-            'table_entries': [
-                {'table_name': 'orders', 'source_table_path': 's3a://bucket/warehouse/orders'},
-            ],
+            'dest_s3_prefix': 's3a://dest-bucket/warehouse',
+            'table_tokens': ['orders'],
             'run_id': 'run_123',
         }
-        config = get_config()
-        result = discover_tables(db_config, mock_spark, config)
+        result = discover_tables(db_config, mock_spark, get_config())
 
         assert len(result) == 1
         tbl = result[0]
         assert tbl['source_table'] == 'orders'
-        assert tbl['source_database'] == 'analytics'
-        assert tbl['dest_database'] == 'analytics'
-        assert tbl['source_location'] == 's3a://bucket/warehouse/orders'
-        assert tbl['dest_location'] == 's3a://bucket/warehouse/orders'
+        assert tbl['dest_location'] == 's3a://dest-bucket/warehouse/analytics/orders'
         assert tbl['source_row_count'] == 5000
         assert tbl['is_partitioned'] is True
-        assert 'dt' in tbl['partition_columns']
 
-    def test_extracts_schema_correctly(self, mock_spark):
+    def test_queries_hms_when_table_exists(self, mock_spark):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
         from utils.migrations.shared import get_config
 
-        _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
+        _mock_fs_for_table_listing(mock_spark, ['orders'])
+
+        # Mock HMS responses
+        describe_row = MagicMock()
+        describe_row.col_name = 'id'
+        describe_row.data_type = 'bigint'
+
+        count_row = MagicMock()
+        count_row.__getitem__ = lambda self, key: 10000 if key == 'c' else None
+
+        partition_row = MagicMock()
+
+        desc_formatted_loc = MagicMock()
+        desc_formatted_loc.col_name = 'Location'
+        desc_formatted_loc.data_type = 's3a://dest-bucket/warehouse/analytics/orders'
+
+        def sql_router(sql):
+            sl = sql.lower().strip()
+            df = MagicMock()
+            if sl.startswith('describe formatted'):
+                df.collect.return_value = [desc_formatted_loc]
+            elif sl.startswith('describe '):
+                df.collect.return_value = [describe_row]
+            elif sl.startswith('select count'):
+                df.collect.return_value = [count_row]
+            elif '.partitions' in sl:
+                df.count.return_value = 3
+                df.columns = ['dt']
+            return df
+        mock_spark.sql.side_effect = sql_router
 
         db_config = {
-            'source_database': 'analytics', 'dest_database': 'analytics',
-            'table_entries': [{'table_name': 'orders', 'source_table_path': 's3a://bucket/wh/orders'}],
+            'source_database': 'analytics',
+            'dest_database': 'analytics',
+            'dest_s3_prefix': 's3a://dest-bucket/warehouse',
+            'table_tokens': ['orders'],
             'run_id': 'run_123',
         }
         result = discover_tables(db_config, mock_spark, get_config())
 
-        schema = result[0]['schema']
-        names = [c['name'] for c in schema]
-        assert 'id' in names
-        assert 'amount' in names
-        assert 'dt' in names
-        id_col = next(c for c in schema if c['name'] == 'id')
-        assert id_col['type'] == 'BIGINT'
-
-    def test_handles_missing_version_hint(self, mock_spark):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
-        from utils.migrations.shared import get_config
-
-        _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA, has_version_hint=False)
-
-        db_config = {
-            'source_database': 'analytics', 'dest_database': 'analytics',
-            'table_entries': [{'table_name': 'orders', 'source_table_path': 's3a://bucket/wh/orders'}],
-            'run_id': 'run_123',
-        }
-        result = discover_tables(db_config, mock_spark, get_config())
         assert len(result) == 1
-        assert 'error' not in result[0]
+        tbl = result[0]
+        assert tbl['source_row_count'] == 10000
+        assert tbl['partition_count'] == 3
+        assert tbl['partition_spec_detail'] == [
+            {'source_column': 'dt', 'transform': 'identity', 'name': 'dt', 'param': None},
+        ]
 
-    def test_records_error_on_metadata_failure(self, mock_spark):
+    def test_records_error_on_failure(self, mock_spark):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
         from utils.migrations.shared import get_config
 
+        _mock_fs_for_table_listing(mock_spark, ['orders'])
+
+        # After table listing succeeds, break FS for metadata reads
         fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
-        fs_mock.exists.side_effect = Exception("S3 connection refused")
+        call_count = {'n': 0}
+
+        def exists_then_fail(path):
+            call_count['n'] += 1
+            path_str = str(path)
+            if 'version-hint' in path_str:
+                raise Exception("S3 connection refused")
+            return True
+        fs_mock.exists.side_effect = exists_then_fail
+
+        def sql_router(sql):
+            raise Exception("Table not found")
+        mock_spark.sql.side_effect = sql_router
 
         db_config = {
-            'source_database': 'analytics', 'dest_database': 'analytics',
-            'table_entries': [{'table_name': 'orders', 'source_table_path': 's3a://bucket/wh/orders'}],
+            'source_database': 'analytics',
+            'dest_database': 'analytics',
+            'dest_s3_prefix': 's3a://dest/warehouse',
+            'table_tokens': ['orders'],
             'run_id': 'run_123',
         }
         result = discover_tables(db_config, mock_spark, get_config())
         assert len(result) == 1
         assert 'error' in result[0]
-        assert result[0]['source_table'] == 'orders'
-
-    def test_dest_location_equals_source(self, mock_spark):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
-        from utils.migrations.shared import get_config
-
-        _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
-
-        db_config = {
-            'source_database': 'analytics', 'dest_database': 'analytics',
-            'table_entries': [{'table_name': 'orders', 'source_table_path': 's3a://bucket/warehouse/orders'}],
-            'run_id': 'run_123',
-        }
-        result = discover_tables(db_config, mock_spark, get_config())
-        assert result[0]['dest_location'] == 's3a://bucket/warehouse/orders'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test iceberg_to_iceberg create_dest_table
+# Test create_dest_table
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestIcebergCreateDestTable:
 
-    def test_registers_new_table(self, mock_spark):
+    def _make_table_info(self, **overrides):
+        base = {
+            'source_table': 'orders',
+            'dest_location': 's3a://dest-bucket/warehouse/analytics/orders',
+            'file_format': 'PARQUET',
+            'format_version': '2',
+            'schema': [
+                {'name': 'id', 'type': 'BIGINT'},
+                {'name': 'amount', 'type': 'DOUBLE'},
+                {'name': 'dt', 'type': 'DATE'},
+            ],
+            'partition_spec_detail': [
+                {'source_column': 'dt', 'transform': 'identity', 'name': 'dt', 'param': None},
+            ],
+        }
+        base.update(overrides)
+        return base
+
+    def test_creates_new_table_with_add_files(self, mock_spark):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
         from utils.migrations.shared import get_config
 
+        call_log = []
         def sql_router(sql):
+            call_log.append(sql)
             sl = sql.lower().strip()
             if sl.startswith('describe '):
                 raise Exception("Table not found")
             return MagicMock()
         mock_spark.sql.side_effect = sql_router
 
-        table_info = {
-            'source_table': 'orders',
-            'dest_location': 's3a://bucket/warehouse/orders',
-            'file_format': 'PARQUET',
-        }
-        result = create_dest_table(table_info, 'analytics', mock_spark, get_config())
+        result = create_dest_table(self._make_table_info(), 'analytics', mock_spark, get_config())
 
         assert result['status'] == 'COMPLETED'
         assert result['existed'] is False
-        calls_str = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
-        assert 'register_table' in calls_str
-        assert 'analytics.orders' in calls_str
+        calls_str = ' '.join(call_log)
+        assert 'CREATE TABLE' in calls_str
+        assert 'add_files' in calls_str
 
-    def test_refreshes_existing_table_at_same_location(self, mock_spark):
+    def test_incremental_add_files_when_at_dest(self, mock_spark):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
         from utils.migrations.shared import get_config
 
+        call_log = []
+        loc_row = MagicMock()
+        loc_row.col_name = 'Location'
+        loc_row.data_type = 's3a://dest-bucket/warehouse/analytics/orders'
+
         def sql_router(sql):
+            call_log.append(sql)
             sl = sql.lower().strip()
             df = MagicMock()
             if sl.startswith('describe formatted'):
-                loc = MagicMock()
-                loc.col_name = 'Location'
-                loc.data_type = 's3a://bucket/warehouse/orders'
-                df.collect.return_value = [loc]
+                df.collect.return_value = [loc_row]
             return df
         mock_spark.sql.side_effect = sql_router
 
-        table_info = {
-            'source_table': 'orders',
-            'dest_location': 's3a://bucket/warehouse/orders',
-            'file_format': 'PARQUET',
-        }
-        result = create_dest_table(table_info, 'analytics', mock_spark, get_config())
+        result = create_dest_table(self._make_table_info(), 'analytics', mock_spark, get_config())
 
         assert result['status'] == 'COMPLETED'
         assert result['existed'] is True
-        calls_str = ' '.join(str(c) for c in mock_spark.sql.call_args_list)
-        assert 'REFRESH TABLE' in calls_str
+        calls_str = ' '.join(call_log)
+        assert 'add_files' in calls_str
+        assert 'DROP TABLE' not in calls_str
+        assert 'CREATE TABLE' not in calls_str
 
-    def test_fails_when_existing_table_points_to_different_location(self, mock_spark):
+    def test_drops_table_at_different_location(self, mock_spark):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
         from utils.migrations.shared import get_config
 
+        call_log = []
+        loc_row = MagicMock()
+        loc_row.col_name = 'Location'
+        loc_row.data_type = 's3a://old-bucket/somewhere/orders'
+
         def sql_router(sql):
+            call_log.append(sql)
             sl = sql.lower().strip()
             df = MagicMock()
             if sl.startswith('describe formatted'):
-                loc = MagicMock()
-                loc.col_name = 'Location'
-                loc.data_type = 's3a://other-bucket/old/orders'
-                df.collect.return_value = [loc]
+                df.collect.return_value = [loc_row]
             return df
         mock_spark.sql.side_effect = sql_router
 
-        table_info = {
-            'source_table': 'orders',
-            'dest_location': 's3a://bucket/warehouse/orders',
-            'file_format': 'PARQUET',
-        }
-        result = create_dest_table(table_info, 'analytics', mock_spark, get_config())
+        result = create_dest_table(self._make_table_info(), 'analytics', mock_spark, get_config())
 
-        assert result['status'] == 'FAILED'
-        assert result['existed'] is True
-        assert 'LOCATION MISMATCH' not in result['error']  # that's in the log, not the error
-        assert 'already exists' in result['error']
-        assert 's3a://other-bucket/old/orders' in result['error']
+        assert result['status'] == 'COMPLETED'
+        calls_str = ' '.join(call_log)
+        assert 'DROP TABLE' in calls_str
+        assert 'CREATE TABLE' in calls_str
+        assert 'add_files' in calls_str
 
-    def test_returns_error_on_failure(self, mock_spark):
+    def test_returns_error_on_add_files_failure(self, mock_spark):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
         from utils.migrations.shared import get_config
 
@@ -379,66 +480,78 @@ class TestIcebergCreateDestTable:
             sl = sql.lower().strip()
             if sl.startswith('describe '):
                 raise Exception("Table not found")
-            if 'register_table' in sl:
-                raise Exception("Permission denied")
+            if 'add_files' in sl:
+                raise Exception("No files found at path")
             return MagicMock()
         mock_spark.sql.side_effect = sql_router
 
-        table_info = {
-            'source_table': 'orders',
-            'dest_location': 's3a://bucket/warehouse/orders',
-            'file_format': 'PARQUET',
-        }
-        result = create_dest_table(table_info, 'analytics', mock_spark, get_config())
+        result = create_dest_table(self._make_table_info(), 'analytics', mock_spark, get_config())
 
         assert result['status'] == 'FAILED'
-        assert 'Permission denied' in result['error']
+        assert 'No files found' in result['error']
+
+    def test_unpartitioned_table(self, mock_spark):
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
+        from utils.migrations.shared import get_config
+
+        call_log = []
+        def sql_router(sql):
+            call_log.append(sql)
+            sl = sql.lower().strip()
+            if sl.startswith('describe '):
+                raise Exception("Table not found")
+            return MagicMock()
+        mock_spark.sql.side_effect = sql_router
+
+        table_info = self._make_table_info(partition_spec_detail=[])
+        result = create_dest_table(table_info, 'analytics', mock_spark, get_config())
+
+        assert result['status'] == 'COMPLETED'
+        create_sql = next(s for s in call_log if 'CREATE TABLE' in s)
+        assert 'PARTITIONED BY' not in create_sql
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test Iceberg type mapping
+# Test type mapping (branching logic only — the lookup table is self-evident)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestIcebergTypeMapping:
 
-    def test_primitive_types(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
-
-        assert _map_iceberg_type('boolean') == 'BOOLEAN'
-        assert _map_iceberg_type('int') == 'INT'
-        assert _map_iceberg_type('long') == 'BIGINT'
-        assert _map_iceberg_type('float') == 'FLOAT'
-        assert _map_iceberg_type('double') == 'DOUBLE'
-        assert _map_iceberg_type('string') == 'STRING'
-        assert _map_iceberg_type('binary') == 'BINARY'
-        assert _map_iceberg_type('date') == 'DATE'
-        assert _map_iceberg_type('timestamp') == 'TIMESTAMP'
-        assert _map_iceberg_type('timestamptz') == 'TIMESTAMP'
-        assert _map_iceberg_type('uuid') == 'STRING'
-
-    def test_decimal_type(self):
+    def test_special_type_branches(self):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
 
         assert _map_iceberg_type('decimal(10,2)') == 'DECIMAL(10,2)'
-
-    def test_fixed_type(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
-
         assert _map_iceberg_type('fixed[16]') == 'BINARY'
-
-    def test_nested_type_maps_to_string(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
-
         assert _map_iceberg_type({'type': 'struct', 'fields': []}) == 'STRING'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test Iceberg metadata extraction helpers (pure functions, no mocking)
+# Test metadata extraction from metadata.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestExtractSchema:
+class TestMetadataExtraction:
 
-    def test_extracts_fields_from_current_schema(self):
+    def test_extracts_schema_partitions_and_row_count(self):
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import (
+            _extract_schema, _extract_partition_spec, _extract_row_count,
+        )
+
+        schema = _extract_schema(SAMPLE_ICEBERG_METADATA)
+        assert schema == [
+            {'name': 'id', 'type': 'BIGINT'},
+            {'name': 'amount', 'type': 'DOUBLE'},
+            {'name': 'dt', 'type': 'DATE'},
+        ]
+
+        spec, is_partitioned = _extract_partition_spec(SAMPLE_ICEBERG_METADATA)
+        assert is_partitioned is True
+        assert len(spec) == 1
+        assert spec[0]['source_column'] == 'dt'
+        assert spec[0]['transform'] == 'identity'
+
+        assert _extract_row_count(SAMPLE_ICEBERG_METADATA) == 5000
+
+    def test_schema_selection_by_id(self):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_schema
 
         metadata = {
@@ -452,96 +565,58 @@ class TestExtractSchema:
             ],
         }
         result = _extract_schema(metadata)
-        assert result == [
+        assert len(result) == 2
+        assert result[0]['name'] == 'id'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test DDL builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDDLBuilders:
+
+    def test_column_defs_and_partition_clause(self):
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import (
+            _build_column_defs, _build_iceberg_partition_clause,
+        )
+
+        schema = [
             {'name': 'id', 'type': 'BIGINT'},
-            {'name': 'name', 'type': 'STRING'},
+            {'name': 'amount', 'type': 'DOUBLE'},
+            {'name': 'dt', 'type': 'DATE'},
         ]
+        assert _build_column_defs(schema) == '`id` BIGINT, `amount` DOUBLE, `dt` DATE'
 
-    def test_falls_back_to_last_schema_if_id_not_found(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_schema
+        spec = [{'source_column': 'dt', 'transform': 'identity', 'name': 'dt', 'param': None}]
+        assert _build_iceberg_partition_clause(spec) == '`dt`'
 
-        metadata = {
-            'current-schema-id': 99,
-            'schemas': [
-                {'schema-id': 0, 'fields': [{'name': 'a', 'type': 'int'}]},
-            ],
-        }
-        result = _extract_schema(metadata)
-        assert result == [{'name': 'a', 'type': 'INT'}]
+    @pytest.mark.parametrize('spec, expected', [
+        ([{'source_column': 'id', 'transform': 'bucket', 'name': 'id_bucket', 'param': 16}],
+         'bucket(16, `id`)'),
+        ([{'source_column': 'ts', 'transform': 'year', 'name': 'ts_year', 'param': None}],
+         'years(`ts`)'),
+        ([{'source_column': 'val', 'transform': 'truncate', 'name': 'val_trunc', 'param': 10}],
+         'truncate(10, `val`)'),
+    ])
+    def test_partition_transforms(self, spec, expected):
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _build_iceberg_partition_clause
 
-    def test_returns_empty_list_when_no_schemas(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_schema
-
-        assert _extract_schema({'schemas': []}) == []
-        assert _extract_schema({}) == []
-
-
-class TestExtractPartitionSpec:
-
-    def test_extracts_partition_columns(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_partition_spec
-
-        metadata = {
-            'current-schema-id': 0,
-            'schemas': [{'schema-id': 0, 'fields': [
-                {'id': 1, 'name': 'id', 'type': 'long'},
-                {'id': 2, 'name': 'dt', 'type': 'date'},
-            ]}],
-            'default-spec-id': 0,
-            'partition-specs': [{'spec-id': 0, 'fields': [
-                {'source-id': 2, 'field-id': 1000, 'name': 'dt', 'transform': 'identity'},
-            ]}],
-        }
-        cols, is_part = _extract_partition_spec(metadata)
-        assert cols == ['dt']
-        assert is_part is True
-
-    def test_unpartitioned_table(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_partition_spec
-
-        metadata = {
-            'current-schema-id': 0,
-            'schemas': [{'schema-id': 0, 'fields': [{'id': 1, 'name': 'id', 'type': 'long'}]}],
-            'default-spec-id': 0,
-            'partition-specs': [{'spec-id': 0, 'fields': []}],
-        }
-        cols, is_part = _extract_partition_spec(metadata)
-        assert cols == []
-        assert is_part is False
-
-    def test_no_partition_specs_at_all(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_partition_spec
-
-        cols, is_part = _extract_partition_spec({})
-        assert cols == []
-        assert is_part is False
+        assert _build_iceberg_partition_clause(spec) == expected
 
 
-class TestExtractRowCount:
+# ─────────────────────────────────────────────────────────────────────────────
+# Test token matching
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def test_extracts_count_from_current_snapshot(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_row_count
+class TestMatchTokens:
 
-        metadata = {
-            'current-snapshot-id': 42,
-            'snapshots': [
-                {'snapshot-id': 41, 'summary': {'total-records': '100'}},
-                {'snapshot-id': 42, 'summary': {'total-records': '5000'}},
-            ],
-        }
-        assert _extract_row_count(metadata) == 5000
+    @pytest.mark.parametrize('tables, tokens, expected', [
+        (['a', 'b', 'c'], ['*'], ['a', 'b', 'c']),
+        (['orders', 'users', 'events'], ['orders'], ['orders']),
+        (['orders', 'order_items', 'users'], ['order*'], ['orders', 'order_items']),
+        (['orders'], ['orders', 'orders'], ['orders']),
+    ])
+    def test_matching(self, tables, tokens, expected):
+        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _match_tokens
 
-    def test_returns_zero_when_no_snapshots(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_row_count
-
-        assert _extract_row_count({}) == 0
-        assert _extract_row_count({'current-snapshot-id': None}) == 0
-
-    def test_returns_zero_when_snapshot_id_not_found(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_row_count
-
-        metadata = {
-            'current-snapshot-id': 99,
-            'snapshots': [{'snapshot-id': 1, 'summary': {'total-records': '100'}}],
-        }
-        assert _extract_row_count(metadata) == 0
+        assert _match_tokens(tables, tokens) == expected

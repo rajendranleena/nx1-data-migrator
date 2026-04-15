@@ -1,10 +1,20 @@
 """
-Iceberg-to-Iceberg metadata migration strategy.
+Iceberg-to-Iceberg migration strategy.
 
-Source: File-based Iceberg catalog on S3 (no metastore — metadata.json files)
-Destination: Iceberg tables registered in Hive Metastore via register_table
+Source: Iceberg table with Hadoop catalog on S3 (metadata.json files)
+Destination: Iceberg table registered in HMS via CREATE TABLE + add_files
+
+On first run, reads schema and partition spec from the copied metadata.json
+at the destination. On incremental runs, queries the existing HMS table for
+stats. Data files are registered via add_files (check_duplicate_files=true
+by default, so already-tracked files are skipped).
+
+Limitation: add_files only supports identity partition transforms.
+Tables with year(), month(), bucket(), truncate() partitioning will fail.
 """
 
+import contextlib
+import fnmatch
 import json
 import logging
 
@@ -27,6 +37,10 @@ ICEBERG_TYPE_MAP = {
     'uuid': 'STRING',
 }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metadata.json helpers (used on first run when table is not yet in HMS)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _map_iceberg_type(iceberg_type):
     """Map an Iceberg type to a Spark SQL type string."""
@@ -127,8 +141,25 @@ def _extract_schema(metadata):
     ]
 
 
+def _parse_transform(transform_str):
+    """Parse an Iceberg partition transform string into (transform, param).
+
+    Examples: 'identity' -> ('identity', None),
+              'bucket[16]' -> ('bucket', 16).
+    """
+    if '[' in transform_str:
+        name, rest = transform_str.split('[', 1)
+        param = int(rest.rstrip(']'))
+        return name, param
+    return transform_str, None
+
+
 def _extract_partition_spec(metadata):
-    """Extract partition columns from Iceberg metadata. Returns (col_names, is_partitioned)."""
+    """Extract partition spec from Iceberg metadata.
+
+    Returns (spec_fields, is_partitioned) where spec_fields is a list of dicts:
+        {'source_column': str, 'transform': str, 'name': str, 'param': int | None}
+    """
     default_spec_id = metadata.get('default-spec-id', 0)
     specs = metadata.get('partition-specs', [])
 
@@ -158,13 +189,19 @@ def _extract_partition_spec(metadata):
         for f in schema.get('fields', []):
             field_id_to_name[f['id']] = f['name']
 
-    part_cols = []
+    spec_fields = []
     for pf in spec.get('fields', []):
         source_id = pf.get('source-id')
-        name = field_id_to_name.get(source_id, f'field_{source_id}')
-        part_cols.append(name)
+        source_column = field_id_to_name.get(source_id, f'field_{source_id}')
+        transform, param = _parse_transform(pf.get('transform', 'identity'))
+        spec_fields.append({
+            'source_column': source_column,
+            'transform': transform,
+            'name': pf.get('name', source_column),
+            'param': param,
+        })
 
-    return part_cols, len(part_cols) > 0
+    return spec_fields, len(spec_fields) > 0
 
 
 def _extract_row_count(metadata):
@@ -180,6 +217,50 @@ def _extract_row_count(metadata):
 
     return 0
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DDL builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TRANSFORM_MAP = {
+    'identity': lambda col, _: col,
+    'year': lambda col, _: f'years({col})',
+    'month': lambda col, _: f'months({col})',
+    'day': lambda col, _: f'days({col})',
+    'hour': lambda col, _: f'hours({col})',
+    'bucket': lambda col, p: f'bucket({p}, {col})',
+    'truncate': lambda col, p: f'truncate({p}, {col})',
+}
+
+
+def _build_iceberg_partition_clause(partition_spec):
+    """Convert a partition spec detail list into a Spark SQL PARTITIONED BY clause body."""
+    if not partition_spec:
+        return ''
+
+    parts = []
+    for field in partition_spec:
+        col = f"`{field['source_column']}`"
+        transform = field['transform']
+        param = field.get('param')
+        formatter = _TRANSFORM_MAP.get(transform)
+        if formatter:
+            parts.append(formatter(col, param))
+        else:
+            parts.append(col)
+    return ', '.join(parts)
+
+
+def _build_column_defs(schema):
+    """Build a column definition string from a schema list for CREATE TABLE DDL."""
+    if not schema:
+        return ''
+    return ', '.join(f"`{col['name']}` {col['type']}" for col in schema)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S3 and HMS helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _get_fs_stats(spark, table_path):
     """Get file count and total size via Hadoop FS."""
@@ -200,20 +281,105 @@ def _get_fs_stats(spark, table_path):
     return 0, 0
 
 
+def _list_iceberg_tables(spark, base_path):
+    """List subdirectories under base_path that contain a metadata/ folder."""
+    try:
+        from py4j.java_gateway import java_import
+
+        java_import(spark._jvm, 'org.apache.hadoop.fs.*')
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark._jvm.java.net.URI(base_path),
+            spark._jsc.hadoopConfiguration()
+        )
+        base = spark._jvm.org.apache.hadoop.fs.Path(base_path)
+        if not fs.exists(base):
+            return []
+
+        status_list = fs.listStatus(base)
+        tables = []
+        for i in range(len(status_list)):
+            if not status_list[i].isDirectory():
+                continue
+            name = status_list[i].getPath().getName()
+            metadata_dir = spark._jvm.org.apache.hadoop.fs.Path(
+                f"{base_path}/{name}/metadata"
+            )
+            if fs.exists(metadata_dir):
+                tables.append(name)
+        return sorted(tables)
+    except Exception as e:
+        logger.warning(f"[iceberg_discover] Could not list tables at {base_path}: {e}")
+        return []
+
+
+def _match_tokens(table_names, tokens):
+    """Match table names against token patterns using fnmatch."""
+    if '*' in tokens:
+        return table_names
+    seen = set()
+    matched = []
+    for tok in tokens:
+        for t in table_names:
+            if t not in seen and fnmatch.fnmatch(t, tok):
+                seen.add(t)
+                matched.append(t)
+    return matched
+
+
+def _describe_schema(spark, full_name):
+    """Extract schema from an HMS table via DESCRIBE."""
+    rows = spark.sql(f"DESCRIBE {full_name}").collect()
+    schema = []
+    for r in rows:
+        cn = (r.col_name or '').strip()
+        if cn.startswith('#') or cn == '' or cn == 'col_name':
+            break
+        schema.append({'name': cn, 'type': (r.data_type or '').strip()})
+    return schema
+
+
+def _describe_table_info(spark, full_name):
+    """Extract location and file format from DESCRIBE FORMATTED."""
+    location = None
+    file_format = 'PARQUET'
+    for row in spark.sql(f"DESCRIBE FORMATTED {full_name}").collect():
+        col = (row.col_name or '').strip().rstrip(':').lower()
+        val = (row.data_type or '').strip()
+        if col == 'location':
+            location = val
+        elif col == 'write.format.default':
+            file_format = val.upper()
+    return location, file_format
+
+
+def _resolve_data_path(spark, table_path):
+    """Return {table_path}/data if it exists, otherwise table_path."""
+    try:
+        from py4j.java_gateway import java_import
+
+        java_import(spark._jvm, 'org.apache.hadoop.fs.*')
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark._jvm.java.net.URI(table_path),
+            spark._jsc.hadoopConfiguration()
+        )
+        data_path = f"{table_path}/data"
+        if fs.exists(spark._jvm.org.apache.hadoop.fs.Path(data_path)):
+            return data_path
+    except Exception as e:
+        logger.warning(f"[iceberg_create] Could not check data/ subdir for {table_path}: {e}")
+    return table_path
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Strategy interface functions
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_excel_rows(df, config, run_id):
-    """Parse Excel rows for Iceberg-to-Iceberg metadata migration.
+    """Parse Excel rows for Iceberg-to-Iceberg migration.
 
-    Each row specifies a single Iceberg table via source_table_path.
-    Tables are registered in the metastore at their existing S3 location —
-    no data is copied, so dest_bucket and s3 prefix columns are not used.
-
-    The `database` column is the HMS database to register tables into
-    (there is no source metastore for file-based Iceberg tables).
-    Rows are grouped by database.
+    Required columns: database, table, dest_s3_prefix.
+    The 'table' column supports single names, comma-separated lists,
+    or wildcards (fnmatch patterns). Rows are grouped by (database, dest_s3_prefix).
     """
     grouped = {}
     for _, row in df.iterrows():
@@ -221,103 +387,202 @@ def parse_excel_rows(df, config, run_id):
         if not database:
             continue
 
-        table_name = cell_str(row.get('table'))
-        source_table_path = normalize_s3(cell_str(row.get('source_table_path')))
+        raw_table = cell_str(row.get('table'), '*')
+        dest_s3_prefix = normalize_s3(cell_str(row.get('dest_s3_prefix')))
 
-        if not table_name or not source_table_path:
+        if not dest_s3_prefix:
             logger.warning(
                 f"[parse_iceberg_excel] Skipping row for database '{database}' — "
-                f"missing 'table' or 'source_table_path'"
+                f"missing 'dest_s3_prefix'"
             )
             continue
 
-        if database not in grouped:
-            grouped[database] = {'entries': []}
+        key = (database, dest_s3_prefix.rstrip('/'))
+        if key not in grouped:
+            grouped[key] = {'tokens': []}
 
-        grouped[database]['entries'].append({
-            'table_name': table_name,
-            'source_table_path': source_table_path.rstrip('/'),
-        })
+        for tok in raw_table.split(','):
+            tok = tok.strip()
+            if tok:
+                grouped[key]['tokens'].append(tok)
 
     configs = []
-    for database, group in grouped.items():
+    for (database, dest_s3_prefix), group in grouped.items():
+        unique_tokens = list(dict.fromkeys(group['tokens']))
+        if '*' in unique_tokens:
+            unique_tokens = ['*']
+
         configs.append({
             'source_database': database,
             'dest_database': database,
-            'table_entries': group['entries'],
+            'dest_s3_prefix': dest_s3_prefix,
+            'table_tokens': unique_tokens,
             'run_id': run_id,
         })
         logger.info(
             f"[parse_iceberg_excel] {database} | "
-            f"tables={len(group['entries'])}"
+            f"prefix={dest_s3_prefix} | tokens={unique_tokens[:5]}"
         )
 
     return configs
 
 
 def discover_tables(db_config, spark, config):
-    """Discover Iceberg table metadata by reading metadata.json from S3."""
-    database = db_config['dest_database']
-    entries = db_config.get('table_entries', [])
+    """Discover Iceberg tables at destination and collect metadata.
 
-    logger.info(f"[iceberg_discover] '{database}': discovering {len(entries)} table(s)")
+    Lists S3 subdirectories under {dest_s3_prefix}/{database}/ to find
+    tables, then matches against table_tokens. For each matched table,
+    queries HMS if the table is already registered, otherwise falls back
+    to reading metadata.json from the destination.
+    """
+    from utils.migrations.shared import apply_bucket_credentials
+
+    database = db_config['dest_database']
+    dest_prefix = db_config['dest_s3_prefix']
+    tokens = db_config.get('table_tokens', ['*'])
+    db_path = f"{dest_prefix.rstrip('/')}/{database}"
+
+    apply_bucket_credentials(
+        spark, dest_prefix,
+        config.get('_dest_endpoint', ''),
+        config.get('_dest_access_key', ''),
+        config.get('_dest_secret_key', ''),
+    )
+
+    available_tables = _list_iceberg_tables(spark, db_path)
+    matched = _match_tokens(available_tables, tokens)
+
+    logger.info(
+        f"[iceberg_discover] '{database}': {len(available_tables)} table(s) found, "
+        f"{len(matched)} matched tokens {tokens[:5]}"
+    )
 
     metadata_list = []
-    for entry in entries:
-        tbl_name = entry['table_name']
-        table_path = entry['source_table_path'].rstrip('/')
+    for tbl_name in matched:
+        dest_path = f"{db_path}/{tbl_name}"
+        full_name = f"{database}.{tbl_name}"
 
         try:
-            iceberg_meta = _read_iceberg_metadata(spark, table_path)
-            schema = _extract_schema(iceberg_meta)
-            part_cols, is_partitioned = _extract_partition_spec(iceberg_meta)
-            row_count = _extract_row_count(iceberg_meta)
-            file_format = iceberg_meta.get('properties', {}).get(
-                'write.format.default', 'parquet'
-            ).upper()
-            file_count, total_size = _get_fs_stats(spark, table_path)
+            table_in_hms = False
+            try:
+                spark.sql(f"DESCRIBE {full_name}")
+                table_in_hms = True
+            except Exception:
+                pass
 
-            logger.info(
-                f"[iceberg_discover] {database}.{tbl_name} | fmt={file_format} | "
-                f"rows={row_count} | size={total_size / (1024 ** 2):.1f}MB | path={table_path}"
-            )
+            if table_in_hms:
+                schema = _describe_schema(spark, full_name)
+                row_count = spark.sql(
+                    f"SELECT COUNT(*) as c FROM {full_name}"
+                ).collect()[0]['c']
 
-            metadata_list.append({
-                'source_database': database,
-                'source_table': tbl_name,
-                'dest_database': database,
-                'source_location': table_path,
-                'dest_location': table_path,
-                'file_format': file_format,
-                'table_type': 'ICEBERG',
-                'schema': schema,
-                'partition_columns': ','.join(part_cols),
-                'partitions': [],
-                'partition_count': 0,
-                'is_partitioned': is_partitioned,
-                'source_row_count': row_count,
-                'source_file_count': file_count,
-                'source_total_size_bytes': total_size,
-            })
+                partition_count = 0
+                is_partitioned = False
+                partition_columns = ''
+                with contextlib.suppress(Exception):
+                    part_df = spark.sql(f"SELECT * FROM {full_name}.partitions")
+                    partition_count = part_df.count()
+                    if partition_count > 0:
+                        is_partitioned = True
+                        partition_columns = ','.join(
+                            c for c in part_df.columns if c != 'record_count'
+                        )
+
+                location, file_format = _describe_table_info(spark, full_name)
+
+                partition_spec_detail = [
+                    {'source_column': col, 'transform': 'identity',
+                     'name': col, 'param': None}
+                    for col in (c.strip() for c in partition_columns.split(','))
+                    if col
+                ]
+
+                logger.info(
+                    f"[iceberg_discover] {full_name} (HMS) | fmt={file_format} | "
+                    f"rows={row_count} | parts={partition_count}"
+                )
+
+                file_count, total_size = _get_fs_stats(spark, dest_path)
+
+                metadata_list.append({
+                    'source_database': database,
+                    'source_table': tbl_name,
+                    'dest_database': database,
+                    'source_location': location or dest_path,
+                    'dest_location': dest_path,
+                    'file_format': file_format,
+                    'table_type': 'ICEBERG',
+                    'schema': schema,
+                    'partition_columns': partition_columns,
+                    'partition_spec_detail': partition_spec_detail,
+                    'partitions': [],
+                    'partition_count': partition_count,
+                    'is_partitioned': is_partitioned,
+                    'source_row_count': row_count,
+                    'source_file_count': file_count,
+                    'source_total_size_bytes': total_size,
+                    'format_version': '2',
+                })
+
+            else:
+                iceberg_meta = _read_iceberg_metadata(spark, dest_path)
+                schema = _extract_schema(iceberg_meta)
+                partition_spec, is_partitioned = _extract_partition_spec(iceberg_meta)
+                row_count = _extract_row_count(iceberg_meta)
+                file_format = iceberg_meta.get('properties', {}).get(
+                    'write.format.default', 'parquet'
+                ).upper()
+                format_version = str(iceberg_meta.get('format-version', 2))
+
+                file_count, total_size = _get_fs_stats(spark, dest_path)
+
+                logger.info(
+                    f"[iceberg_discover] {full_name} (metadata.json) | fmt={file_format} | "
+                    f"rows={row_count} | size={total_size / (1024 ** 2):.1f}MB"
+                )
+
+                metadata_list.append({
+                    'source_database': database,
+                    'source_table': tbl_name,
+                    'dest_database': database,
+                    'source_location': dest_path,
+                    'dest_location': dest_path,
+                    'file_format': file_format,
+                    'table_type': 'ICEBERG',
+                    'schema': schema,
+                    'partition_columns': ','.join(
+                        p['source_column'] for p in partition_spec
+                    ),
+                    'partition_spec_detail': partition_spec,
+                    'partitions': [],
+                    'partition_count': 0,
+                    'is_partitioned': is_partitioned,
+                    'source_row_count': row_count,
+                    'source_file_count': file_count,
+                    'source_total_size_bytes': total_size,
+                    'format_version': format_version,
+                })
 
         except Exception as e:
-            logger.error(f"[iceberg_discover] FAILED for {database}.{tbl_name}: {e}")
+            logger.error(f"[iceberg_discover] FAILED for {full_name}: {e}")
             metadata_list.append({
                 'source_database': database,
                 'source_table': tbl_name,
                 'dest_database': database,
-                'source_location': table_path,
+                'source_location': dest_path,
                 'dest_location': '',
                 'file_format': 'UNKNOWN',
                 'table_type': 'UNKNOWN',
                 'schema': [],
                 'partition_columns': '',
+                'partition_spec_detail': [],
                 'partitions': [],
                 'partition_count': 0,
                 'is_partitioned': False,
                 'source_row_count': 0,
                 'source_file_count': 0,
                 'source_total_size_bytes': 0,
+                'format_version': '2',
                 'error': str(e)[:500],
             })
 
@@ -325,12 +590,21 @@ def discover_tables(db_config, spark, config):
 
 
 def create_dest_table(table_info, dest_db, spark, config):
-    """Register an Iceberg table in Hive Metastore via register_table procedure."""
+    """Create or update an Iceberg table at dest_location and register data via add_files.
+
+    - Table doesn't exist: CREATE TABLE + add_files
+    - Table exists at dest: add_files only (incremental, duplicates skipped)
+    - Table exists elsewhere: DROP TABLE + CREATE TABLE + add_files
+    """
     from utils.migrations.shared import apply_bucket_credentials
 
     tbl = table_info['source_table']
     dest_path = table_info['dest_location']
     full_name = f"{dest_db}.{tbl}"
+    fmt = table_info.get('file_format', 'PARQUET')
+    format_version = table_info.get('format_version', '2')
+    schema = table_info.get('schema', [])
+    partition_spec = table_info.get('partition_spec_detail', [])
 
     apply_bucket_credentials(
         spark, dest_path,
@@ -341,36 +615,61 @@ def create_dest_table(table_info, dest_db, spark, config):
 
     try:
         exists = False
+        existing_location = None
         try:
-            spark.sql(f"DESCRIBE {full_name}")
+            for row in spark.sql(f"DESCRIBE FORMATTED {full_name}").collect():
+                if (row.col_name or '').strip() == 'Location':
+                    existing_location = (row.data_type or '').strip()
             exists = True
         except Exception:
             pass
 
-        if exists:
-            existing_location = None
-            for row in spark.sql(f"DESCRIBE FORMATTED {full_name}").collect():
-                if (row.col_name or '').strip() == 'Location':
-                    existing_location = (row.data_type or '').strip()
-                    break
-
-            if existing_location and existing_location.rstrip('/') != dest_path.rstrip('/'):
-                error_msg = (
-                    f"Table {full_name} already exists at '{existing_location}' "
-                    f"but expected '{dest_path}'"
-                )
-                logger.error(f"[iceberg_create] LOCATION MISMATCH for {full_name}: {error_msg}")
-                return {'source_table': tbl, 'status': 'FAILED', 'existed': True, 'error': error_msg}
-
-            spark.sql(f"REFRESH TABLE {full_name}")
-            logger.info(f"[iceberg_create] REFRESHED (already existed): {full_name} at {dest_path}")
+        # Already at dest — just add_files (incremental)
+        if exists and existing_location and existing_location.rstrip('/') == dest_path.rstrip('/'):
+            logger.info(f"[iceberg_create] {full_name} already at {dest_path}, running add_files")
+            data_path = _resolve_data_path(spark, dest_path)
+            spark.sql(
+                f"CALL spark_catalog.system.add_files("
+                f"table => '{full_name}', "
+                f"source_table => '`{fmt.lower()}`.`{data_path}`')"
+            )
+            logger.info(f"[iceberg_create] add_files complete for {full_name}")
             return {'source_table': tbl, 'status': 'COMPLETED', 'existed': True, 'error': None}
 
-        metadata_file = _resolve_metadata_file(spark, dest_path)
-        spark.sql(
-            f"CALL spark_catalog.system.register_table('{full_name}', '{metadata_file}')"
+        # Exists at different location — drop first
+        if exists:
+            spark.sql(f"DROP TABLE {full_name}")
+            logger.info(f"[iceberg_create] Dropped {full_name} (was at {existing_location})")
+
+        # CREATE TABLE at dest
+        col_defs = _build_column_defs(schema)
+        if not col_defs:
+            raise ValueError(f"No schema available for {full_name} — cannot create table")
+
+        partition_clause = _build_iceberg_partition_clause(partition_spec)
+        partitioned_by = f"PARTITIONED BY ({partition_clause})" if partition_clause else ""
+
+        ddl = (
+            f"CREATE TABLE {full_name} ({col_defs}) "
+            f"USING iceberg "
+            f"{partitioned_by} "
+            f"LOCATION '{dest_path}' "
+            f"TBLPROPERTIES ("
+            f"'write.format.default' = '{fmt.lower()}', "
+            f"'format-version' = '{format_version}')"
         )
-        logger.info(f"[iceberg_create] REGISTERED: {full_name} at {dest_path} (metadata: {metadata_file})")
+        spark.sql(ddl)
+        logger.info(f"[iceberg_create] CREATED: {full_name} at {dest_path}")
+
+        # add_files
+        data_path = _resolve_data_path(spark, dest_path)
+        spark.sql(
+            f"CALL spark_catalog.system.add_files("
+            f"table => '{full_name}', "
+            f"source_table => '`{fmt.lower()}`.`{data_path}`')"
+        )
+        logger.info(f"[iceberg_create] add_files complete for {full_name}")
+
         return {'source_table': tbl, 'status': 'COMPLETED', 'existed': False, 'error': None}
 
     except Exception as e:

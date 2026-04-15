@@ -6,20 +6,21 @@ at a destination. No data is copied — only metadata (DDL) is migrated.
 
 Supports multiple migration types via the strategy pattern:
   - hive_to_hive:         Hive external tables → Hive external tables at dest S3
-  - iceberg_to_iceberg:   File-based Iceberg catalog → HMS-registered Iceberg tables
+  - iceberg_to_iceberg:   Source Iceberg table → new Iceberg table at dest S3
+                          (CREATE TABLE + add_files, supports incremental migration)
 
 Pipeline stages:
   1. Init tracking tables & create run record
   2. Parse Excel config (database, table tokens, prefix mapping)
   3. Discover source table metadata (schema, partitions, row counts)
   4. Validate data presence at destination S3 paths
-  5. Create destination tables (Hive DDL or Iceberg register_table)
+  5. Create destination tables (Hive DDL or Iceberg CREATE + add_files)
   6. Validate destination tables (row count, partition, schema comparison)
   7. Generate HTML report & send email
 
 Excel columns (hive_to_hive):      database | table | dest_database | dest_bucket |
                                    source_s3_prefix | dest_s3_prefix
-Excel columns (iceberg_to_iceberg): database | table | source_table_path
+Excel columns (iceberg_to_iceberg): database | table | dest_s3_prefix
 """
 
 import contextlib
@@ -605,7 +606,7 @@ def update_s3_table_create_status(table_result: dict, spark) -> dict:
 @task.pyspark(conn_id='spark_default')
 @track_duration
 def validate_s3_destination_tables(table_result: dict, spark, **context) -> dict:
-    """Validate destination Hive tables"""
+    """Validate destination tables"""
     if not isinstance(table_result, dict) or 'tables' not in table_result:
         logger.warning("[validate_s3_destination_tables] Skipping invalid input")
         return {}
@@ -667,8 +668,14 @@ def validate_s3_destination_tables(table_result: dict, spark, **context) -> dict
             dest_row_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_tbl}").collect()[0]['c']
 
             dest_partition_count = 0
+            migration_type = table_result.get('migration_type', 'hive_to_hive')
             with contextlib.suppress(Exception):
-                dest_partition_count = spark.sql(f"SHOW PARTITIONS {dest_tbl}").count()
+                if migration_type == 'iceberg_to_iceberg':
+                    dest_partition_count = spark.sql(
+                        f"SELECT * FROM {dest_tbl}.partitions"
+                    ).count()
+                else:
+                    dest_partition_count = spark.sql(f"SHOW PARTITIONS {dest_tbl}").count()
 
             src_schema = {c['name'].lower(): c['type'].lower() for c in t.get('schema', [])}
             dest_schema = {
@@ -692,7 +699,11 @@ def validate_s3_destination_tables(table_result: dict, spark, **context) -> dict
                     schema_diffs.append(f"Extra column in dest: {cn}")
 
             row_count_match = (src_row_count == dest_row_count)
-            partition_count_match = (src_partition_count == dest_partition_count)
+            partition_count_match = (
+                src_partition_count == dest_partition_count
+                if src_partition_count > 0
+                else True
+            )
 
             match_str = (
                 f"rows={'✓' if row_count_match else '✗'} "

@@ -1279,20 +1279,20 @@ COMPLETED_WITH_ERRORS
 Metadata-only migration: discovers source table schemas and recreates them at a destination. No data is copied — only metadata (DDL) is migrated. Supports multiple migration types via the strategy pattern:
 
 - **`hive_to_hive`** — Discovers Hive tables via metastore (`SHOW TABLES` / `DESCRIBE FORMATTED`), creates Hive external tables at destination S3 paths
-- **`iceberg_to_iceberg`** — Reads Iceberg `metadata.json` directly from S3 (file-based catalog, no metastore), registers tables in HMS via `register_table`
+- **`iceberg_to_iceberg`** — Reads Iceberg `metadata.json` from the source table, creates a new Iceberg table at the destination, and registers copied data files via `add_files`. Supports incremental migration (drop-and-recreate on each run)
 
 ---
 
 ### Key Features
 
 - **Strategy Pattern** - Pluggable migration types (`hive_to_hive`, `iceberg_to_iceberg`) with a shared pipeline
-- **No Data Movement** - `hive_to_hive` assumes data already exists at destination S3 paths; `iceberg_to_iceberg` registers tables in place
+- **No Data Movement** - Both strategies assume data already exists at destination S3 paths; `iceberg_to_iceberg` creates fresh Iceberg metadata pointing to the copied data
 - **Data Presence Validation** - Verifies destination S3 paths contain files before creating tables
 - **Path Remapping** (hive_to_hive only) - Supports prefix-based path translation (`source_s3_prefix` → `dest_s3_prefix`) or simple bucket-based destination
 - **Partition Support** - Automatic partition discovery and repair (Hive) or partition-aware registration (Iceberg)
 - **Format Preservation** - Supports Parquet, ORC, Avro, and TextFile
 - **Comprehensive Validation** - Row counts, partition counts, schema comparison
-- **Incremental Support** - Detects existing tables and runs repair/refresh instead of recreating
+- **Incremental Support** - `hive_to_hive` detects existing tables and runs repair/refresh; `iceberg_to_iceberg` drops and recreates on each run to accommodate incrementally copied data
 
 ---
 
@@ -1318,13 +1318,15 @@ Metadata-only migration: discovers source table schemas and recreates them at a 
 
 **Columns for `iceberg_to_iceberg`:**
 
-| Column             | Required | Description                                             | Example                 |
-| ------------------ | -------- | ------------------------------------------------------- | ----------------------- |
-| `database`         | **Yes**  | HMS database to register the table into                 | `analytics`             |
-| `table`            | **Yes**  | Table name to register                                  | `transactions`          |
-| `source_table_path`| **Yes**  | S3 path to Iceberg table root (containing `metadata/`)  | `s3a://bucket/db/table` |
+| Column             | Required | Description                                                        | Example                           |
+| ------------------ | -------- | ------------------------------------------------------------------ | --------------------------------- |
+| `database`         | **Yes**  | HMS database for the destination table                             | `analytics`                       |
+| `table`            | **Yes**  | Table name(s) — single, comma-separated, or wildcard (`fnmatch`)   | `orders` or `trans*` or `*`       |
+| `dest_s3_prefix`   | **Yes**  | Destination S3 prefix — table path built as `{prefix}/{database}/{table}` | `s3a://dest-bucket/warehouse` |
 
-Tables are registered in the metastore at their existing `source_table_path` location — no data is moved and no path remapping is performed. `dest_database`, `dest_bucket`, `source_s3_prefix`, and `dest_s3_prefix` columns are ignored for this strategy.
+Tables are discovered by listing S3 subdirectories under `{dest_s3_prefix}/{database}/` and matching against the `table` pattern. On first run, schema and partition spec are read from the copied `metadata.json` at the destination. On incremental runs, the existing HMS table is queried for stats and `add_files` registers only new data files (`check_duplicate_files=true` by default).
+
+**Limitations:** `add_files` only supports identity partition transforms (`PARTITIONED BY (column)`). Tables with `year()`, `month()`, `bucket()`, or `truncate()` partitioning are not supported. `dest_database`, `dest_bucket`, `source_s3_prefix`, and `source_table_path` columns are ignored for this strategy.
 
 ---
 
@@ -1400,7 +1402,7 @@ finalize_s3_run
 - Reads Excel file from S3 using `pyspark.pandas.read_excel`
 - Normalizes column names and delegates to the strategy's `parse_excel_rows` function
 - `hive_to_hive`: groups rows by `(source_database, dest_database, dest_bucket, prefixes)`, supports wildcard table patterns. Skips rows that provide neither `dest_bucket` nor a `source_s3_prefix`+`dest_s3_prefix` pair, or that provide both.
-- `iceberg_to_iceberg`: groups rows by `database` (the HMS database to register into), requires `table` and `source_table_path` per row. Ignores `dest_database`, `dest_bucket`, and prefix columns.
+- `iceberg_to_iceberg`: groups rows by `(database, dest_s3_prefix)`, supports wildcard/comma-separated table patterns. Requires `dest_s3_prefix` per row. Ignores `dest_database`, `dest_bucket`, and source prefix columns.
 
 ---
 
@@ -1410,7 +1412,7 @@ finalize_s3_run
 **Purpose:** Discover source table metadata — dispatches to the active strategy
 
 - **`hive_to_hive`**: lists tables via `SHOW TABLES`, filters by token patterns (wildcards/comma-separated), extracts schema, location, format, partitions, row count, and file metrics from the Hive metastore
-- **`iceberg_to_iceberg`**: reads `metadata.json` directly from S3 at each `source_table_path`, extracts schema, partitions, row count, and format from the Iceberg metadata. Destination path is always the source path (in-place registration).
+- **`iceberg_to_iceberg`**: lists S3 subdirectories under `{dest_s3_prefix}/{database}/` to discover tables, matches against table tokens. If table exists in HMS (incremental run), queries it for schema, row count, and partition count. Otherwise reads `metadata.json` from the destination (first run).
 
 ---
 
@@ -1460,8 +1462,9 @@ finalize_s3_run
   - **If table exists:** Runs `MSCK REPAIR TABLE` and `REFRESH TABLE`
   - **If table does not exist:** Generates and executes `CREATE EXTERNAL TABLE` DDL using schema from discovery, then runs `MSCK REPAIR TABLE` if partitioned
 - **`iceberg_to_iceberg`**: for each confirmed table:
-  - **If table exists:** Runs `REFRESH TABLE`
-  - **If table does not exist:** Resolves the latest `metadata.json` file and calls `register_table` to register in HMS
+  - **If table exists:** Drops it (`DROP TABLE` without `PURGE` — data files preserved)
+  - Creates a new Iceberg table via `CREATE TABLE ... USING iceberg` with schema and partition spec from source metadata
+  - Registers existing data files via `CALL spark_catalog.system.add_files` (no data copy — reads Parquet footers at dest and creates fresh manifests)
 - Applies per-bucket S3 credentials for destination paths
 
 ---
@@ -1481,7 +1484,7 @@ finalize_s3_run
 
 **Type:** PySpark (mapped per database)
 
-**Purpose:** Validate destination Hive tables — row counts, partition counts, schema comparison
+**Purpose:** Validate destination tables — row counts, partition counts, schema comparison
 
 - Skips tables where table creation was skipped or data was missing
 - Compares source row count, partition count, and schema against the newly created destination table
