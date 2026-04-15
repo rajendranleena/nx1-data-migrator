@@ -6,7 +6,7 @@ An automated **Airflow TaskFlow-based migration pipeline** consisting of two ind
 
 ## Overview
 
-This implementation provides three independent but complementary migration DAGs:
+This implementation provides four independent but complementary migration DAGs:
 
 1. **`mapr_to_s3_migration`** - Migrates Hive tables from MapR-FS/HDFS to S3
 2. **`iceberg_migration`** - Converts existing Hive tables in S3 to Apache Iceberg format
@@ -179,23 +179,23 @@ single-tenant setups.
 │
 │ (Independent — use when data is already in destination S3)
 ▼
-┌─────────────────────────────────────────────────────────────┐
-│ DAG 4: S3-to-S3 Metadata Migration                          │
-│                                                             │
-│ Strategy: hive_to_hive          │ iceberg_to_iceberg        │
-│ ────────────────────────────────┼───────────────────────────│
-│ Source: Hive metastore          │ Source: metadata.json      │
-│   (SHOW TABLES, DESCRIBE)      │   (read directly from S3)  │
-│ │                               │ │                         │
-│ │ [Data Presence Validation]    │ │ [Data Presence Valid.]   │
-│ ▼                               │ ▼                         │
-│ CREATE EXTERNAL TABLE           │ register_table (HMS)       │
-│ + MSCK REPAIR TABLE             │                            │
-│ │                               │ │                         │
-│ │ [Validation: Row counts, partitions, schema]              │
-│ ▼                                                           │
-│ Validated & Tracked                                         │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ DAG 4: S3-to-S3 Metadata Migration                               │
+│                                                                  │
+│ Strategy: hive_to_hive          │ iceberg_to_iceberg             │
+│ ────────────────────────────────┼────────────────────────────────│
+│ Source: Hive metastore          │ Source: metadata.json          │
+│   (SHOW TABLES, DESCRIBE)       │   (read from dest S3)          │
+│ │                               │ │                              │
+│ │ [Data Presence Validation]    │ │ [Data Presence Validation]   │
+│ ▼                               │ ▼                              │
+│ CREATE EXTERNAL TABLE           │ CREATE TABLE + add_files       │
+│ + MSCK REPAIR TABLE             │ (incremental via add_files)    │
+│ │                               │ │                              │
+│ │ [Validation: Row counts, partitions, schema]                   │
+│ ▼                                                                │
+│ Validated & Tracked                                              │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1279,7 +1279,7 @@ COMPLETED_WITH_ERRORS
 Metadata-only migration: discovers source table schemas and recreates them at a destination. No data is copied — only metadata (DDL) is migrated. Supports multiple migration types via the strategy pattern:
 
 - **`hive_to_hive`** — Discovers Hive tables via metastore (`SHOW TABLES` / `DESCRIBE FORMATTED`), creates Hive external tables at destination S3 paths
-- **`iceberg_to_iceberg`** — Reads Iceberg `metadata.json` from the source table, creates a new Iceberg table at the destination, and registers copied data files via `add_files`. Supports incremental migration (drop-and-recreate on each run)
+- **`iceberg_to_iceberg`** — Reads Iceberg `metadata.json` from the destination (where data was already copied), creates a new Iceberg table via `CREATE TABLE`, and registers data files via `add_files`. Incremental: if the table already exists at the destination, only `add_files` is called (duplicates skipped)
 
 ---
 
@@ -1292,7 +1292,7 @@ Metadata-only migration: discovers source table schemas and recreates them at a 
 - **Partition Support** - Automatic partition discovery and repair (Hive) or partition-aware registration (Iceberg)
 - **Format Preservation** - Supports Parquet, ORC, Avro, and TextFile
 - **Comprehensive Validation** - Row counts, partition counts, schema comparison
-- **Incremental Support** - `hive_to_hive` detects existing tables and runs repair/refresh; `iceberg_to_iceberg` drops and recreates on each run to accommodate incrementally copied data
+- **Incremental Support** - `hive_to_hive` detects existing tables and runs repair/refresh; `iceberg_to_iceberg` runs `add_files` on existing tables (duplicates skipped), only dropping and recreating if the table points to a different location
 
 ---
 
@@ -1318,15 +1318,15 @@ Metadata-only migration: discovers source table schemas and recreates them at a 
 
 **Columns for `iceberg_to_iceberg`:**
 
-| Column             | Required | Description                                                        | Example                           |
-| ------------------ | -------- | ------------------------------------------------------------------ | --------------------------------- |
-| `database`         | **Yes**  | HMS database for the destination table                             | `analytics`                       |
-| `table`            | **Yes**  | Table name(s) — single, comma-separated, or wildcard (`fnmatch`)   | `orders` or `trans*` or `*`       |
+| Column             | Required | Description                                                               | Example                       |
+| ------------------ | -------- | ------------------------------------------------------------------------- | ----------------------------- |
+| `database`         | **Yes**  | HMS database for the destination table                                    | `analytics`                   |
+| `table`            | No       | Table name(s) — single, comma-separated, or wildcard; defaults to `*`     | `orders` or `trans*` or `*`   |
 | `dest_s3_prefix`   | **Yes**  | Destination S3 prefix — table path built as `{prefix}/{database}/{table}` | `s3a://dest-bucket/warehouse` |
 
 Tables are discovered by listing S3 subdirectories under `{dest_s3_prefix}/{database}/` and matching against the `table` pattern. On first run, schema and partition spec are read from the copied `metadata.json` at the destination. On incremental runs, the existing HMS table is queried for stats and `add_files` registers only new data files (`check_duplicate_files=true` by default).
 
-**Limitations:** `add_files` only supports identity partition transforms (`PARTITIONED BY (column)`). Tables with `year()`, `month()`, `bucket()`, or `truncate()` partitioning are not supported. `dest_database`, `dest_bucket`, `source_s3_prefix`, and `source_table_path` columns are ignored for this strategy.
+**Limitations:** `add_files` only supports identity partition transforms (`PARTITIONED BY (column)`). Tables with `year()`, `month()`, `bucket()`, or `truncate()` partitioning are not supported. `dest_database`, `dest_bucket`, and `source_s3_prefix` columns are ignored for this strategy.
 
 ---
 
@@ -1462,9 +1462,9 @@ finalize_s3_run
   - **If table exists:** Runs `MSCK REPAIR TABLE` and `REFRESH TABLE`
   - **If table does not exist:** Generates and executes `CREATE EXTERNAL TABLE` DDL using schema from discovery, then runs `MSCK REPAIR TABLE` if partitioned
 - **`iceberg_to_iceberg`**: for each confirmed table:
-  - **If table exists:** Drops it (`DROP TABLE` without `PURGE` — data files preserved)
-  - Creates a new Iceberg table via `CREATE TABLE ... USING iceberg` with schema and partition spec from source metadata
-  - Registers existing data files via `CALL spark_catalog.system.add_files` (no data copy — reads Parquet footers at dest and creates fresh manifests)
+  - **If table exists at destination path:** Runs `add_files` only (incremental — duplicate files are skipped)
+  - **If table exists at a different path:** Drops it (`DROP TABLE` without `PURGE` — data files preserved), then creates + add_files
+  - **If table does not exist:** `CREATE TABLE ... USING iceberg` with schema and partition spec from destination metadata, then `add_files` to register existing data files
 - Applies per-bucket S3 credentials for destination paths
 
 ---
