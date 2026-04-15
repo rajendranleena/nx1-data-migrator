@@ -302,8 +302,6 @@ class TestIcebergDiscoverTables:
         count_row = MagicMock()
         count_row.__getitem__ = lambda self, key: 10000 if key == 'c' else None
 
-        partition_row = MagicMock()
-
         desc_formatted_loc = MagicMock()
         desc_formatted_loc.col_name = 'Location'
         desc_formatted_loc.data_type = 's3a://dest-bucket/warehouse/analytics/orders'
@@ -533,7 +531,9 @@ class TestMetadataExtraction:
 
     def test_extracts_schema_partitions_and_row_count(self):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import (
-            _extract_schema, _extract_partition_spec, _extract_row_count,
+            _extract_partition_spec,
+            _extract_row_count,
+            _extract_schema,
         )
 
         schema = _extract_schema(SAMPLE_ICEBERG_METADATA)
@@ -577,7 +577,8 @@ class TestDDLBuilders:
 
     def test_column_defs_and_partition_clause(self):
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import (
-            _build_column_defs, _build_iceberg_partition_clause,
+            _build_column_defs,
+            _build_iceberg_partition_clause,
         )
 
         schema = [
