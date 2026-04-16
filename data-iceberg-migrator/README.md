@@ -186,7 +186,7 @@ single-tenant setups.
 │ │                                                                │
 │ │ [Data Presence Validation]                                     │
 │ ▼                                                                │
-│ CREATE TABLE + add_files (incremental via add_files)             │
+│ DROP + CREATE TABLE + add_files (re-imports all data files)      │
 │ │                                                                │
 │ │ [Validation: Row counts, partitions, schema]                   │
 │ ▼                                                                │
@@ -1268,7 +1268,7 @@ COMPLETED_WITH_ERRORS
 
 ### Purpose
 
-Metadata-only migration: reads Iceberg `metadata.json` from the destination (where data was already copied), creates a new Iceberg table via `CREATE TABLE`, and registers data files via `add_files`. Incremental: if the table already exists at the destination, only `add_files` is called (duplicates skipped). No data is copied — only metadata (DDL) is migrated.
+Metadata-only migration: reads Iceberg `metadata.json` from the destination (where data was already copied), creates a new Iceberg table via `CREATE TABLE`, and registers data files via `add_files`. If the table already exists it is dropped and recreated so that `add_files` re-imports all data files — this handles both re-runs and incremental data loads where new files have been added to S3. No data is copied — only metadata (DDL) is migrated.
 
 ---
 
@@ -1279,7 +1279,7 @@ Metadata-only migration: reads Iceberg `metadata.json` from the destination (whe
 - **Partition Support** - Partition-aware registration via `add_files`
 - **Format Preservation** - Supports Parquet, ORC, Avro, and TextFile
 - **Comprehensive Validation** - Row counts, partition counts, schema comparison
-- **Incremental Support** - Runs `add_files` on existing tables (duplicates skipped), only dropping and recreating if the table points to a different location
+- **Idempotent Re-runs** - Existing tables are dropped and recreated so `add_files` re-imports all data files, handling both re-runs and incremental data loads
 
 ---
 
@@ -1291,7 +1291,7 @@ Metadata-only migration: reads Iceberg `metadata.json` from the destination (whe
 | `table`            | No       | Table name(s) — single, comma-separated, or wildcard; defaults to `*`     | `orders` or `trans*` or `*`   |
 | `dest_s3_prefix`   | **Yes**  | Destination S3 prefix — table path built as `{prefix}/{database}/{table}` | `s3a://dest-bucket/warehouse` |
 
-Tables are discovered by listing S3 subdirectories under `{dest_s3_prefix}/{database}/` and matching against the `table` pattern. On first run, schema and partition spec are read from the copied `metadata.json` at the destination. On incremental runs, the existing HMS table is queried for stats and `add_files` registers only new data files (`check_duplicate_files=true` by default).
+Tables are discovered by listing S3 subdirectories under `{dest_s3_prefix}/{database}/` and matching against the `table` pattern. Schema and partition spec are read from the destination's `metadata.json`. If a table already exists in HMS it is dropped and recreated so that `add_files` can re-import all data files cleanly (Iceberg's `add_files` rejects imports when any source file is already tracked — there is no skip-duplicates mode).
 
 **Limitations:** `add_files` only supports identity partition transforms (`PARTITIONED BY (column)`). Tables with `year()`, `month()`, `bucket()`, or `truncate()` partitioning are not supported.
 
@@ -1379,8 +1379,8 @@ finalize_s3_run
 **Purpose:** Discover source table metadata — dispatches to the active strategy
 
 - Lists S3 subdirectories under `{dest_s3_prefix}/{database}/` to discover tables, matches against table tokens
-- If table exists in HMS (incremental run), queries it for schema, row count, and partition count
-- Otherwise reads `metadata.json` from the destination (first run)
+- If table exists in HMS, queries it for schema, row count, and partition count
+- Otherwise reads `metadata.json` from the destination
 
 ---
 
@@ -1427,9 +1427,9 @@ finalize_s3_run
 
 - Skips tables whose data presence status is not `CONFIRMED`
 - For each confirmed table:
-  - **If table exists at destination path:** Runs `add_files` only (incremental — duplicate files are skipped)
-  - **If table exists at a different path:** Drops it (`DROP TABLE` without `PURGE` — data files preserved), then creates + add_files
+  - **If table already exists:** Drops it (`DROP TABLE` without `PURGE` — data files preserved on S3), then creates + `add_files`
   - **If table does not exist:** `CREATE TABLE ... USING iceberg` with schema and partition spec from destination metadata, then `add_files` to register existing data files
+- Tables are always dropped and recreated because `add_files` rejects the entire import when any source file is already tracked (no skip-duplicates mode) — this ensures both re-runs and incremental data loads work correctly
 - Applies per-bucket S3 credentials for destination paths
 
 ---

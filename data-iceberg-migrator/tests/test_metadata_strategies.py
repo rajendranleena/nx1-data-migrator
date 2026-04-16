@@ -293,6 +293,10 @@ class TestIcebergDiscoverTables:
         from utils.migrations.shared import get_config
 
         _mock_fs_for_table_listing(mock_spark, ['orders'])
+        # Partition spec now comes from metadata.json even on the HMS path
+        # (HMS `.partitions` metadata-table columns are not the actual
+        # partition columns, and HMS drops transform info).
+        _mock_fs_for_iceberg(mock_spark, SAMPLE_ICEBERG_METADATA)
 
         # Mock HMS responses
         describe_row = MagicMock()
@@ -417,14 +421,19 @@ class TestIcebergCreateDestTable:
         assert 'CREATE TABLE' in calls_str
         assert 'add_files' in calls_str
 
-    def test_incremental_add_files_when_at_dest(self, mock_spark):
+    @pytest.mark.parametrize('existing_location', [
+        's3a://dest-bucket/warehouse/analytics/orders',   # same as dest
+        's3a://old-bucket/somewhere/orders',               # different location
+    ])
+    def test_drops_and_recreates_existing_table(self, mock_spark, existing_location):
+        """Table already in HMS (any location) — DROP + CREATE + add_files."""
         from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
         from utils.migrations.shared import get_config
 
         call_log = []
         loc_row = MagicMock()
         loc_row.col_name = 'Location'
-        loc_row.data_type = 's3a://dest-bucket/warehouse/analytics/orders'
+        loc_row.data_type = existing_location
 
         def sql_router(sql):
             call_log.append(sql)
@@ -439,32 +448,6 @@ class TestIcebergCreateDestTable:
 
         assert result['status'] == 'COMPLETED'
         assert result['existed'] is True
-        calls_str = ' '.join(call_log)
-        assert 'add_files' in calls_str
-        assert 'DROP TABLE' not in calls_str
-        assert 'CREATE TABLE' not in calls_str
-
-    def test_drops_table_at_different_location(self, mock_spark):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
-        from utils.migrations.shared import get_config
-
-        call_log = []
-        loc_row = MagicMock()
-        loc_row.col_name = 'Location'
-        loc_row.data_type = 's3a://old-bucket/somewhere/orders'
-
-        def sql_router(sql):
-            call_log.append(sql)
-            sl = sql.lower().strip()
-            df = MagicMock()
-            if sl.startswith('describe formatted'):
-                df.collect.return_value = [loc_row]
-            return df
-        mock_spark.sql.side_effect = sql_router
-
-        result = create_dest_table(self._make_table_info(), 'analytics', mock_spark, get_config())
-
-        assert result['status'] == 'COMPLETED'
         calls_str = ' '.join(call_log)
         assert 'DROP TABLE' in calls_str
         assert 'CREATE TABLE' in calls_str

@@ -4,10 +4,10 @@ Iceberg-to-Iceberg migration strategy.
 Source: Iceberg table with Hadoop catalog on S3 (metadata.json files)
 Destination: Iceberg table registered in HMS via CREATE TABLE + add_files
 
-On first run, reads schema and partition spec from the copied metadata.json
-at the destination. On incremental runs, queries the existing HMS table for
-stats. Data files are registered via add_files (check_duplicate_files=true
-by default, so already-tracked files are skipped).
+Reads schema and partition spec from the destination's metadata.json.
+If the table already exists in HMS it is dropped and recreated so that
+add_files can re-import all data files (add_files has no skip-duplicates
+mode — it rejects the entire import when any source file is already tracked).
 
 Limitation: add_files only supports identity partition transforms.
 Tables with year(), month(), bucket(), truncate() partitioning will fail.
@@ -39,7 +39,7 @@ ICEBERG_TYPE_MAP = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metadata.json helpers (used on first run when table is not yet in HMS)
+# Metadata.json helpers (used when table is not yet in HMS)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _map_iceberg_type(iceberg_type):
@@ -476,26 +476,30 @@ def discover_tables(db_config, spark, config):
                     f"SELECT COUNT(*) as c FROM {full_name}"
                 ).collect()[0]['c']
 
+                # Partition spec from metadata.json — the .partitions metadata
+                # table columns (partition, record_count, file_count, …) are
+                # NOT the actual partition columns, and HMS doesn't preserve
+                # transforms (year, month, bucket, etc.).
+                try:
+                    iceberg_meta = _read_iceberg_metadata(spark, dest_path)
+                    partition_spec_detail, is_partitioned = (
+                        _extract_partition_spec(iceberg_meta)
+                    )
+                except Exception:
+                    partition_spec_detail, is_partitioned = [], False
+
+                partition_columns = ','.join(
+                    p['source_column'] for p in partition_spec_detail
+                )
+
                 partition_count = 0
-                is_partitioned = False
-                partition_columns = ''
-                with contextlib.suppress(Exception):
-                    part_df = spark.sql(f"SELECT * FROM {full_name}.partitions")
-                    partition_count = part_df.count()
-                    if partition_count > 0:
-                        is_partitioned = True
-                        partition_columns = ','.join(
-                            c for c in part_df.columns if c != 'record_count'
-                        )
+                if is_partitioned:
+                    with contextlib.suppress(Exception):
+                        partition_count = spark.sql(
+                            f"SELECT * FROM {full_name}.partitions"
+                        ).count()
 
                 location, file_format = _describe_table_info(spark, full_name)
-
-                partition_spec_detail = [
-                    {'source_column': col, 'transform': 'identity',
-                     'name': col, 'param': None}
-                    for col in (c.strip() for c in partition_columns.split(','))
-                    if col
-                ]
 
                 logger.info(
                     f"[iceberg_discover] {full_name} (HMS) | fmt={file_format} | "
@@ -590,11 +594,15 @@ def discover_tables(db_config, spark, config):
 
 
 def create_dest_table(table_info, dest_db, spark, config):
-    """Create or update an Iceberg table at dest_location and register data via add_files.
+    """Create an Iceberg table at dest_location and register data via add_files.
 
     - Table doesn't exist: CREATE TABLE + add_files
-    - Table exists at dest: add_files only (incremental, duplicates skipped)
-    - Table exists elsewhere: DROP TABLE + CREATE TABLE + add_files
+    - Table already exists: DROP TABLE + CREATE TABLE + add_files
+
+    The table is always dropped and recreated because add_files rejects the
+    entire import when any source file is already tracked (there is no
+    skip-duplicates mode).  DROP + CREATE + add_files re-imports everything
+    cleanly and handles both re-runs and incremental data loads.
     """
     from utils.migrations.shared import apply_bucket_credentials
 
@@ -624,19 +632,10 @@ def create_dest_table(table_info, dest_db, spark, config):
         except Exception:
             pass
 
-        # Already at dest — just add_files (incremental)
-        if exists and existing_location and existing_location.rstrip('/') == dest_path.rstrip('/'):
-            logger.info(f"[iceberg_create] {full_name} already at {dest_path}, running add_files")
-            data_path = _resolve_data_path(spark, dest_path)
-            spark.sql(
-                f"CALL spark_catalog.system.add_files("
-                f"table => '{full_name}', "
-                f"source_table => '`{fmt.lower()}`.`{data_path}`')"
-            )
-            logger.info(f"[iceberg_create] add_files complete for {full_name}")
-            return {'source_table': tbl, 'status': 'COMPLETED', 'existed': True, 'error': None}
-
-        # Exists at different location — drop first
+        # Drop existing table so add_files can re-import all data files.
+        # add_files rejects the entire import when ANY source file is already
+        # tracked (check_duplicate_files has no skip mode), so the only way to
+        # handle incremental data is DROP + CREATE + add_files.
         if exists:
             spark.sql(f"DROP TABLE {full_name}")
             logger.info(f"[iceberg_create] Dropped {full_name} (was at {existing_location})")
@@ -670,7 +669,35 @@ def create_dest_table(table_info, dest_db, spark, config):
         )
         logger.info(f"[iceberg_create] add_files complete for {full_name}")
 
-        return {'source_table': tbl, 'status': 'COMPLETED', 'existed': False, 'error': None}
+        # Row and partition counts reflecting what add_files actually
+        # imported. These become the authoritative source_* values for
+        # validation — the discover-time metrics reflect only metadata.json-
+        # tracked state, which is stale when incremental Parquet files sit
+        # in data/ untracked by the source Iceberg metadata.
+        imported_row_count = spark.sql(
+            f"SELECT COUNT(*) as c FROM {full_name}"
+        ).collect()[0]['c']
+
+        imported_partition_count = 0
+        if partition_spec:
+            with contextlib.suppress(Exception):
+                imported_partition_count = spark.sql(
+                    f"SELECT * FROM {full_name}.partitions"
+                ).count()
+
+        logger.info(
+            f"[iceberg_create] {full_name} imported "
+            f"{imported_row_count} rows, {imported_partition_count} partitions"
+        )
+
+        return {
+            'source_table': tbl,
+            'status': 'COMPLETED',
+            'existed': exists,
+            'imported_row_count': imported_row_count,
+            'imported_partition_count': imported_partition_count,
+            'error': None,
+        }
 
     except Exception as e:
         error_msg = str(e)[:2000]

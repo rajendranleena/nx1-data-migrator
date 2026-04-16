@@ -563,12 +563,27 @@ def update_s3_table_create_status(table_result: dict, spark) -> dict:
 
         error_msg = (r.get('error') or '').replace("'", "''")[:2000]
 
+        # Refresh source_* metrics with what the strategy actually imported,
+        # if it reported them. For iceberg_to_iceberg this replaces the
+        # discover-time metrics (from metadata.json) with the true state
+        # after add_files — important when incremental Parquet files sat
+        # in data/ untracked by the source metadata.
+        imported_rc = r.get('imported_row_count')
+        imported_pc = r.get('imported_partition_count')
+        metric_updates = []
+        if imported_rc is not None:
+            metric_updates.append(f"source_row_count = {int(imported_rc)}")
+        if imported_pc is not None:
+            metric_updates.append(f"source_partition_count = {int(imported_pc)}")
+        metric_sql = ",".join(metric_updates) + "," if metric_updates else ""
+
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.s3_migration_table_status
             SET table_create_status = '{r['status']}',
                 table_create_completed_at = current_timestamp(),
                 table_create_duration_seconds = {table_dur},
                 table_already_existed = {str(r.get('existed', False)).lower()},
+                {metric_sql}
                 overall_status = CASE
                     WHEN overall_status = 'FAILED' THEN overall_status
                     WHEN overall_status = 'DATA_MISSING' THEN overall_status
