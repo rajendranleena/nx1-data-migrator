@@ -85,75 +85,66 @@ class TestParseS3Excel:
     def test_basic_row_parsing(self, mock_spark, sample_s3_run_id):
         setup_spark_excel(mock_spark, make_excel_bytes([{
             'database': 'sales', 'table': '*',
-            'dest_database': 'sales_dest',
-            'dest_bucket': 's3a://dest-bkt',
-            'source_s3_prefix': '', 'dest_s3_prefix': '',
+            'dest_s3_prefix': 's3a://dest/data',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'iceberg_to_iceberg', sample_s3_run_id, spark=mock_spark)
         assert len(result) == 1
         assert result[0]['source_database'] == 'sales'
-        assert result[0]['dest_database'] == 'sales_dest'
+        assert result[0]['dest_database'] == 'sales'
         assert result[0]['run_id'] == sample_s3_run_id
 
-    @pytest.mark.parametrize("raw_bucket,expected", [
-        ('s3://b',   's3a://b'),
-        ('s3n://b',  's3a://b'),
-        ('b',        's3a://b'),
-        ('s3a://b',  's3a://b'),
+    @pytest.mark.parametrize("raw_prefix,expected", [
+        ('s3://dest/data',   's3a://dest/data'),
+        ('s3n://dest/data',  's3a://dest/data'),
+        ('s3a://dest/data',  's3a://dest/data'),
     ])
-    def test_normalizes_s3_prefix(self, mock_spark, sample_s3_run_id, raw_bucket, expected):
+    def test_normalizes_s3_prefix(self, mock_spark, sample_s3_run_id, raw_prefix, expected):
         setup_spark_excel(mock_spark, make_excel_bytes([{
-            'database': 'db', 'table': '*', 'dest_database': '',
-            'dest_bucket': raw_bucket, 'source_s3_prefix': '', 'dest_s3_prefix': '',
+            'database': 'db', 'table': '*',
+            'dest_s3_prefix': raw_prefix,
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
-        assert result[0]['dest_bucket'] == expected
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'iceberg_to_iceberg', sample_s3_run_id, spark=mock_spark)
+        assert result[0]['dest_s3_prefix'] == expected
 
     def test_wildcard_collapses_specific_tokens(self, mock_spark, sample_s3_run_id):
         setup_spark_excel(mock_spark, make_excel_bytes([
-            {'database': 'db', 'table': 'tbl_a', 'dest_database': '', 'dest_bucket': 's3a://b', 'source_s3_prefix': '', 'dest_s3_prefix': ''},
-            {'database': 'db', 'table': '*',     'dest_database': '', 'dest_bucket': 's3a://b', 'source_s3_prefix': '', 'dest_s3_prefix': ''},
+            {'database': 'db', 'table': 'tbl_a', 'dest_s3_prefix': 's3a://d/data'},
+            {'database': 'db', 'table': '*',     'dest_s3_prefix': 's3a://d/data'},
         ]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'iceberg_to_iceberg', sample_s3_run_id, spark=mock_spark)
         assert result[0]['table_tokens'] == ['*']
 
     def test_comma_separated_tables_tokenized(self, mock_spark, sample_s3_run_id):
         setup_spark_excel(mock_spark, make_excel_bytes([{
             'database': 'db', 'table': 'tbl_a,tbl_b,tbl_c',
-            'dest_database': '', 'dest_bucket': 's3a://b',
-            'source_s3_prefix': '', 'dest_s3_prefix': '',
+            'dest_s3_prefix': 's3a://d/data',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'iceberg_to_iceberg', sample_s3_run_id, spark=mock_spark)
         assert set(result[0]['table_tokens']) == {'tbl_a', 'tbl_b', 'tbl_c'}
 
     def test_empty_rows_skipped(self, mock_spark, sample_s3_run_id):
         setup_spark_excel(mock_spark, make_excel_bytes([
-            {'database': '',      'table': '*', 'dest_database': '', 'dest_bucket': '',   'source_s3_prefix': '', 'dest_s3_prefix': ''},
-            {'database': 'mydb', 'table': '*', 'dest_database': '', 'dest_bucket': 's3a://b', 'source_s3_prefix': '', 'dest_s3_prefix': ''},
+            {'database': '',     'table': '*', 'dest_s3_prefix': ''},
+            {'database': 'mydb', 'table': '*', 'dest_s3_prefix': 's3a://d/data'},
         ]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'iceberg_to_iceberg', sample_s3_run_id, spark=mock_spark)
         assert len(result) == 1
         assert result[0]['source_database'] == 'mydb'
 
-    def test_prefix_pair_recorded(self, mock_spark, sample_s3_run_id):
+    def test_dest_prefix_recorded(self, mock_spark, sample_s3_run_id):
         setup_spark_excel(mock_spark, make_excel_bytes([{
-            'database': 'db', 'table': '*', 'dest_database': 'db2',
-            'dest_bucket': '',
-            'source_s3_prefix': 's3a://src/data',
-            'dest_s3_prefix':   's3a://dst/data',
+            'database': 'db', 'table': '*',
+            'dest_s3_prefix': 's3a://dst/data',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
-        assert result[0]['source_s3_prefix'] == 's3a://src/data'
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'iceberg_to_iceberg', sample_s3_run_id, spark=mock_spark)
         assert result[0]['dest_s3_prefix'] == 's3a://dst/data'
 
-    def test_skips_row_with_both_dest_bucket_and_prefix_pair(self, mock_spark, sample_s3_run_id):
+    def test_skips_row_with_missing_dest_prefix(self, mock_spark, sample_s3_run_id):
         setup_spark_excel(mock_spark, make_excel_bytes([{
-            'database': 'db', 'table': '*', 'dest_database': 'db2',
-            'dest_bucket': 's3a://explicit-bkt',
-            'source_s3_prefix': 's3a://src/data',
-            'dest_s3_prefix':   's3a://dst/data',
+            'database': 'db', 'table': '*',
+            'dest_s3_prefix': '',
         }]))
-        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'hive_to_hive', sample_s3_run_id, spark=mock_spark)
+        result = m.parse_s3_excel.function('s3a://b/f.xlsx', 'iceberg_to_iceberg', sample_s3_run_id, spark=mock_spark)
         assert len(result) == 0
 
 
@@ -163,67 +154,53 @@ class TestParseS3Excel:
 
 class TestDiscoverSourceTables:
 
-    def _make_sql_router(self, tables, file_format='PARQUET', partitions=None, row_count=500):
-        """Return a spark.sql side_effect that answers all queries discover makes."""
-        if partitions is None:
-            partitions = []
+    def _setup_fs_table_listing(self, mock_spark, table_names):
+        """Configure FS mock so _list_iceberg_tables returns given tables."""
+        fs_mock = mock_spark._jvm.org.apache.hadoop.fs.FileSystem.get.return_value
 
+        items = []
+        for name in table_names:
+            item = MagicMock()
+            item.isDirectory.return_value = True
+            item.getPath.return_value.getName.return_value = name
+            items.append(item)
+
+        fs_mock.listStatus.return_value = items
+        fs_mock.exists.return_value = True
+
+    def _make_sql_router(self, file_format='PARQUET', partition_count=0, row_count=500):
+        """Return a spark.sql side_effect for iceberg discovery (HMS path)."""
         def router(sql):
             sl = sql.lower().strip()
             df = MagicMock()
-            if 'show tables' in sl:
-                df.collect.return_value = [MagicMock(tableName=t) for t in tables]
-            elif 'describe formatted' in sl:
-                rows = []
-                # location
+            if sl.startswith('describe formatted'):
                 loc_row = MagicMock()
                 loc_row.col_name = 'Location'
-                loc_row.data_type = 's3a://src-bucket/data/db/tbl'
-                rows.append(loc_row)
-                # table type
-                type_row = MagicMock()
-                type_row.col_name = 'Type'
-                type_row.data_type = 'EXTERNAL_TABLE'
-                rows.append(type_row)
-                # input format
-                fmt_map = {'PARQUET': 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
-                           'ORC': 'org.apache.hadoop.hive.ql.io.orc.OrcInputFormat'}
+                loc_row.data_type = 's3a://dest-bucket/data/sales_data/transactions'
                 fmt_row = MagicMock()
-                fmt_row.col_name = 'InputFormat:'
-                fmt_row.data_type = fmt_map.get(file_format, fmt_map['PARQUET'])
-                rows.append(fmt_row)
-                if partitions:
-                    ph = MagicMock()
-                    ph.col_name = '# Partition Information'
-                    ph.data_type = ''
-                    rows.append(ph)
-                    ch = MagicMock()
-                    ch.col_name = '# col_name'
-                    ch.data_type = ''
-                    rows.append(ch)
-                    pc = MagicMock()
-                    pc.col_name = 'dt'
-                    pc.data_type = 'string'
-                    rows.append(pc)
-                df.collect.return_value = rows
-            elif 'show partitions' in sl:
-                df.collect.return_value = [MagicMock(partition=p) for p in partitions]
-            elif 'select count' in sl:
-                count_row = MagicMock()
-                count_row.__getitem__ = lambda self, k: row_count
-                df.collect.return_value = [count_row]
-            elif 'describe ' in sl:
+                fmt_row.col_name = 'write.format.default'
+                fmt_row.data_type = file_format
+                df.collect.return_value = [loc_row, fmt_row]
+            elif sl.startswith('describe '):
                 col = MagicMock()
                 col.col_name = 'id'
                 col.data_type = 'bigint'
                 df.collect.return_value = [col]
+            elif 'count(*)' in sl:
+                r = MagicMock()
+                r.__getitem__ = lambda self, k: row_count
+                df.collect.return_value = [r]
+            elif '.partitions' in sl:
+                df.count.return_value = partition_count
+                df.columns = ['dt'] if partition_count > 0 else []
             else:
                 df.collect.return_value = []
             return df
         return router
 
     def test_discovers_all_tables_with_wildcard(self, mock_spark, sample_s3_db_config):
-        mock_spark.sql.side_effect = self._make_sql_router(['transactions', 'orders'])
+        self._setup_fs_table_listing(mock_spark, ['transactions', 'orders'])
+        mock_spark.sql.side_effect = self._make_sql_router()
         sample_s3_db_config['table_tokens'] = ['*']
         result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
@@ -232,7 +209,8 @@ class TestDiscoverSourceTables:
         assert len(result['tables']) == 2
 
     def test_discovers_specific_table_by_token(self, mock_spark, sample_s3_db_config):
-        mock_spark.sql.side_effect = self._make_sql_router(['transactions', 'orders'])
+        self._setup_fs_table_listing(mock_spark, ['transactions', 'orders'])
+        mock_spark.sql.side_effect = self._make_sql_router()
         sample_s3_db_config['table_tokens'] = ['transactions']
         result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
@@ -240,17 +218,17 @@ class TestDiscoverSourceTables:
         assert len(result['tables']) == 1
         assert result['tables'][0]['source_table'] == 'transactions'
 
-    def test_detects_orc_format(self, mock_spark, sample_s3_db_config):
-        mock_spark.sql.side_effect = self._make_sql_router(['transactions'], file_format='ORC')
+    def test_detects_file_format(self, mock_spark, sample_s3_db_config):
+        self._setup_fs_table_listing(mock_spark, ['transactions'])
+        mock_spark.sql.side_effect = self._make_sql_router(file_format='ORC')
         result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
         )
         assert result['tables'][0]['file_format'] == 'ORC'
 
     def test_detects_partitioned_table(self, mock_spark, sample_s3_db_config):
-        mock_spark.sql.side_effect = self._make_sql_router(
-            ['transactions'], partitions=['dt=2024-01-01', 'dt=2024-01-02']
-        )
+        self._setup_fs_table_listing(mock_spark, ['transactions'])
+        mock_spark.sql.side_effect = self._make_sql_router(partition_count=2)
         result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
         )
@@ -259,42 +237,21 @@ class TestDiscoverSourceTables:
         assert tbl['partition_count'] == 2
 
     def test_includes_source_row_count(self, mock_spark, sample_s3_db_config):
-        mock_spark.sql.side_effect = self._make_sql_router(['transactions'], row_count=999)
+        self._setup_fs_table_listing(mock_spark, ['transactions'])
+        mock_spark.sql.side_effect = self._make_sql_router(row_count=999)
         result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
         )
         assert result['tables'][0]['source_row_count'] == 999
 
-    def test_compute_dest_path_via_prefix(self, mock_spark, sample_s3_db_config):
-        """When source and dest prefixes are configured, dest_location should be prefix-derived."""
-        sample_s3_db_config['source_s3_prefix'] = 's3a://src/data'
-        sample_s3_db_config['dest_s3_prefix'] = 's3a://dst/data'
-
-        def router(sql):
-            sl = sql.lower()
-            df = MagicMock()
-            if 'show tables' in sl:
-                df.collect.return_value = [MagicMock(tableName='transactions')]
-            elif 'describe formatted' in sl:
-                loc = MagicMock()
-                loc.col_name = 'Location'
-                loc.data_type = 's3a://src/data/sales_data/transactions'
-                df.collect.return_value = [loc]
-            elif 'show partitions' in sl:
-                df.collect.return_value = []
-            elif 'select count' in sl:
-                r = MagicMock()
-                r.__getitem__ = lambda self, k: 0
-                df.collect.return_value = [r]
-            else:
-                df.collect.return_value = []
-            return df
-
-        mock_spark.sql.side_effect = router
+    def test_dest_location_uses_prefix_path(self, mock_spark, sample_s3_db_config):
+        """dest_location should be {dest_s3_prefix}/{database}/{table}."""
+        self._setup_fs_table_listing(mock_spark, ['transactions'])
+        mock_spark.sql.side_effect = self._make_sql_router()
         result = m.discover_source_tables.function.__wrapped__(
             db_config=sample_s3_db_config, spark=mock_spark,
         )
-        assert result['tables'][0]['dest_location'].startswith('s3a://dst/data')
+        assert result['tables'][0]['dest_location'] == 's3a://dest-bucket/data/sales_data/transactions'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,7 +370,7 @@ class TestCreateDestTables:
         def sql_router(sql):
             sl = sql.lower()
             df = MagicMock()
-            if sl.strip().startswith('describe ') and 'formatted' not in sl:
+            if 'describe formatted' in sl:
                 raise Exception("Table not found")
             df.collect.return_value = []
             return df
@@ -425,16 +382,29 @@ class TestCreateDestTables:
         assert result['table_results'][0]['status'] == 'COMPLETED'
         assert result['table_results'][0]['existed'] is False
 
-    def test_repairs_existing_table(self, mock_spark, mock_iceberg_retry, sample_s3_presence_result):
-        mock_spark.sql.return_value.collect.return_value = []  # DESCRIBE doesn't raise
+    def test_add_files_for_existing_table(self, mock_spark, mock_iceberg_retry, sample_s3_presence_result):
+        dest_path = sample_s3_presence_result['tables'][0]['dest_location']
+
+        def sql_router(sql):
+            sl = sql.lower()
+            df = MagicMock()
+            if 'describe formatted' in sl:
+                loc_row = MagicMock()
+                loc_row.col_name = 'Location'
+                loc_row.data_type = dest_path
+                df.collect.return_value = [loc_row]
+            else:
+                df.collect.return_value = []
+            return df
+        mock_spark.sql.side_effect = sql_router
 
         result = m.create_dest_tables.function.__wrapped__(
             presence_result=sample_s3_presence_result, spark=mock_spark, ti=MagicMock(),
         )
         assert result['table_results'][0]['status'] == 'COMPLETED'
         assert result['table_results'][0]['existed'] is True
-        repair_calls = [c for c in mock_spark.sql.call_args_list if 'MSCK REPAIR' in str(c)]
-        assert len(repair_calls) > 0
+        add_files_calls = [c for c in mock_spark.sql.call_args_list if 'add_files' in str(c)]
+        assert len(add_files_calls) > 0
 
     def test_skips_table_with_missing_data(self, mock_spark, mock_iceberg_retry, sample_s3_presence_result):
         sample_s3_presence_result['presence_results'][0]['status'] = 'MISSING'
@@ -448,9 +418,9 @@ class TestCreateDestTables:
         def sql_router(sql):
             sl = sql.lower()
             df = MagicMock()
-            if sl.strip().startswith('describe ') and 'formatted' not in sl:
+            if 'describe formatted' in sl:
                 raise Exception("Table not found")
-            if 'create external table' in sl:
+            if 'create table' in sl:
                 raise Exception("DDL permission denied")
             df.collect.return_value = []
             return df
@@ -517,9 +487,6 @@ class TestValidateS3DestinationTables:
                 r = MagicMock()
                 r.__getitem__ = lambda self, k: dest_row_count
                 df.collect.return_value = [r]
-            elif 'show partitions' in sl:
-                df.count.return_value = dest_part_count
-                df.collect.return_value = [MagicMock() for _ in range(dest_part_count)]
             elif sl.startswith('describe '):
                 df.collect.return_value = [
                     MagicMock(col_name=name, data_type=dtype) for name, dtype in schema_cols

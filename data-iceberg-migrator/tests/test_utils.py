@@ -226,44 +226,6 @@ class TestApplyBucketCredentials:
 
 
 # ---------------------------------------------------------------------------
-# compute_dest_path
-# ---------------------------------------------------------------------------
-class TestComputeDestPath:
-
-    def test_uses_prefix_mapping_when_matched(self):
-        result = m.compute_dest_path(
-            source_location='s3a://src-bucket/data/db/tbl',
-            dest_database='dest_db',
-            table_name='tbl',
-            dest_bucket='s3a://dest-bucket',
-            source_s3_prefix='s3a://src-bucket/data',
-            dest_s3_prefix='s3a://dest-bucket/data',
-        )
-        assert result == 's3a://dest-bucket/data/db/tbl'
-
-    def test_falls_back_to_bucket_db_table(self):
-        result = m.compute_dest_path(
-            source_location='s3a://src-bucket/data/db/tbl',
-            dest_database='dest_db',
-            table_name='tbl',
-            dest_bucket='s3a://dest-bucket',
-            source_s3_prefix='',
-            dest_s3_prefix='',
-        )
-        assert result == 's3a://dest-bucket/dest_db/tbl'
-
-    def test_raises_when_source_doesnt_match_prefix(self):
-        with pytest.raises(ValueError, match="does not start with source_s3_prefix"):
-            m.compute_dest_path(
-                source_location='s3a://other-bucket/data/db/tbl',
-                dest_database='dest_db',
-                table_name='tbl',
-                dest_bucket='s3a://dest-bucket',
-                source_s3_prefix='s3a://src-bucket/data',
-                dest_s3_prefix='s3a://dest-bucket/data',
-            )
-
-# ---------------------------------------------------------------------------
 # cell_str
 # ---------------------------------------------------------------------------
 class TestCellStr:

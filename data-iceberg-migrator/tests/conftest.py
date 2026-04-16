@@ -173,7 +173,6 @@ def _install_airflow_stubs():
     sys.modules.pop("migration_dag_folder_copy", None)
     sys.modules.pop("migration_dag_metadata", None)
     sys.modules.pop("utils.migrations.metadata_strategies.iceberg_to_iceberg", None)
-    sys.modules.pop("utils.migrations.metadata_strategies.hive_to_hive", None)
     sys.modules.pop("utils.migrations.metadata_strategies", None)
     sys.modules.pop("utils.migrations.partition_utils", None)
     sys.modules.pop("utils.migrations.shared", None)
@@ -457,13 +456,11 @@ def sample_s3_run_id():
 def sample_s3_db_config(sample_s3_run_id):
     return {
         'source_database':  'sales_data',
-        'dest_database':    'sales_data_dest',
-        'dest_bucket':      's3a://dest-bucket',
-        'source_s3_prefix': 's3a://src-bucket/data',
+        'dest_database':    'sales_data',
         'dest_s3_prefix':   's3a://dest-bucket/data',
         'table_tokens':     ['transactions'],
         'run_id':           sample_s3_run_id,
-        'migration_type':   'hive_to_hive',
+        'migration_type':   'iceberg_to_iceberg',
     }
 
 
@@ -472,20 +469,21 @@ def sample_s3_table_metadata():
     return [{
         'source_database':        'sales_data',
         'source_table':           'transactions',
-        'dest_database':          'sales_data_dest',
-        'dest_bucket':            's3a://dest-bucket',
-        'source_location':        's3a://src-bucket/data/sales_data/transactions',
+        'dest_database':          'sales_data',
+        'source_location':        's3a://dest-bucket/data/sales_data/transactions',
         'dest_location':          's3a://dest-bucket/data/sales_data/transactions',
         'file_format':            'PARQUET',
-        'table_type':             'EXTERNAL_TABLE',
-        'schema':                 [{'name': 'id', 'type': 'bigint'}, {'name': 'amount', 'type': 'double'}],
+        'table_type':             'ICEBERG',
+        'schema':                 [{'name': 'id', 'type': 'BIGINT'}, {'name': 'amount', 'type': 'DOUBLE'}],
         'partition_columns':      'dt',
-        'partitions':             ['dt=2024-01-01', 'dt=2024-01-02'],
+        'partition_spec_detail':  [{'source_column': 'dt', 'transform': 'identity', 'name': 'dt', 'param': None}],
+        'partitions':             [],
         'partition_count':        2,
         'is_partitioned':         True,
         'source_row_count':       1000,
         'source_file_count':      5,
         'source_total_size_bytes': 10 * 1024 * 1024,
+        'format_version':         '2',
     }]
 
 
@@ -494,11 +492,9 @@ def sample_s3_discovery(sample_s3_run_id, sample_s3_table_metadata):
     return {
         'run_id':           sample_s3_run_id,
         'source_database':  'sales_data',
-        'dest_database':    'sales_data_dest',
-        'dest_bucket':      's3a://dest-bucket',
-        'source_s3_prefix': 's3a://src-bucket/data',
+        'dest_database':    'sales_data',
         'dest_s3_prefix':   's3a://dest-bucket/data',
-        'migration_type':   'hive_to_hive',
+        'migration_type':   'iceberg_to_iceberg',
         'tables':           sample_s3_table_metadata,
         '_task_duration':   4.2,
     }

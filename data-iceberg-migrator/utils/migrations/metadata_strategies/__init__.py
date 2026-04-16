@@ -16,9 +16,6 @@ import logging
 
 from utils.migrations.shared import cell_str, normalize_s3  # noqa: F401 — re-exported for strategy modules
 
-from .hive_to_hive import create_dest_table as _hive_create
-from .hive_to_hive import discover_tables as _hive_discover
-from .hive_to_hive import parse_excel_rows as _hive_parse
 from .iceberg_to_iceberg import create_dest_table as _iceberg_create
 from .iceberg_to_iceberg import discover_tables as _iceberg_discover
 from .iceberg_to_iceberg import parse_excel_rows as _iceberg_parse
@@ -26,11 +23,6 @@ from .iceberg_to_iceberg import parse_excel_rows as _iceberg_parse
 logger = logging.getLogger(__name__)
 
 STRATEGIES = {
-    'hive_to_hive': {
-        'parse_excel_rows': _hive_parse,
-        'discover_tables': _hive_discover,
-        'create_dest_table': _hive_create,
-    },
     'iceberg_to_iceberg': {
         'parse_excel_rows': _iceberg_parse,
         'discover_tables': _iceberg_discover,

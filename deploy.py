@@ -44,10 +44,6 @@ PROJECTS = {
                 "utils/migrations/metadata_strategies/__init__.py",
             ),
             (
-                "utils/migrations/metadata_strategies/hive_to_hive.py",
-                "utils/migrations/metadata_strategies/hive_to_hive.py",
-            ),
-            (
                 "utils/migrations/metadata_strategies/iceberg_to_iceberg.py",
                 "utils/migrations/metadata_strategies/iceberg_to_iceberg.py",
             ),

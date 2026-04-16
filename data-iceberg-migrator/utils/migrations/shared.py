@@ -22,7 +22,6 @@ __all__ = [
     "build_s3_opts",
     "cell_str",
     "cluster_login",
-    "compute_dest_path",
     "configure_spark_s3",
     "execute_with_iceberg_retry",
     "get_config",
@@ -118,24 +117,6 @@ def apply_bucket_credentials(spark, bucket_url: str, endpoint: str, access_key: 
     if secret_key:
         spark.conf.set(f"fs.s3a.bucket.{bucket_name}.secret.key", secret_key)
 
-
-def compute_dest_path(source_location: str, dest_database: str, table_name: str,
-                      dest_bucket: str, source_s3_prefix: str, dest_s3_prefix: str) -> str:
-    """ Compute the destination S3 path for a table. """
-    if source_s3_prefix and dest_s3_prefix:
-        if not source_location.startswith(source_s3_prefix):
-            raise ValueError(
-                f"source_location '{source_location}' does not start with "
-                f"source_s3_prefix '{source_s3_prefix}' — check the Excel config"
-            )
-        relative = source_location[len(source_s3_prefix):].lstrip('/')
-        return f"{dest_s3_prefix.rstrip('/')}/{relative}"
-    if not dest_bucket:
-        raise ValueError(
-            f"No dest_bucket provided for {dest_database}.{table_name} "
-            f"and no s3 prefix pair to derive the path"
-        )
-    return f"{dest_bucket.rstrip('/')}/{dest_database}/{table_name}"
 
 
 def cell_str(val, default=''):

@@ -4,23 +4,20 @@ DAG 4: S3-to-S3 Metadata Migration
 Metadata-only migration: discovers source table schemas and recreates them
 at a destination. No data is copied — only metadata (DDL) is migrated.
 
-Supports multiple migration types via the strategy pattern:
-  - hive_to_hive:         Hive external tables → Hive external tables at dest S3
-  - iceberg_to_iceberg:   Source Iceberg table → new Iceberg table at dest S3
-                          (CREATE TABLE + add_files, supports incremental migration)
+Migration type: iceberg_to_iceberg
+  Source Iceberg table → new Iceberg table at dest S3
+  (CREATE TABLE + add_files, supports incremental migration)
 
 Pipeline stages:
   1. Init tracking tables & create run record
   2. Parse Excel config (database, table tokens, prefix mapping)
   3. Discover source table metadata (schema, partitions, row counts)
   4. Validate data presence at destination S3 paths
-  5. Create destination tables (Hive DDL or Iceberg CREATE + add_files)
+  5. Create destination tables (Iceberg CREATE + add_files)
   6. Validate destination tables (row count, partition, schema comparison)
   7. Generate HTML report & send email
 
-Excel columns (hive_to_hive):      database | table | dest_database | dest_bucket |
-                                   source_s3_prefix | dest_s3_prefix
-Excel columns (iceberg_to_iceberg): database | table | dest_s3_prefix
+Excel columns: database | table | dest_s3_prefix
 """
 
 import contextlib
@@ -203,7 +200,7 @@ def parse_s3_excel(excel_file_path: str, migration_type: str, run_id: str, spark
 def discover_source_tables(db_config: dict, spark, **context) -> dict:
     """Discover source table metadata — dispatches to the active strategy."""
     config = get_config()
-    migration_type = db_config.get('migration_type', 'hive_to_hive')
+    migration_type = db_config.get('migration_type', 'iceberg_to_iceberg')
     strategy = get_strategy(migration_type)
 
     configure_spark_s3(spark, config)
@@ -215,7 +212,6 @@ def discover_source_tables(db_config: dict, spark, **context) -> dict:
         'source_database': db_config['source_database'],
         'dest_database': db_config['dest_database'],
         'dest_bucket': db_config.get('dest_bucket', ''),
-        'source_s3_prefix': db_config.get('source_s3_prefix', ''),
         'dest_s3_prefix': db_config.get('dest_s3_prefix', ''),
         'migration_type': migration_type,
         'tables': metadata,
@@ -496,7 +492,7 @@ def create_dest_tables(presence_result: dict, spark, **context) -> dict:
 
     config = get_config()
     configure_spark_s3(spark, config)
-    migration_type = presence_result.get('migration_type', 'hive_to_hive')
+    migration_type = presence_result.get('migration_type', 'iceberg_to_iceberg')
     strategy = get_strategy(migration_type)
     dest_db = presence_result['dest_database']
     tables = presence_result['tables']
@@ -668,14 +664,10 @@ def validate_s3_destination_tables(table_result: dict, spark, **context) -> dict
             dest_row_count = spark.sql(f"SELECT COUNT(*) as c FROM {dest_tbl}").collect()[0]['c']
 
             dest_partition_count = 0
-            migration_type = table_result.get('migration_type', 'hive_to_hive')
             with contextlib.suppress(Exception):
-                if migration_type == 'iceberg_to_iceberg':
-                    dest_partition_count = spark.sql(
-                        f"SELECT * FROM {dest_tbl}.partitions"
-                    ).count()
-                else:
-                    dest_partition_count = spark.sql(f"SHOW PARTITIONS {dest_tbl}").count()
+                dest_partition_count = spark.sql(
+                    f"SELECT * FROM {dest_tbl}.partitions"
+                ).count()
 
             src_schema = {c['name'].lower(): c['type'].lower() for c in t.get('schema', [])}
             dest_schema = {
@@ -1171,7 +1163,7 @@ def finalize_s3_run(run_id: str, spark) -> dict:
 with DAG(
     dag_id='s3_to_s3_metadata_migration',
     default_args=default_args,
-    description='Metadata-only migration: recreate tables at destination (Hive or Iceberg)',
+    description='Metadata-only migration: register Iceberg tables at destination via CREATE TABLE + add_files',
     schedule=None,
     start_date=datetime(2025, 1, 1),
     catchup=False,
@@ -1184,9 +1176,9 @@ with DAG(
             description='S3 path to the Excel config file for metadata migration',
         ),
         'migration_type': Param(
-            default='hive_to_hive',
+            default='iceberg_to_iceberg',
             type='string',
-            enum=['hive_to_hive', 'iceberg_to_iceberg'],
+            enum=['iceberg_to_iceberg'],
             description='Type of metadata migration to perform',
         ),
     },
