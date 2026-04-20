@@ -20,6 +20,7 @@ class TestGetConfig:
         assert cfg['tracking_database'] == 'migration_tracking'
         assert cfg['default_s3_bucket'] == 's3a://test-bucket'
         assert cfg['distcp_mappers'] == '10'
+        assert cfg['distcp_preserve_delete'] is True
         for key in ['s3_endpoint', 's3_access_key', 's3_secret_key',
                      'spark_conn_id', 'tracking_location', 'report_output_location',
                      'auth_method', 'smtp_conn_id', 'email_recipients']:

@@ -168,6 +168,12 @@ def get_config() -> dict:
         # DistCp Configuration
         'distcp_mappers': Variable.get('migration_distcp_mappers', default_var=os.getenv('MIGRATION_DISTCP_MAPPERS', '50')),
         'distcp_bandwidth': Variable.get('migration_distcp_bandwidth', default_var=os.getenv('MIGRATION_DISTCP_BANDWIDTH', '100')),
+        'distcp_preserve_delete': str(
+            Variable.get(
+                'migration_distcp_preserve_delete',
+                default_var=os.getenv('MIGRATION_DISTCP_PRESERVE_DELETE', 'true')
+            )
+        ).strip().lower() in ('1', 'true', 'yes', 'y', 'on'),
 
         # Spark Configuration
         'spark_conn_id': Variable.get('migration_spark_conn_id', default_var=os.getenv('MIGRATION_SPARK_CONN_ID', 'spark_default')),

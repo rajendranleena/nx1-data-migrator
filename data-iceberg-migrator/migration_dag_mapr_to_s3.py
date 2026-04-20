@@ -1013,6 +1013,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
     temp_dir = cluster_setup['temp_dir']
     mappers = config['distcp_mappers']
     bandwidth = config['distcp_bandwidth']
+    preserve_delete = config.get('distcp_preserve_delete', True)
 
     s3_opts = build_s3_opts(discovery['dest_bucket'], config, discovery.get('dest_endpoint', ''))
 
@@ -1056,24 +1057,30 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
         logger.info(f"[DistCp]   Source : {source_loc}")
         logger.info(f"[DistCp]   Dest   : {s3_loc}")
         logger.info(f"[DistCp]   Mappers: {mappers} | Bandwidth: {bandwidth} MB/s")
+        if partition_filter_active:
+            logger.info(
+                f"[DistCp]   Partition mode: "
+                f"{'per-partition with delete preservation' if preserve_delete else 'path-list additive copy (delete disabled)'}"
+            )
 
         if partition_filter_active and filtered_partitions:
-            partition_copy_pairs = []
-            for part_str in filtered_partitions:
-                src_part = f"{source_loc}/{part_str}"
-                dst_part = f"{s3_loc}/{part_str}"
-                partition_copy_pairs.append((src_part, dst_part))
+            if preserve_delete:
+                partition_copy_pairs = []
+                for part_str in filtered_partitions:
+                    src_part = f"{source_loc}/{part_str}"
+                    dst_part = f"{s3_loc}/{part_str}"
+                    partition_copy_pairs.append((src_part, dst_part))
 
-            distcp_calls = ""
-            for part_idx, (src_part, dst_part) in enumerate(partition_copy_pairs):
-                distcp_calls += f"""
+                distcp_calls = ""
+                for part_idx, (src_part, dst_part) in enumerate(partition_copy_pairs):
+                    distcp_calls += f"""
 echo "=== Copying partition: {src_part} -> {dst_part} ==="
 hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}_part{part_idx}.log \\
     "{src_part}" "{dst_part}"
 """
 
-            cmd = f'''set -e
+                cmd = f'''set -e
 
 calculate_s3_metrics_hadoop() {{
     local location=$1
@@ -1125,6 +1132,77 @@ echo "S3_FILES_TRANSFERRED=$S3_FILES_TRANSFERRED"
 echo "S3_BYTES_TRANSFERRED=$S3_BYTES_TRANSFERRED"
 echo "===DISTCP_METRICS_END==="
 echo "PARTITIONS_REQUESTED={len(filtered_partitions)}"
+exit 0
+'''
+            else:
+                pathlist_entries = "\n".join(f"{source_loc}/{part_str}" for part_str in filtered_partitions)
+                cmd = f'''set -e
+
+calculate_s3_metrics_hadoop() {{
+    local location=$1
+    if ! hadoop fs{s3_opts} -test -d "$location" 2>/dev/null; then
+        echo "S3_FILE_COUNT=0"
+        echo "S3_TOTAL_SIZE=0"
+        return
+    fi
+    FILE_COUNT=$(hadoop fs{s3_opts} -ls -R "$location" 2>/dev/null | grep '^-' | wc -l)
+    TOTAL_SIZE=$(hadoop fs{s3_opts} -du -s "$location" 2>/dev/null | awk '{{print $1}}')
+    [ -z "$FILE_COUNT" ] && FILE_COUNT=0
+    [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
+    echo "S3_FILE_COUNT=$FILE_COUNT"
+    echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
+}}
+
+INCR=false
+hadoop fs{s3_opts} -test -d {s3_loc} 2>/dev/null && INCR=true
+PATHLIST="{temp_dir}/distcp_{tbl}_sources.txt"
+
+cat > "$PATHLIST" <<'EOF'
+{pathlist_entries}
+EOF
+
+echo "=== Calculating S3 metrics BEFORE distcp ==="
+S3_BEFORE=$(calculate_s3_metrics_hadoop "{s3_loc}")
+S3_FILE_COUNT_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
+[ -z "$S3_FILE_COUNT_BEFORE" ] && S3_FILE_COUNT_BEFORE=0
+[ -z "$S3_TOTAL_SIZE_BEFORE" ] && S3_TOTAL_SIZE_BEFORE=0
+
+echo "=== Running distcp using source path list (delete disabled) ==="
+DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+    -log {temp_dir}/distcp_{tbl}.log -f "$PATHLIST" "{s3_loc}" 2>&1)
+DISTCP_EXIT=$?
+rm -f "$PATHLIST"
+
+BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | awk '{{print $NF}}' | tr -d ',')
+FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Number of files copied" | awk '{{print $NF}}' | tr -d ',')
+[ -z "$BYTES_COPIED" ] && BYTES_COPIED=0
+[ -z "$FILES_COPIED" ] && FILES_COPIED=0
+
+echo "=== Calculating S3 metrics AFTER distcp ==="
+S3_AFTER=$(calculate_s3_metrics_hadoop "{s3_loc}")
+S3_FILE_COUNT_AFTER=$(echo "$S3_AFTER" | grep "^S3_FILE_COUNT=" | cut -d'=' -f2)
+S3_TOTAL_SIZE_AFTER=$(echo "$S3_AFTER" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f2)
+[ -z "$S3_FILE_COUNT_AFTER" ] && S3_FILE_COUNT_AFTER=0
+[ -z "$S3_TOTAL_SIZE_AFTER" ] && S3_TOTAL_SIZE_AFTER=0
+
+S3_FILES_TRANSFERRED=$((S3_FILE_COUNT_AFTER - S3_FILE_COUNT_BEFORE))
+S3_BYTES_TRANSFERRED=$((S3_TOTAL_SIZE_AFTER - S3_TOTAL_SIZE_BEFORE))
+
+echo "===DISTCP_METRICS_START==="
+echo "INCREMENTAL=$INCR"
+echo "BYTES_COPIED=$BYTES_COPIED"
+echo "FILES_COPIED=$FILES_COPIED"
+echo "S3_FILE_COUNT_BEFORE=$S3_FILE_COUNT_BEFORE"
+echo "S3_TOTAL_SIZE_BEFORE=$S3_TOTAL_SIZE_BEFORE"
+echo "S3_FILE_COUNT_AFTER=$S3_FILE_COUNT_AFTER"
+echo "S3_TOTAL_SIZE_AFTER=$S3_TOTAL_SIZE_AFTER"
+echo "S3_FILES_TRANSFERRED=$S3_FILES_TRANSFERRED"
+echo "S3_BYTES_TRANSFERRED=$S3_BYTES_TRANSFERRED"
+echo "===DISTCP_METRICS_END==="
+echo "PARTITIONS_REQUESTED={len(filtered_partitions)}"
+
+[ "$DISTCP_EXIT" -ne 0 ] && exit $DISTCP_EXIT
 exit 0
 '''
         else:

@@ -49,6 +49,7 @@ The DAGs rely on Airflow Variables for configuration. Set these before running:
 | `s3_secret_key`              | _(empty)_        | Default S3 secret key (all buckets)          | `source_to_s3_migration`, `folder_only_data_copy`, `s3_to_s3_metadata_migration`        |
 | `migration_distcp_mappers`   | `50`             | Number of DistCp mappers                     | `source_to_s3_migration`, `folder_only_data_copy`                                       |
 | `migration_distcp_bandwidth` | `100`            | Bandwidth limit per mapper (MB/s)            | `source_to_s3_migration`, `folder_only_data_copy`                                       |
+| `migration_distcp_preserve_delete` | `true`     | DistCp delete-preservation mode for partition-filtered copies (see [DistCp partition copy modes](#distcp-partition-copy-modes)) | `source_to_s3_migration` |
 | `s3_listing_tool`            | `hadoop`         | Tool for S3 listing: `hadoop` or `boto3`     | Currently unused                                                                      |
 | `migration_smtp_conn_id`     | `smtp_default`   | Airflow SMTP connection ID for email reports | All DAGs                                                                              |
 | `migration_email_recipients` | _(empty)_        | Comma-separated email addresses for reports  | All DAGs                                                                              |
@@ -455,7 +456,7 @@ cleanup_edge (SSH: Cleanup temp files)
   - Bandwidth limit per mapper (default: 100 MB/s)
   - Dynamic strategy for load balancing
   - S3 credentials passed via `-D` properties
-- **Partition-specific copy (path-list mode):** When a `partition_filter` is active, DistCp runs in `-f pathlist` mode instead of copying the whole table root. A temporary path-list file is written to the edge node listing only the matched source/destination partition paths (`{source_loc}/{part}  {s3_loc}/{part}`), and DistCp copies exactly those partitions with `-update -delete`.
+- **Partition-filtered copy:** When a `partition_filter` is active, only the matched partitions are copied instead of the whole table root. The copy mode is controlled by `migration_distcp_preserve_delete` (see below).
 - Captures success/failure status per table
 - **File metrics tracking:**
   - Calculates S3 metrics BEFORE DistCp: file count and total size
@@ -467,6 +468,40 @@ cleanup_edge (SSH: Cleanup temp files)
   - These metrics help detect incomplete copies even when DistCp reports success
 - Logs written to `{temp_dir}/distcp_{run_id}_{src_db}.log`
 - **Timeout:** 24 hours per table (configurable via `SSH_COMMAND_TIMEOUT`)
+
+##### DistCp partition copy modes
+
+When `partition_filter` is active, the `migration_distcp_preserve_delete` variable controls how filtered partitions are copied. For full-table copies (no `partition_filter`), this setting has no effect — DistCp always uses `-update -delete` against the table root.
+
+| `preserve_delete` | Strategy | Flags | Speed | Cleans up stale files? |
+|---|---|---|---|---|
+| `true` (default) | One DistCp per partition | `-update -delete` | Slower (N jobs) | Yes |
+| `false` | Single DistCp with `-f` path-list | `-update` only | Faster (1 job) | No |
+
+**Note:** Single DistCp with -f having multiple partition paths to a common destination + -delete option, lead to a exit code 25 - because the destination folder already exists after the first partition is copied. Hence this is an infeasible option.
+
+**Important:** The `migration_distcp_preserve_delete` setting only affects partition-filtered copies (when `partition_filter` is set in the Excel config). For full-table (bulk) loads, this setting has no effect—DistCp always uses `-update -delete` against the table root.
+
+**How to choose the setting for partition-filtered runs:**
+
+- Use `true` (default) for incremental re-syncs of mutable data, or when you want to remove any files in S3 that no longer exist in the source partitions.
+- Use `false` for one-time or phased loads where you do not need to clean up orphans immediately (e.g., append-only data, phased migration steps). You can always run a full-table copy later to clean up.
+
+If unsure, leave the default (`true`).
+
+##### Partition filter: safe run sequences
+
+All run sequences are safe — no combination corrupts data:
+
+- **Partition-filtered → Full table** — full run copies everything and cleans up with `-delete`
+- **Full table → Partition-filtered** — only named partitions are re-synced, rest stays untouched
+- **`preserve_delete=false` → `true` or full table** — next run cleans up any orphans
+- **Different partition filters across runs** — each operates on its own partitions
+
+**What to watch for:**
+
+- `preserve_delete=false` with repeated re-syncs of mutable partitions will accumulate orphaned files. Switch to `true` or do a full-table run to clean up.
+- A partition-filtered run only touches the named partitions. To remove partitions dropped at source, run a full-table copy.
 
 ---
 

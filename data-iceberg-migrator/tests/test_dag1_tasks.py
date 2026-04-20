@@ -465,6 +465,47 @@ class TestRunDistcpSsh:
         assert s3_loc in ssh_cmd
         assert 'PARTITIONS_REQUESTED=2' in ssh_cmd
 
+    def test_filtered_partitions_can_use_path_list_when_delete_not_preserved(self, mock_ssh_hook, sample_discovery):
+        hook, client, _, _ = mock_ssh_hook
+        stderr = MagicMock()
+        stderr.read.return_value = b''
+        client.exec_command.return_value = (
+            MagicMock(), self._make_distcp_stdout(incremental=False), stderr
+        )
+
+        filtered_discovery = {
+            **sample_discovery,
+            'tables': [{
+                **sample_discovery['tables'][0],
+                'partition_filter': 'dt>=2024-01-01',
+                'filtered_partitions': ['dt=2024-01-01', 'dt=2024-01-02'],
+                'partition_filter_active': True,
+                'filtered_row_count': 500,
+                'filtered_source_size_bytes': 5 * 1024 * 1024,
+                'filtered_file_count': 2,
+                'full_table_row_count': 1000,
+                'full_table_partition_count': 2,
+                'serde_properties': {},
+            }],
+        }
+
+        cfg = {**m.get_config(), 'distcp_preserve_delete': False}
+        with patch.object(m, 'get_config', return_value=cfg):
+            result = m.run_distcp_ssh.function.__wrapped__(
+                discovery=filtered_discovery,
+                cluster_setup={'temp_dir': '/tmp/test', 'run_id': 'r'},
+                ti=MagicMock(),
+            )
+
+        assert result['distcp_results'][0]['status'] == 'COMPLETED'
+
+        ssh_cmd = client.exec_command.call_args[0][0]
+        assert 'PATHLIST=' in ssh_cmd
+        assert '-f "$PATHLIST"' in ssh_cmd
+        assert '-delete' not in ssh_cmd
+        assert 'dt=2024-01-01' in ssh_cmd
+        assert 'dt=2024-01-02' in ssh_cmd
+
     def test_zero_filtered_partitions_skips_table(self, mock_ssh_hook, sample_discovery):
         """If partition_filter_active=True but filtered_partitions=[], table must be SKIPPED
         without calling SSH at all."""

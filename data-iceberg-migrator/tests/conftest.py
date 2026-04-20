@@ -19,6 +19,7 @@ MOCK_VARIABLES = {
     's3_secret_key':                'testsecret',
     'migration_distcp_mappers':     '10',
     'migration_distcp_bandwidth':   '50',
+    'migration_distcp_preserve_delete': 'true',
     'migration_spark_conn_id':      'spark_default',
     'migration_tracking_database':  'migration_tracking',
     'migration_tracking_location':  's3a://test-bucket/tracking',
