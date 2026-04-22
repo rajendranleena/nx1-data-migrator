@@ -16,6 +16,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+import re
 
 from airflow import DAG
 from airflow.decorators import task
@@ -1274,8 +1275,10 @@ exit 0
         from datetime import datetime as _dt
         distcp_started_at = _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         try:
+            yarn_application_ids = []
+            yarn_application_id = None
             with ssh.get_conn() as client:
-                _, stdout, stderr = client.exec_command(_login_shell(cmd, config.get('cluster_type', 'MapR')), timeout=SSH_COMMAND_TIMEOUT)
+                _, stdout, stderr = client.exec_command(_login_shell(cmd, config.get('cluster_type', 'MapR')), timeout=SSH_COMMAND_TIMEOUT, get_pty=True)
                 output = stdout.read().decode()
                 error_output = stderr.read().decode()
                 exit_code = stdout.channel.recv_exit_status()
@@ -1283,6 +1286,22 @@ exit 0
                 logger.info(f"=== DistCp for {src_db}.{tbl} (last 1000 chars) ===")
                 logger.info(output[-1000:])
 
+                combined_output = output + "\n" + error_output
+
+                # Extract all YARN application IDs (ordered)
+                yarn_application_ids = re.findall(r'application_\d+_\d+', combined_output)
+
+                # Deduplicate while preserving order
+                yarn_application_ids = list(dict.fromkeys(yarn_application_ids))
+
+                # Last app ID
+                yarn_application_id = yarn_application_ids[-1] if yarn_application_ids else None
+
+                if yarn_application_ids:
+                    logger.info(f"[DistCp] YARN Application IDs for {src_db}.{tbl}: {yarn_application_ids}")
+                    logger.info(f"[DistCp] Last YARN Application ID for {src_db}.{tbl}: {yarn_application_id}")
+                else:
+                    logger.warning(f"[DistCp] No YARN Application ID found for {src_db}.{tbl}")
                 is_incr = False
                 bytes_copied = 0
                 files_copied = 0
@@ -1367,7 +1386,9 @@ exit 0
                     's3_files_transferred': s3_files_transferred,
                     'partition_filter_active': partition_filter_active,
                     'partitions_requested': len(filtered_partitions) if partition_filter_active else None,
-                    'error': None
+                    'error': None,
+                    'yarn_application_id': yarn_application_id,
+                    'yarn_application_ids': yarn_application_ids,
                 })
         except Exception as e:
             error_msg = f"DistCp failed for {src_db}.{tbl}: {str(e)[:2000]}"
@@ -1391,7 +1412,9 @@ exit 0
                 's3_files_transferred': 0,
                 'partition_filter_active': partition_filter_active,
                 'partitions_requested': len(filtered_partitions) if partition_filter_active else None,
-                'error': str(e)[:2000]
+                'error': str(e)[:2000],
+                'yarn_application_id': yarn_application_id,
+                'yarn_application_ids': yarn_application_ids
             })
             logger.error(f"ERROR: {error_msg}")
 
@@ -2607,7 +2630,7 @@ def generate_html_report(run_id: str, spark) -> str:
                     <td class="{schema_match_class}">{schema_match_icon}</td>
                 </tr>
 """
-    html += """
+    html += f"""
             </tbody>
         </table>
 
@@ -2707,7 +2730,7 @@ def generate_html_report(run_id: str, spark) -> str:
                 </tr>
 """
 
-    html += """
+    html += f"""
             </tbody>
         </table>
 
