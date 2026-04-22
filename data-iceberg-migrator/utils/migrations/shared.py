@@ -309,6 +309,23 @@ echo "TEMP_DIR={temp_dir}"
     return {'temp_dir': temp_dir, 'run_id': run_id}
 
 
+def _s3a_committer_opts(config: dict) -> str:
+    """Return S3A magic-committer JVM flags for HDP clusters.
+
+    MapR has its own S3 connector and doesn't use FileOutputCommitter, so no
+    flags are needed there. HDP 3.x uses vanilla S3A whose default v1 committer
+    tries an atomic rename on S3 (unsupported), causing CommitterEventHandler
+    failures. The magic committer bypasses that with S3 multipart uploads.
+    """
+    if config.get('cluster_type', 'MapR').upper() == 'HDP':
+        return (
+            " -Dmapreduce.outputcommitter.factory.scheme.s3a="
+            "org.apache.hadoop.fs.s3a.commit.S3ACommitterFactory"
+            " -Dfs.s3a.committer.name=magic"
+        )
+    return ""
+
+
 def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -> str:
     """Build per-bucket Hadoop S3A JVM options scoped to the destination bucket name.
 
@@ -367,6 +384,7 @@ def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -
             s3_opts += f" -Dfs.s3a.bucket.{bucket_name}.access.key={access_key}"
         if secret_key:
             s3_opts += f" -Dfs.s3a.bucket.{bucket_name}.secret.key={secret_key}"
+        s3_opts += _s3a_committer_opts(config)
         return s3_opts
 
     global_endpoint   = config.get('s3_endpoint')   or ''
@@ -380,6 +398,7 @@ def build_s3_opts(dest_bucket_url: str, config: dict, dest_endpoint: str = '') -
         s3_opts += f" -Dfs.s3a.access.key={global_access_key}"
     if global_secret_key:
         s3_opts += f" -Dfs.s3a.secret.key={global_secret_key}"
+    s3_opts += _s3a_committer_opts(config)
     return s3_opts
 
 
