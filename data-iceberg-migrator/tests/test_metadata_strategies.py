@@ -127,7 +127,7 @@ class TestIcebergParseExcelRows:
 
     def test_basic_parsing_and_s3_normalization(self):
         import pandas as pd
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+        from utils.migrations.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'analytics',
@@ -147,7 +147,7 @@ class TestIcebergParseExcelRows:
 
     def test_skips_rows_without_dest_s3_prefix(self):
         import pandas as pd
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+        from utils.migrations.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'analytics',
@@ -161,7 +161,7 @@ class TestIcebergParseExcelRows:
 
     def test_comma_separated_tables(self):
         import pandas as pd
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+        from utils.migrations.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'analytics',
@@ -176,7 +176,7 @@ class TestIcebergParseExcelRows:
 
     def test_wildcard_collapses_other_tokens(self):
         import pandas as pd
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+        from utils.migrations.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([
             {'database': 'analytics', 'table': 'orders',
@@ -193,7 +193,7 @@ class TestIcebergParseExcelRows:
 
     def test_groups_by_database_and_prefix(self):
         import pandas as pd
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+        from utils.migrations.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([
             {'database': 'analytics', 'table': 'orders',
@@ -211,7 +211,7 @@ class TestIcebergParseExcelRows:
 
     def test_defaults_to_wildcard_when_table_empty(self):
         import pandas as pd
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+        from utils.migrations.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([{
             'database': 'analytics', 'table': '',
@@ -225,7 +225,7 @@ class TestIcebergParseExcelRows:
 
     def test_merges_tokens_from_same_group(self):
         import pandas as pd
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import parse_excel_rows
+        from utils.migrations.iceberg_to_iceberg import parse_excel_rows
 
         df = pd.DataFrame([
             {'database': 'analytics', 'table': 'orders',
@@ -248,7 +248,7 @@ class TestIcebergParseExcelRows:
 class TestIcebergDiscoverTables:
 
     def test_filters_out_dirs_without_metadata(self, mock_spark):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _list_iceberg_tables
+        from utils.migrations.iceberg_to_iceberg import _list_iceberg_tables
 
         _mock_fs_for_table_listing(
             mock_spark, ['orders'], dirs_without_metadata=['tmp_staging', 'logs']
@@ -259,7 +259,7 @@ class TestIcebergDiscoverTables:
         assert result == ['orders']
 
     def test_discovers_from_metadata_json_when_not_in_hms(self, mock_spark):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
+        from utils.migrations.iceberg_to_iceberg import discover_tables
         from utils.migrations.shared import get_config
 
         _mock_fs_for_table_listing(mock_spark, ['orders'])
@@ -289,7 +289,7 @@ class TestIcebergDiscoverTables:
         assert tbl['is_partitioned'] is True
 
     def test_queries_hms_when_table_exists(self, mock_spark):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
+        from utils.migrations.iceberg_to_iceberg import discover_tables
         from utils.migrations.shared import get_config
 
         _mock_fs_for_table_listing(mock_spark, ['orders'])
@@ -343,7 +343,7 @@ class TestIcebergDiscoverTables:
         ]
 
     def test_records_error_on_failure(self, mock_spark):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import discover_tables
+        from utils.migrations.iceberg_to_iceberg import discover_tables
         from utils.migrations.shared import get_config
 
         _mock_fs_for_table_listing(mock_spark, ['orders'])
@@ -401,7 +401,7 @@ class TestIcebergCreateDestTable:
         return base
 
     def test_creates_new_table_with_add_files(self, mock_spark):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
+        from utils.migrations.iceberg_to_iceberg import create_dest_table
         from utils.migrations.shared import get_config
 
         call_log = []
@@ -427,7 +427,7 @@ class TestIcebergCreateDestTable:
     ])
     def test_drops_and_recreates_existing_table(self, mock_spark, existing_location):
         """Table already in HMS (any location) — DROP + CREATE + add_files."""
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
+        from utils.migrations.iceberg_to_iceberg import create_dest_table
         from utils.migrations.shared import get_config
 
         call_log = []
@@ -454,7 +454,7 @@ class TestIcebergCreateDestTable:
         assert 'add_files' in calls_str
 
     def test_returns_error_on_add_files_failure(self, mock_spark):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
+        from utils.migrations.iceberg_to_iceberg import create_dest_table
         from utils.migrations.shared import get_config
 
         def sql_router(sql):
@@ -472,7 +472,7 @@ class TestIcebergCreateDestTable:
         assert 'No files found' in result['error']
 
     def test_unpartitioned_table(self, mock_spark):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import create_dest_table
+        from utils.migrations.iceberg_to_iceberg import create_dest_table
         from utils.migrations.shared import get_config
 
         call_log = []
@@ -499,7 +499,7 @@ class TestIcebergCreateDestTable:
 class TestIcebergTypeMapping:
 
     def test_special_type_branches(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _map_iceberg_type
+        from utils.migrations.iceberg_to_iceberg import _map_iceberg_type
 
         assert _map_iceberg_type('decimal(10,2)') == 'DECIMAL(10,2)'
         assert _map_iceberg_type('fixed[16]') == 'BINARY'
@@ -513,7 +513,7 @@ class TestIcebergTypeMapping:
 class TestMetadataExtraction:
 
     def test_extracts_schema_partitions_and_row_count(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import (
+        from utils.migrations.iceberg_to_iceberg import (
             _extract_partition_spec,
             _extract_row_count,
             _extract_schema,
@@ -535,7 +535,7 @@ class TestMetadataExtraction:
         assert _extract_row_count(SAMPLE_ICEBERG_METADATA) == 5000
 
     def test_schema_selection_by_id(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _extract_schema
+        from utils.migrations.iceberg_to_iceberg import _extract_schema
 
         metadata = {
             'current-schema-id': 1,
@@ -559,7 +559,7 @@ class TestMetadataExtraction:
 class TestDDLBuilders:
 
     def test_column_defs_and_partition_clause(self):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import (
+        from utils.migrations.iceberg_to_iceberg import (
             _build_column_defs,
             _build_iceberg_partition_clause,
         )
@@ -583,7 +583,7 @@ class TestDDLBuilders:
          'truncate(10, `val`)'),
     ])
     def test_partition_transforms(self, spec, expected):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _build_iceberg_partition_clause
+        from utils.migrations.iceberg_to_iceberg import _build_iceberg_partition_clause
 
         assert _build_iceberg_partition_clause(spec) == expected
 
@@ -601,6 +601,6 @@ class TestMatchTokens:
         (['orders'], ['orders', 'orders'], ['orders']),
     ])
     def test_matching(self, tables, tokens, expected):
-        from utils.migrations.metadata_strategies.iceberg_to_iceberg import _match_tokens
+        from utils.migrations.iceberg_to_iceberg import _match_tokens
 
         assert _match_tokens(tables, tokens) == expected
