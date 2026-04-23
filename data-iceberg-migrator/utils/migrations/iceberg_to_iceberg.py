@@ -14,208 +14,22 @@ Tables with year(), month(), bucket(), truncate() partitioning will fail.
 """
 
 import contextlib
-import fnmatch
-import json
 import logging
 
-from utils.migrations.metadata_strategies import cell_str, normalize_s3
+from utils.migrations.shared import cell_str, normalize_s3
+from utils.migrations.shared import (
+    _extract_partition_spec,
+    _extract_row_count,
+    _extract_schema,
+    _get_fs_stats,
+    _list_iceberg_tables,
+    _map_iceberg_type,
+    _match_tokens,
+    _read_iceberg_metadata,
+    apply_bucket_credentials,
+)
 
 logger = logging.getLogger(__name__)
-
-ICEBERG_TYPE_MAP = {
-    'boolean': 'BOOLEAN',
-    'int': 'INT',
-    'long': 'BIGINT',
-    'float': 'FLOAT',
-    'double': 'DOUBLE',
-    'date': 'DATE',
-    'time': 'STRING',
-    'timestamp': 'TIMESTAMP',
-    'timestamptz': 'TIMESTAMP',
-    'string': 'STRING',
-    'binary': 'BINARY',
-    'uuid': 'STRING',
-}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Metadata.json helpers (used when table is not yet in HMS)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _map_iceberg_type(iceberg_type):
-    """Map an Iceberg type to a Spark SQL type string."""
-    if isinstance(iceberg_type, dict):
-        return 'STRING'
-
-    t = str(iceberg_type).lower()
-    if t in ICEBERG_TYPE_MAP:
-        return ICEBERG_TYPE_MAP[t]
-    if t.startswith('decimal'):
-        return t.upper()
-    if t.startswith('fixed'):
-        return 'BINARY'
-    return 'STRING'
-
-
-def _resolve_metadata_file(spark, table_path):
-    """Resolve the path to the latest Iceberg metadata.json file for a table."""
-    from py4j.java_gateway import java_import
-
-    java_import(spark._jvm, 'org.apache.hadoop.fs.*')
-
-    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-        spark._jvm.java.net.URI(table_path),
-        spark._jsc.hadoopConfiguration()
-    )
-
-    metadata_dir = f"{table_path}/metadata"
-    hint_path = spark._jvm.org.apache.hadoop.fs.Path(f"{metadata_dir}/version-hint.text")
-
-    if fs.exists(hint_path):
-        reader = spark._jvm.java.io.BufferedReader(
-            spark._jvm.java.io.InputStreamReader(fs.open(hint_path))
-        )
-        version = reader.readLine().strip()
-        reader.close()
-        return f"{metadata_dir}/v{version}.metadata.json"
-
-    status_list = fs.listStatus(spark._jvm.org.apache.hadoop.fs.Path(metadata_dir))
-    metadata_files = []
-    for i in range(len(status_list)):
-        name = status_list[i].getPath().getName()
-        if name.endswith('.metadata.json'):
-            metadata_files.append(status_list[i].getPath().toString())
-    if not metadata_files:
-        raise FileNotFoundError(f"No metadata.json files found in {metadata_dir}")
-    return sorted(metadata_files)[-1]
-
-
-def _read_iceberg_metadata(spark, table_path):
-    """Read and parse the latest Iceberg metadata.json from S3."""
-    metadata_file = _resolve_metadata_file(spark, table_path)
-
-    from py4j.java_gateway import java_import
-
-    java_import(spark._jvm, 'org.apache.hadoop.fs.*')
-
-    fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-        spark._jvm.java.net.URI(table_path),
-        spark._jsc.hadoopConfiguration()
-    )
-
-    reader = spark._jvm.java.io.BufferedReader(
-        spark._jvm.java.io.InputStreamReader(
-            fs.open(spark._jvm.org.apache.hadoop.fs.Path(metadata_file)), "UTF-8"
-        )
-    )
-    try:
-        lines = []
-        line = reader.readLine()
-        while line is not None:
-            lines.append(line)
-            line = reader.readLine()
-    finally:
-        reader.close()
-
-    return json.loads('\n'.join(lines))
-
-
-def _extract_schema(metadata):
-    """Extract schema from Iceberg metadata as list of {name, type} dicts."""
-    current_schema_id = metadata.get('current-schema-id', 0)
-    schemas = metadata.get('schemas', [])
-
-    schema = None
-    for s in schemas:
-        if s.get('schema-id') == current_schema_id:
-            schema = s
-            break
-    if schema is None and schemas:
-        schema = schemas[-1]
-    if schema is None:
-        return []
-
-    return [
-        {'name': field['name'], 'type': _map_iceberg_type(field['type'])}
-        for field in schema.get('fields', [])
-    ]
-
-
-def _parse_transform(transform_str):
-    """Parse an Iceberg partition transform string into (transform, param).
-
-    Examples: 'identity' -> ('identity', None),
-              'bucket[16]' -> ('bucket', 16).
-    """
-    if '[' in transform_str:
-        name, rest = transform_str.split('[', 1)
-        param = int(rest.rstrip(']'))
-        return name, param
-    return transform_str, None
-
-
-def _extract_partition_spec(metadata):
-    """Extract partition spec from Iceberg metadata.
-
-    Returns (spec_fields, is_partitioned) where spec_fields is a list of dicts:
-        {'source_column': str, 'transform': str, 'name': str, 'param': int | None}
-    """
-    default_spec_id = metadata.get('default-spec-id', 0)
-    specs = metadata.get('partition-specs', [])
-
-    spec = None
-    for s in specs:
-        if s.get('spec-id') == default_spec_id:
-            spec = s
-            break
-    if spec is None and specs:
-        spec = specs[-1]
-
-    if not spec or not spec.get('fields'):
-        return [], False
-
-    current_schema_id = metadata.get('current-schema-id', 0)
-    schemas = metadata.get('schemas', [])
-    schema = None
-    for s in schemas:
-        if s.get('schema-id') == current_schema_id:
-            schema = s
-            break
-    if schema is None and schemas:
-        schema = schemas[-1]
-
-    field_id_to_name = {}
-    if schema:
-        for f in schema.get('fields', []):
-            field_id_to_name[f['id']] = f['name']
-
-    spec_fields = []
-    for pf in spec.get('fields', []):
-        source_id = pf.get('source-id')
-        source_column = field_id_to_name.get(source_id, f'field_{source_id}')
-        transform, param = _parse_transform(pf.get('transform', 'identity'))
-        spec_fields.append({
-            'source_column': source_column,
-            'transform': transform,
-            'name': pf.get('name', source_column),
-            'param': param,
-        })
-
-    return spec_fields, len(spec_fields) > 0
-
-
-def _extract_row_count(metadata):
-    """Extract total row count from the current snapshot summary."""
-    current_snapshot_id = metadata.get('current-snapshot-id')
-    if current_snapshot_id is None:
-        return 0
-
-    for snap in metadata.get('snapshots', []):
-        if snap.get('snapshot-id') == current_snapshot_id:
-            summary = snap.get('summary', {})
-            return int(summary.get('total-records', 0))
-
-    return 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -259,72 +73,8 @@ def _build_column_defs(schema):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# S3 and HMS helpers
+# HMS helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _get_fs_stats(spark, table_path):
-    """Get file count and total size via Hadoop FS."""
-    try:
-        from py4j.java_gateway import java_import
-
-        java_import(spark._jvm, 'org.apache.hadoop.fs.*')
-        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-            spark._jvm.java.net.URI(table_path),
-            spark._jsc.hadoopConfiguration()
-        )
-        path_obj = spark._jvm.org.apache.hadoop.fs.Path(table_path)
-        if fs.exists(path_obj):
-            summary = fs.getContentSummary(path_obj)
-            return int(summary.getFileCount()), int(summary.getLength())
-    except Exception as e:
-        logger.warning(f"[iceberg_discover] Could not get FS stats for {table_path}: {e}")
-    return 0, 0
-
-
-def _list_iceberg_tables(spark, base_path):
-    """List subdirectories under base_path that contain a metadata/ folder."""
-    try:
-        from py4j.java_gateway import java_import
-
-        java_import(spark._jvm, 'org.apache.hadoop.fs.*')
-        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-            spark._jvm.java.net.URI(base_path),
-            spark._jsc.hadoopConfiguration()
-        )
-        base = spark._jvm.org.apache.hadoop.fs.Path(base_path)
-        if not fs.exists(base):
-            return []
-
-        status_list = fs.listStatus(base)
-        tables = []
-        for i in range(len(status_list)):
-            if not status_list[i].isDirectory():
-                continue
-            name = status_list[i].getPath().getName()
-            metadata_dir = spark._jvm.org.apache.hadoop.fs.Path(
-                f"{base_path}/{name}/metadata"
-            )
-            if fs.exists(metadata_dir):
-                tables.append(name)
-        return sorted(tables)
-    except Exception as e:
-        logger.warning(f"[iceberg_discover] Could not list tables at {base_path}: {e}")
-        return []
-
-
-def _match_tokens(table_names, tokens):
-    """Match table names against token patterns using fnmatch."""
-    if '*' in tokens:
-        return table_names
-    seen = set()
-    matched = []
-    for tok in tokens:
-        for t in table_names:
-            if t not in seen and fnmatch.fnmatch(t, tok):
-                seen.add(t)
-                matched.append(t)
-    return matched
-
 
 def _describe_schema(spark, full_name):
     """Extract schema from an HMS table via DESCRIBE."""
@@ -435,8 +185,6 @@ def discover_tables(db_config, spark, config):
     queries HMS if the table is already registered, otherwise falls back
     to reading metadata.json from the destination.
     """
-    from utils.migrations.shared import apply_bucket_credentials
-
     database = db_config['dest_database']
     dest_prefix = db_config['dest_s3_prefix']
     tokens = db_config.get('table_tokens', ['*'])
@@ -604,8 +352,6 @@ def create_dest_table(table_info, dest_db, spark, config):
     skip-duplicates mode).  DROP + CREATE + add_files re-imports everything
     cleanly and handles both re-runs and incremental data loads.
     """
-    from utils.migrations.shared import apply_bucket_credentials
-
     tbl = table_info['source_table']
     dest_path = table_info['dest_location']
     full_name = f"{dest_db}.{tbl}"
