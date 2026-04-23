@@ -1076,7 +1076,7 @@ def run_distcp_ssh(discovery: dict, cluster_setup: dict, **context) -> dict:
                 for part_idx, (src_part, dst_part) in enumerate(partition_copy_pairs):
                     distcp_calls += f"""
 echo "=== Copying partition: {src_part} -> {dst_part} ==="
-hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
+run_distcp_with_retry hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}_part{part_idx}.log \\
     "{src_part}" "{dst_part}"
 """
@@ -1096,6 +1096,26 @@ calculate_s3_metrics_hadoop() {{
     [ -z "$TOTAL_SIZE" ] && TOTAL_SIZE=0
     echo "S3_FILE_COUNT=$FILE_COUNT"
     echo "S3_TOTAL_SIZE=$TOTAL_SIZE"
+}}
+
+run_distcp_with_retry() {{
+    local max_attempts=3
+    local delay=30
+    local attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        echo "  [DistCp] Attempt $attempt/$max_attempts: $*"
+        if "$@"; then
+            return 0
+        fi
+        echo "  [DistCp] Attempt $attempt/$max_attempts failed"
+        attempt=$((attempt + 1))
+        if [ $attempt -le $max_attempts ]; then
+            echo "  [DistCp] Retrying in ${{delay}}s..."
+            sleep $delay
+        fi
+    done
+    echo "  [DistCp] All $max_attempts attempts failed"
+    return 1
 }}
 
 INCR=false
