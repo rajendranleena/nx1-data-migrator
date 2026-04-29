@@ -308,6 +308,7 @@ def init_tracking_tables(spark) -> dict:
                 distcp_is_incremental BOOLEAN,
                 distcp_bytes_copied BIGINT,
                 distcp_files_copied BIGINT,
+                yarn_application_id STRING,
                 table_create_status STRING,
                 table_create_completed_at TIMESTAMP,
                 table_create_duration_seconds DOUBLE,
@@ -969,7 +970,8 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     row_count_match, partition_count_match, schema_match,
                     schema_differences,
                     overall_status, error_message,
-                    updated_at, partition_filter, filtered_partition_count, full_table_row_count, full_table_partition_count
+                    updated_at, partition_filter, filtered_partition_count, full_table_row_count, full_table_partition_count,
+                    yarn_application_id
                 ) VALUES (
                     '{run_id}', '{t['source_database']}', '{t['source_table']}',
                     '{t['dest_database']}', '{t['dest_bucket']}', '{t['s3_location']}',
@@ -991,7 +993,8 @@ def record_discovered_tables(discovery: dict, spark) -> dict:
                     NULL, NULL, NULL,
                     NULL,
                     NULL, NULL,
-                    current_timestamp(), '{partition_filter_val}', {filtered_partition_count_sql}, {full_table_row_count}, {full_table_partition_count}
+                    current_timestamp(), '{partition_filter_val}', {filtered_partition_count_sql}, {full_table_row_count}, {full_table_partition_count},
+                    NULL
                 )
             """,
             task_label=f"record_discovered_tables:{t['source_table']}")
@@ -1190,9 +1193,12 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 [ -z "$S3_TOTAL_SIZE_BEFORE" ] && S3_TOTAL_SIZE_BEFORE=0
 
 echo "=== Running distcp using source path list (delete disabled) ==="
+set +e
 DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}.log -f "$PATHLIST" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
+set -e
+echo "$DISTCP_OUTPUT"
 rm -f "$PATHLIST"
 
 BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | awk '{{print $NF}}' | tr -d ',')
@@ -1258,9 +1264,12 @@ S3_TOTAL_SIZE_BEFORE=$(echo "$S3_BEFORE" | grep "^S3_TOTAL_SIZE=" | cut -d'=' -f
 [ -z "$S3_TOTAL_SIZE_BEFORE" ] && S3_TOTAL_SIZE_BEFORE=0
 
 echo "=== Running distcp ==="
+set +e
 DISTCP_OUTPUT=$(hadoop distcp{s3_opts} -update -delete -m {mappers} -bandwidth {bandwidth} -strategy dynamic \\
     -log {temp_dir}/distcp_{tbl}.log "{source_loc}" "{s3_loc}" 2>&1)
 DISTCP_EXIT=$?
+set -e
+echo "$DISTCP_OUTPUT"
 
 BYTES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Bytes Copied" | awk '{{print $NF}}' | tr -d ',')
 FILES_COPIED=$(echo "$DISTCP_OUTPUT" | grep -i "Number of files copied" | awk '{{print $NF}}' | tr -d ',')
@@ -1444,6 +1453,11 @@ exit 0
     result_dict = {
         **discovery,
         'distcp_results': results,
+        'yarn_application_ids': list(dict.fromkeys(
+            app_id
+            for r in results
+            for app_id in (r.get('yarn_application_ids') or [])
+        )),
         '_has_failures': has_failures,
         '_failure_summary': (
             f"S3 copy failed for {len(failed_tables)}/{len(results)} table(s)"
@@ -1487,6 +1501,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
         s3_files_after = r.get('s3_file_count_after', 0)
         s3_bytes_transfer = r.get('s3_bytes_transferred', 0)
         s3_files_transfer = r.get('s3_files_transferred', 0)
+        yarn_app_id = ','.join(r.get('yarn_application_ids') or ([r['yarn_application_id']] if r.get('yarn_application_id') else [])).replace("'", "''")
 
         execute_with_iceberg_retry(spark, f"""
             UPDATE {tracking_db}.migration_table_status
@@ -1497,6 +1512,7 @@ def update_distcp_status(distcp_result: dict, spark) -> dict:
                 distcp_is_incremental = {str(r['is_incremental']).lower()},
                 distcp_bytes_copied = {r.get('bytes_copied', 0)},
                 distcp_files_copied = {r.get('files_copied', 0)},
+                yarn_application_id = '{yarn_app_id}',
                 s3_total_size_bytes_before = {s3_size_before},
                 s3_file_count_before = {s3_files_before},
                 s3_total_size_bytes_after = {s3_size_after},
@@ -2570,6 +2586,15 @@ def generate_html_report(run_id: str, spark) -> str:
         distcp_detail = f"<br><small>{t.distcp_bytes_copied/(1024**2):.1f} MB, {t.distcp_files_copied:,} files</small>" if t.distcp_bytes_copied else ""
         if t.distcp_is_incremental:
             distcp_dur += " <span style='background-color: #fff3cd; padding: 2px 6px; border-radius: 4px; font-size: 10px;'>INCREMENTAL</span>"
+        yarn_app_id_val = getattr(t, 'yarn_application_id', None) or ''
+        _yarn_ids = [x for x in yarn_app_id_val.split(',') if x]
+        if len(_yarn_ids) > 1:
+            _yarn_list = ''.join(f"<div style='font-family:monospace;color:#666;font-size:11px;'>{i}</div>" for i in _yarn_ids)
+            yarn_app_detail = f"<br><details style='font-size:11px;color:#666;'><summary style='cursor:pointer;color:#2980b9;'>{len(_yarn_ids)} YARN app IDs</summary>{_yarn_list}</details>"
+        elif _yarn_ids:
+            yarn_app_detail = f"<br><small style='font-family:monospace;color:#666;'>{_yarn_ids[0]}</small>"
+        else:
+            yarn_app_detail = ""
         table_dur = f"{t.table_create_duration_seconds:.1f}s" if t.table_create_duration_seconds else "N/A"
         val_dur = f"{t.validation_duration_seconds:.1f}s" if t.validation_duration_seconds else "N/A"
 
@@ -2592,7 +2617,7 @@ def generate_html_report(run_id: str, spark) -> str:
                     <td><span class="status-badge {status_class}">{t.overall_status}</span></td>
                     <td>{pf_display}</td>
                     <td class="duration">{discovery_dur}</td>
-                    <td class="duration">{distcp_dur}{distcp_detail}</td>
+                    <td class="duration">{distcp_dur}{distcp_detail}{yarn_app_detail}</td>
                     <td class="duration">{table_dur}</td>
                     <td class="duration">{val_dur}</td>
                     <td>{t.file_format or 'N/A'}</td>
